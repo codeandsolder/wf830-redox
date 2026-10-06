@@ -245,6 +245,312 @@ impl AttachRequest<'_> {
     }
 }
 
+/// Compact packet-configuration option block used by extended PDN connect.
+///
+/// The old C structure is nine bytes. The three 16-bit protocol identifiers are
+/// converted to device byte order before the block is sent as TLV `0x21`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PcoInfo {
+    pub first_pco: u8,
+    pub second_pco: u8,
+    pub n_pco: u8,
+    pub first_os_pco: u16,
+    pub second_os_pco: u16,
+    pub third_os_pco: u16,
+}
+
+impl PcoInfo {
+    #[must_use]
+    const fn wire_bytes(self) -> [u8; 9] {
+        let first = self.first_os_pco.to_be_bytes();
+        let second = self.second_os_pco.to_be_bytes();
+        let third = self.third_os_pco.to_be_bytes();
+        [
+            self.first_pco,
+            self.second_pco,
+            self.n_pco,
+            first[0],
+            first[1],
+            second[0],
+            second[1],
+            third[0],
+            third[1],
+        ]
+    }
+}
+
+/// Variable-sized field rejected by the clean PDN codecs when it exceeds the
+/// maximum size proven by the OEM structures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdnField {
+    Apn,
+    Username,
+    Password,
+    OperatorPco,
+    ApnNi,
+}
+
+/// Error returned by a typed PDN request encoder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdnEncodeError {
+    FieldTooLong(PdnField),
+    /// The normal-connect connection-control triplet is outside the range the
+    /// live SDK accepts unchanged.
+    PdnControlOutOfRange,
+    /// Caller-owned output storage is too small.
+    NoSpace,
+}
+
+impl From<TlvError> for PdnEncodeError {
+    fn from(value: TlvError) -> Self {
+        match value {
+            TlvError::NoSpace | TlvError::PayloadTooLong => Self::NoSpace,
+        }
+    }
+}
+
+/// Clean representation of normal PDN connectivity request `0x3105`.
+///
+/// The live P4 wire payload begins with `request_type, optional_info`, then an
+/// always-present transaction TLV (`0x20`) and APN TLV (`0x04`). The remaining
+/// configuration TLVs are conditional on `optional_info != 0`; requested APN
+/// type (`0x70`) is always emitted last.
+///
+/// The historical SDK generated `transaction_id` through its private
+/// `tid_list_add()` state. The clean codec makes that state explicit by taking
+/// the already-allocated transaction ID from its caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PdnConnectRequest<'a> {
+    pub request_type: u8,
+    pub optional_info: u8,
+    pub transaction_id: u8,
+    pub apn: &'a [u8],
+    pub pdn_type: u8,
+    pub ip_alloc: u8,
+    pub username: &'a [u8],
+    pub password: &'a [u8],
+    pub auth_flag: u8,
+    pub general_pco: Option<u16>,
+    pub operator_pco: Option<&'a [u8]>,
+    pub req_apn_type: ApnType,
+    pub nas_sig_low_priority_ind: u8,
+    pub pdn_control: PdnConnectionControl,
+    pub secure_pco: u8,
+}
+
+impl PdnConnectRequest<'_> {
+    /// Encode the normal PDN-connect HCI frame using live-P4 semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PdnEncodeError::FieldTooLong`] for fields exceeding their
+    /// proven OEM bounds, [`PdnEncodeError::PdnControlOutOfRange`] instead of
+    /// reproducing the SDK's silent normalization, or
+    /// [`PdnEncodeError::NoSpace`] if `output` is too small.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, PdnEncodeError> {
+        if self.apn.len() > 99 {
+            return Err(PdnEncodeError::FieldTooLong(PdnField::Apn));
+        }
+        if self.optional_info != 0 {
+            if self.username.len() > 99 {
+                return Err(PdnEncodeError::FieldTooLong(PdnField::Username));
+            }
+            if self.password.len() > 99 {
+                return Err(PdnEncodeError::FieldTooLong(PdnField::Password));
+            }
+            if self.operator_pco.is_some_and(|pco| pco.len() > 100) {
+                return Err(PdnEncodeError::FieldTooLong(PdnField::OperatorPco));
+            }
+            if self.pdn_control.max_conn > 1023
+                || self.pdn_control.max_conn_t > 3000
+                || self.pdn_control.wait_time > 1023
+            {
+                return Err(PdnEncodeError::PdnControlOutOfRange);
+            }
+        }
+
+        let Some(payload) = output.get_mut(HEADER_LEN..) else {
+            return Err(PdnEncodeError::NoSpace);
+        };
+        let Some(base) = payload.get_mut(..2) else {
+            return Err(PdnEncodeError::NoSpace);
+        };
+        base.copy_from_slice(&[self.request_type, self.optional_info]);
+
+        let Some(tlv_storage) = payload.get_mut(2..) else {
+            return Err(PdnEncodeError::NoSpace);
+        };
+        let mut tlv = TlvWriter::new(tlv_storage);
+        tlv.push_raw(0x20, &[self.transaction_id])?;
+        tlv.push_raw(0x04, self.apn)?;
+
+        if self.optional_info != 0 {
+            tlv.push_raw(0x02, self.username)?;
+            tlv.push_raw(0x03, self.password)?;
+            tlv.push_raw(0x05, &[self.pdn_type])?;
+            tlv.push_raw(0x1e, &[self.auth_flag])?;
+            tlv.push_raw(0x01, &[self.ip_alloc])?;
+            if let Some(general_pco) = self.general_pco {
+                tlv.push_u16(0x5c, general_pco)?;
+            }
+            if let Some(operator_pco) = self.operator_pco {
+                tlv.push_raw(0x5d, operator_pco)?;
+            }
+            tlv.push_raw(0xf6, &[self.nas_sig_low_priority_ind])?;
+
+            let mut pdn_control = [0_u8; 6];
+            pdn_control[..2].copy_from_slice(&self.pdn_control.max_conn.to_be_bytes());
+            pdn_control[2..4].copy_from_slice(&self.pdn_control.max_conn_t.to_be_bytes());
+            pdn_control[4..].copy_from_slice(&self.pdn_control.wait_time.to_be_bytes());
+            tlv.push_raw(0x71, &pdn_control)?;
+            tlv.push_raw(0xf7, &[self.secure_pco])?;
+        }
+
+        tlv.push_raw(0x70, &[self.req_apn_type.p4_wire_value()])?;
+        let payload_len = 2 + tlv.len();
+        let payload_len_u16 = u16::try_from(payload_len).map_err(|_| PdnEncodeError::NoSpace)?;
+        output[..HEADER_LEN].copy_from_slice(
+            &Header {
+                command: recovered_opcode::PDN_CONNECT_REQUEST,
+                payload_len: payload_len_u16,
+            }
+            .encode(),
+        );
+        Ok(HEADER_LEN + payload_len)
+    }
+}
+
+/// Clean representation of extended PDN connectivity request `0x3167`.
+///
+/// B014 and the live P4 implementation are instruction-shape equivalent for
+/// this encoder. The OEM structure also carried `req_apn_type`, but the live
+/// encoder never serializes it; it was SDK bookkeeping and is intentionally
+/// absent from this wire type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PdnConnectExtRequest<'a> {
+    pub request_type: u8,
+    pub optional_info: u8,
+    pub apn: &'a [u8],
+    pub ip_alloc: u8,
+    pub apn_class: u8,
+    pub pdn_type: u8,
+    pub username: &'a [u8],
+    pub password: &'a [u8],
+    pub auth_flag: u8,
+    pub pco: PcoInfo,
+}
+
+impl PdnConnectExtRequest<'_> {
+    /// Encode the extended PDN-connect HCI frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PdnEncodeError::FieldTooLong`] for fields exceeding the
+    /// original safe C string capacity or [`PdnEncodeError::NoSpace`] if the
+    /// caller-owned output buffer is too small.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, PdnEncodeError> {
+        if self.apn.len() > 99 {
+            return Err(PdnEncodeError::FieldTooLong(PdnField::Apn));
+        }
+        if self.optional_info != 0 {
+            if self.username.len() > 63 {
+                return Err(PdnEncodeError::FieldTooLong(PdnField::Username));
+            }
+            if self.password.len() > 63 {
+                return Err(PdnEncodeError::FieldTooLong(PdnField::Password));
+            }
+        }
+
+        let Some(payload) = output.get_mut(HEADER_LEN..) else {
+            return Err(PdnEncodeError::NoSpace);
+        };
+        let Some(base) = payload.get_mut(..2) else {
+            return Err(PdnEncodeError::NoSpace);
+        };
+        base.copy_from_slice(&[self.request_type, self.optional_info]);
+
+        let Some(tlv_storage) = payload.get_mut(2..) else {
+            return Err(PdnEncodeError::NoSpace);
+        };
+        let mut tlv = TlvWriter::new(tlv_storage);
+        tlv.push_raw(0x04, self.apn)?;
+        if self.optional_info != 0 {
+            tlv.push_raw(0x20, &[self.apn_class])?;
+            tlv.push_raw(0x02, self.username)?;
+            tlv.push_raw(0x03, self.password)?;
+            tlv.push_raw(0x05, &[self.pdn_type])?;
+            tlv.push_raw(0x1e, &[self.auth_flag])?;
+            tlv.push_raw(0x01, &[self.ip_alloc])?;
+            tlv.push_raw(0x21, &self.pco.wire_bytes())?;
+        }
+
+        let payload_len = 2 + tlv.len();
+        let payload_len_u16 = u16::try_from(payload_len).map_err(|_| PdnEncodeError::NoSpace)?;
+        output[..HEADER_LEN].copy_from_slice(
+            &Header {
+                command: recovered_opcode::PDN_CONNECT_REQUEST_EXT,
+                payload_len: payload_len_u16,
+            }
+            .encode(),
+        );
+        Ok(HEADER_LEN + payload_len)
+    }
+}
+
+/// Clean representation of PDN disconnect request `0x3107`.
+///
+/// The SDK generates the transaction ID internally; the clean protocol codec
+/// accepts it explicitly. The APN network identifier is encoded as the
+/// message-specific `0x57, len, bytes...` field rather than through the common
+/// TLV helper, matching the live P4 implementation exactly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PdnDisconnectRequest<'a> {
+    pub default_eps_id: u16,
+    pub transaction_id: u8,
+    pub apn_ni: &'a [u8],
+}
+
+impl PdnDisconnectRequest<'_> {
+    /// Encode the PDN-disconnect HCI frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PdnEncodeError::FieldTooLong`] when `apn_ni` exceeds the
+    /// 64-byte recovered `APN_NI` capacity or [`PdnEncodeError::NoSpace`] when
+    /// the destination buffer is too small.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, PdnEncodeError> {
+        if self.apn_ni.len() > 64 {
+            return Err(PdnEncodeError::FieldTooLong(PdnField::ApnNi));
+        }
+
+        let payload_len = 7_usize
+            .checked_add(self.apn_ni.len())
+            .ok_or(PdnEncodeError::NoSpace)?;
+        let payload_len_u16 = u16::try_from(payload_len).map_err(|_| PdnEncodeError::NoSpace)?;
+        let total = HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or(PdnEncodeError::NoSpace)?;
+        let Some(dst) = output.get_mut(..total) else {
+            return Err(PdnEncodeError::NoSpace);
+        };
+
+        dst[..HEADER_LEN].copy_from_slice(
+            &Header {
+                command: recovered_opcode::PDN_DISCONNECT_REQUEST,
+                payload_len: payload_len_u16,
+            }
+            .encode(),
+        );
+        let payload = &mut dst[HEADER_LEN..];
+        payload[..2].copy_from_slice(&self.default_eps_id.to_be_bytes());
+        payload[2..5].copy_from_slice(&[0x20, 0x01, self.transaction_id]);
+        payload[5] = 0x57;
+        payload[6] = u8::try_from(self.apn_ni.len()).map_err(|_| PdnEncodeError::NoSpace)?;
+        payload[7..].copy_from_slice(self.apn_ni);
+        Ok(total)
+    }
+}
+
 /// Raw four-byte detach payload used by `LAPI_DetachRequest`.
 ///
 /// The B014 SDK copies exactly four caller bytes, converts them with `H4D()`,
@@ -340,7 +646,8 @@ impl<'a> AtCommand<'a> {
 mod tests {
     use super::{
         ApnType, AtCommand, AttachEncodeError, AttachField, AttachRequest, DetachRequest,
-        EmptyRequest, PdnConnectionControl, Positioning,
+        EmptyRequest, PcoInfo, PdnConnectExtRequest, PdnConnectRequest, PdnConnectionControl,
+        PdnDisconnectRequest, PdnEncodeError, PdnField, Positioning,
     };
 
     #[test]
@@ -501,6 +808,201 @@ mod tests {
         assert_eq!(
             invalid_control.encode(&mut output),
             Err(AttachEncodeError::PdnControlOutOfRange)
+        );
+    }
+
+    #[test]
+    fn minimal_pdn_connect_keeps_required_fields() {
+        let request = PdnConnectRequest {
+            request_type: 7,
+            optional_info: 0,
+            transaction_id: 9,
+            apn: b"x",
+            pdn_type: 3,
+            ip_alloc: 1,
+            username: &[b'u'; 100],
+            password: &[b'p'; 100],
+            auth_flag: 2,
+            general_pco: None,
+            operator_pco: None,
+            req_apn_type: ApnType::Internet,
+            nas_sig_low_priority_ind: 1,
+            pdn_control: PdnConnectionControl {
+                max_conn: 65_535,
+                max_conn_t: 65_535,
+                wait_time: 65_535,
+            },
+            secure_pco: 1,
+        };
+        let mut output = [0_u8; 15];
+        assert_eq!(request.encode(&mut output), Ok(15));
+        assert_eq!(
+            output,
+            [
+                0x31, 0x05, 0x00, 0x0b, 0x07, 0x00, 0x20, 0x01, 0x09, 0x04, 0x01, b'x', 0x70, 0x01,
+                0x03,
+            ]
+        );
+    }
+
+    #[test]
+    fn normal_pdn_connect_follows_live_tlv_order() {
+        let request = PdnConnectRequest {
+            request_type: 2,
+            optional_info: 1,
+            transaction_id: 7,
+            apn: b"internet",
+            pdn_type: 3,
+            ip_alloc: 1,
+            username: b"u",
+            password: b"p",
+            auth_flag: 2,
+            general_pco: Some(0x1234),
+            operator_pco: Some(&[0xaa, 0xbb]),
+            req_apn_type: ApnType::Internet,
+            nas_sig_low_priority_ind: 1,
+            pdn_control: PdnConnectionControl {
+                max_conn: 20,
+                max_conn_t: 300,
+                wait_time: 10,
+            },
+            secure_pco: 1,
+        };
+        let mut output = [0_u8; 64];
+        assert_eq!(request.encode(&mut output), Ok(59));
+        let encoded = &output[..59];
+        assert_eq!(&encoded[..6], &[0x31, 0x05, 0x00, 0x37, 0x02, 0x01]);
+        assert!(encoded[6..].windows(3).any(|x| x == [0x20, 0x01, 0x07]));
+        assert!(
+            encoded[6..]
+                .windows(4)
+                .any(|x| x == [0x5c, 0x02, 0x12, 0x34])
+        );
+        assert!(
+            encoded[6..]
+                .windows(8)
+                .any(|x| x == [0x71, 0x06, 0x00, 0x14, 0x01, 0x2c, 0x00, 0x0a])
+        );
+        assert_eq!(&encoded[encoded.len() - 3..], &[0x70, 0x01, 0x03]);
+    }
+
+    #[test]
+    fn minimal_extended_pdn_connect_is_base_plus_apn() {
+        let request = PdnConnectExtRequest {
+            request_type: 1,
+            optional_info: 0,
+            apn: b"ims",
+            ip_alloc: 0xff,
+            apn_class: 0xff,
+            pdn_type: 0xff,
+            username: &[b'u'; 64],
+            password: &[b'p'; 64],
+            auth_flag: 0xff,
+            pco: PcoInfo {
+                first_pco: 0xff,
+                second_pco: 0xff,
+                n_pco: 0xff,
+                first_os_pco: 0xffff,
+                second_os_pco: 0xffff,
+                third_os_pco: 0xffff,
+            },
+        };
+        let mut output = [0_u8; 11];
+        assert_eq!(request.encode(&mut output), Ok(11));
+        assert_eq!(
+            output,
+            [
+                0x31, 0x67, 0x00, 0x07, 0x01, 0x00, 0x04, 0x03, b'i', b'm', b's'
+            ]
+        );
+    }
+
+    #[test]
+    fn extended_pdn_connect_encodes_pco_words_big_endian() {
+        let request = PdnConnectExtRequest {
+            request_type: 2,
+            optional_info: 1,
+            apn: b"internet",
+            ip_alloc: 1,
+            apn_class: 7,
+            pdn_type: 3,
+            username: b"u",
+            password: b"p",
+            auth_flag: 2,
+            pco: PcoInfo {
+                first_pco: 0x11,
+                second_pco: 0x22,
+                n_pco: 3,
+                first_os_pco: 0x1234,
+                second_os_pco: 0x5678,
+                third_os_pco: 0x9abc,
+            },
+        };
+        let mut output = [0_u8; 48];
+        assert_eq!(request.encode(&mut output), Ok(45));
+        let encoded = &output[..45];
+        assert_eq!(&encoded[..6], &[0x31, 0x67, 0x00, 0x29, 0x02, 0x01]);
+        assert!(encoded.windows(11).any(|x| x
+            == [
+                0x21, 0x09, 0x11, 0x22, 0x03, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc
+            ]));
+    }
+
+    #[test]
+    fn pdn_disconnect_matches_live_message_specific_apn_field() {
+        let request = PdnDisconnectRequest {
+            default_eps_id: 0x1234,
+            transaction_id: 7,
+            apn_ni: b"internet",
+        };
+        let mut output = [0_u8; 19];
+        assert_eq!(request.encode(&mut output), Ok(19));
+        assert_eq!(
+            output,
+            [
+                0x31, 0x07, 0x00, 0x0f, 0x12, 0x34, 0x20, 0x01, 0x07, 0x57, 0x08, b'i', b'n', b't',
+                b'e', b'r', b'n', b'e', b't',
+            ]
+        );
+    }
+
+    #[test]
+    fn pdn_codecs_reject_only_serialized_oversize_fields() {
+        let mut output = [0_u8; 512];
+        let normal = PdnConnectRequest {
+            request_type: 0,
+            optional_info: 1,
+            transaction_id: 0,
+            apn: b"ok",
+            pdn_type: 0,
+            ip_alloc: 0,
+            username: &[b'u'; 100],
+            password: b"",
+            auth_flag: 0,
+            general_pco: None,
+            operator_pco: None,
+            req_apn_type: ApnType::Internet,
+            nas_sig_low_priority_ind: 0,
+            pdn_control: PdnConnectionControl {
+                max_conn: 20,
+                max_conn_t: 300,
+                wait_time: 0,
+            },
+            secure_pco: 0,
+        };
+        assert_eq!(
+            normal.encode(&mut output),
+            Err(PdnEncodeError::FieldTooLong(PdnField::Username))
+        );
+
+        let disconnect = PdnDisconnectRequest {
+            default_eps_id: 1,
+            transaction_id: 1,
+            apn_ni: &[b'a'; 65],
+        };
+        assert_eq!(
+            disconnect.encode(&mut output),
+            Err(PdnEncodeError::FieldTooLong(PdnField::ApnNi))
         );
     }
 

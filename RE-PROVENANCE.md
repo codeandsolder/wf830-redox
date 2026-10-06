@@ -155,3 +155,44 @@ B014 historically mapped 4/6/7 to 5/7/8; those mappings are deliberately not rep
 The normal attach payload begins with the one-byte `optional_info`. If it is zero, the complete payload is that single byte. Otherwise the live SDK emits TLVs in this order: transaction `0x20`, username `0x02`, password `0x03`, APN `0x04`, auth `0x1e`, PDN type `0x05`, IP allocation `0x01`, optional general PCO `0x5c`, optional operator PCO `0x5d`, attach type `0x5f`, request type `0x60`, requested APN mapping `0x70`, emergency mode `0x62`, positioning `0xf5`, low-priority NAS `0xf6`, PDN connection control `0x71`, secure PCO `0xf7`.
 
 `gct-lapi::AttachRequest` now implements this live-P4 behavior directly. It uses borrowed byte slices rather than the historical fixed C arrays, but intentionally caps inputs to the proven safe OEM storage limits. The OEM SDK silently rewrites out-of-range PDN control values; the clean Rust API rejects them instead.
+
+## Typed PDN requests — live P4 authority
+
+B014 `lted` DWARF reconstructs the request-side C layouts used by the SDK:
+
+- `_PDN_CONNECTIVITY_REQ_PARAM`: 0x1a4 bytes.
+- `_PDN_CONNECTIVITY_REQ_EXT_PARAM`: 0xf4 bytes.
+- `_PDN_DISCONNECT_REQ_PARAM`: 0x44 bytes.
+- `_APN_NI`: one-byte length plus 64 bytes of network identifier storage.
+- `_PCO_INFO`: nine bytes: three u8 selectors followed by three u16 protocol IDs.
+
+A normalized instruction diff of `LAPI_PDNConnRequest` shows the same live-P4
+policy delta as normal attach: B014's requested-APN mappings for historical
+classes 4/6/7 are absent in P4. `ApnType::p4_wire_value()` is therefore shared
+by attach and normal PDN connect.
+
+Normal PDN connect (`0x3105`) sends two fixed payload bytes first:
+`request_type, optional_info`. It always sends transaction `0x20`, APN `0x04`,
+and requested APN type `0x70`. When `optional_info != 0`, the live SDK inserts,
+in order: username `0x02`, password `0x03`, PDN type `0x05`, auth `0x1e`, IP
+allocation `0x01`, optional general PCO `0x5c`, optional operator PCO `0x5d`,
+low-priority NAS `0xf6`, PDN connection control `0x71`, and secure PCO `0xf7`.
+The private SDK generated the transaction byte through `tid_list_add()`; the
+clean codec accepts an explicit transaction ID from its caller instead.
+
+Extended PDN connect (`0x3167`) is instruction-shape equivalent between B014
+and live P4. Its payload begins with `request_type, optional_info`, always sends
+APN `0x04`, then when optional data is enabled sends APN class `0x20`, username
+`0x02`, password `0x03`, PDN type `0x05`, auth `0x1e`, IP allocation `0x01`,
+and the complete nine-byte PCO block as `0x21`. The OEM structure also contains
+`req_apn_type`, but the live encoder never serializes it; it is deliberately not
+part of the clean wire type.
+
+PDN disconnect (`0x3107`) sends `default_eps_id` as a big-endian u16, transaction
+TLV `0x20`, then a message-specific `0x57, len, apn_ni...` field. That final APN
+field does not go through the shared SDK TLV helper. The clean codec caps it at
+the recovered 64-byte `APN_NI` capacity.
+
+`gct-lapi` now has typed encoders for normal connect, extended connect and
+disconnect, with golden tests for minimal/optional paths, PCO endianness, live
+APN mapping and recovered size limits.
