@@ -225,34 +225,6 @@ format with strict truncation checks. `gct-lapi` exposes bounded response parser
 for every fixed prefix above and leaves the parser-managed suffix borrowed until
 its nested grammar is independently proven.
 
-## Core response-side prefixes
-
-The B014 `decode_hci_packet` dispatch targets and the symbol-rich `lted` DWARF
-provide both modem-wire parser behavior and callback-structure field names.
-The clean implementation models only bytes proven to arrive from the modem;
-it does not mirror the much larger callback structures populated by SDK state.
-
-- Online (`0xb122`), Offline (`0xb124`) and PS Init (`0xb12f`) each carry one
-  four-byte device-endian `u32 result` and no additional wire fields.
-- Detach (`0xb104`) is exactly eight bytes: `u32 result`, then two device-endian
-  `u16` deregistration causes. This matches `_DETACH_RSP_INFO` exactly.
-- Normal attach (`0xb102`) and extended attach (`0xb166`) share the same first
-  15 wire bytes despite different callback-structure layouts: two registration
-  result u16s, default EPS ID u16, EPS ID u16, `data_path`, `ip_alloc`, then the
-  five one-byte `NET_FEATURE_INFO` fields (`ims_voice_over_ps`, `emc_bc`,
-  `epc_lcs`, `sc_lcs`, `ext_sr`). Parser-managed fields follow byte 15.
-- Normal PDN connect (`0xb106`) has a ten-byte fixed prefix: result/reject1/
-  reject2/default-EPS-ID as four u16 values, then `data_path` and `ip_alloc`.
-- Extended PDN connect (`0xb168`) adds a device-endian u16 throttle-time value
-  after that common ten-byte prefix, for twelve fixed bytes total.
-- PDN disconnect (`0xb108`) starts with four device-endian u16 values: result,
-  reject cause 1, reject cause 2 and default EPS ID. Optional fields follow.
-
-`gct-hci::TlvCursor` now decodes the shared borrowed `[type,len,payload...]`
-format with strict truncation checks. `gct-lapi` exposes bounded response parsers
-for every fixed prefix above and leaves the parser-managed suffix borrowed until
-its nested grammar is independently proven.
-
 ## Nested ATTACH/PDN response information
 
 The PIC table used by the inner nested parser resolves to B014 VA `0x89c54`.
@@ -283,31 +255,51 @@ payloads. It stops before the first non-container field. `gct-lapi` now exposes
 this as borrowed `PdnInfoContainers` plus semantic `PdnInfoField` values, with
 strict fixed-length validation and unknown inner TLVs preserved as raw data.
 
-## Nested ATTACH/PDN response information
+## Full PDN response grammar — live P4 confirmed
 
-The PIC table used by the inner nested parser resolves to B014 VA `0x89c54`.
-It contains 23 first-match entries. Correlating each handler destination offset
-with B014 `PDN`/`LTE_QOS` DWARF gives the effective wire mapping:
+The current P4 handlers preserve the same response-parser shape as B014. The
+live binary uses normal-PDN handler `0xbf10`, extended-PDN handler `0xc700`, and
+PDN-disconnect handler `0xcb9c`; their B014 counterparts are `0xbd60`, `0xc550`,
+and `0xc9ec`. Helper addresses shift, but the call sequence, fixed prefixes and
+descriptor tags used below are unchanged. P4 therefore remains the authority,
+while B014 DWARF supplies names for the historical callback destinations.
 
-- `0x04`: APN (`PDN.ap_name`, max recovered destination 128 bytes)
-- `0x05`: PDN type (u8)
-- `0x06`: PDN type cause (device-endian u32)
-- `0x07`: IPv4 address
-- `0x08`, `0x09`: primary/secondary IPv4 DNS
-- `0x0a`, `0x0b`: primary/secondary IPv6 DNS
-- `0x0c`: IPv6 interface ID (8 bytes)
-- `0x0d..0x11`: P-CSCF IPv6 addresses 1..5
-- `0x1f`, `0x21`, `0x22`: P-CSCF IPv4 addresses 1..3
-- `0x40..0x44`: QCI, max UL, max DL, guaranteed UL, guaranteed DL as five device-endian u32 values in `LTE_QOS`.
+Normal PDN connect (`0xb106`) is:
 
-The table then contains a second `0x22` entry whose handler writes `PDN.opspec_len`
-and `PDN.opspec`. The dispatcher returns after the first matching type, so this
-second `0x22` handler is unreachable in the OEM implementation. The clean parser
-records the effective first-match behavior (`0x22` = P-CSCF IPv4 #3) rather than
-inventing a corrected opcode for the dead handler.
+1. ten-byte fixed prefix (`result`, two reject causes, default EPS ID,
+   `data_path`, `ip_alloc`);
+2. mandatory transaction TLV `0x20`, whose payload is one byte;
+3. one fixed-order APN-NI TLV copied into the 65-byte `APN_NI` destination
+   (one length byte + at most 64 APN bytes). The OEM helper does not validate
+   this TLV's tag, so the clean parser preserves the observed tag rather than
+   inventing a stronger contract;
+4. up to two contiguous `0xf0`/`0xf2` nested PDN-info containers;
+5. a descriptor-driven TLV suffix with `0x5b` = IPv4 link MTU (device-endian
+   u16), `0x5d` = operator PCO (at most 100 payload bytes), `0xf0` = an
+   additional inner-PDN-info chunk, and `0xf3` = APN-AMBR (UL and DL as two
+   device-endian u32 values). Unknown suffix TLVs are skipped by the OEM and
+   preserved by the Rust cursor.
 
-The enclosing nested parser accepts at most two contiguous outer containers,
-each tagged `0xf0` or `0xf2`, and runs the same inner dispatch table over their
-payloads. It stops before the first non-container field. `gct-lapi` now exposes
-this as borrowed `PdnInfoContainers` plus semantic `PdnInfoField` values, with
-strict fixed-length validation and unknown inner TLVs preserved as raw data.
+An earlier ad-hoc reading suggested an unexplained eight-byte gap between the
+APN and nested parser. That was false: the local variable at `r11-8` is a count
+of bytes consumed *after* the ten-byte fixed prefix. The subsequent `+8` and
+`+2` address arithmetic reconstructs that same `+10` base. There are no opaque
+eight wire bytes in this path.
+
+Extended PDN connect (`0xb168`) is twelve fixed bytes, followed by three
+fixed-order TLVs copied into `apn_class`, requested APN-NI and received APN-NI,
+then the same at-most-two nested `0xf0`/`0xf2` parser. The fixed-order helpers do
+not validate the three TLV tags. `apn_class` is a one-byte destination; each APN
+has the same 64-byte payload bound. The OEM ignores the nested parser's return
+value and therefore ignores any bytes after those initial containers. The clean
+Rust representation deliberately exposes that remainder as `unparsed_suffix`
+instead of silently dropping it.
+
+PDN disconnect (`0xb108`) is an eight-byte fixed prefix, mandatory transaction
+TLV `0x20`, then a descriptor-driven suffix: `0x57` = APN-NI (max 64 bytes),
+`0x5d` = operator PCO (max 100 bytes), and unknown TLVs are skipped/preserved.
+
+`gct-lapi` now implements these complete layouts with allocation-free borrowed
+views. It is intentionally stricter than the old C on malformed input: exact
+one-byte transaction/apn-class fields, exact MTU/AMBR widths, APN/PCO destination
+bounds, truncation errors, and preservation of unknown or OEM-ignored bytes.

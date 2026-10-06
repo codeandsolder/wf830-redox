@@ -553,6 +553,494 @@ impl<'a> PdnDisconnectResponsePrefix<'a> {
     }
 }
 
+/// Fixed-order field in one of the recovered PDN response grammars.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdnResponseField {
+    TransactionId,
+    ApnClass,
+    ApnNetworkIdentifier,
+    RequestedApnNetworkIdentifier,
+    ReceivedApnNetworkIdentifier,
+}
+
+/// Error returned while decoding the recovered ordered portion of a PDN
+/// response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdnResponseDecodeError {
+    Response(ResponseDecodeError),
+    Tlv(TlvDecodeError),
+    MissingField(PdnResponseField),
+    UnexpectedKind {
+        field: PdnResponseField,
+        expected: u8,
+        actual: u8,
+    },
+    UnexpectedFieldLength {
+        field: PdnResponseField,
+        expected: usize,
+        actual: usize,
+    },
+    FieldTooLong {
+        field: PdnResponseField,
+        maximum: usize,
+        actual: usize,
+    },
+}
+
+impl From<ResponseDecodeError> for PdnResponseDecodeError {
+    fn from(value: ResponseDecodeError) -> Self {
+        Self::Response(value)
+    }
+}
+
+impl From<TlvDecodeError> for PdnResponseDecodeError {
+    fn from(value: TlvDecodeError) -> Self {
+        Self::Tlv(value)
+    }
+}
+
+/// One fixed-order TLV whose destination is known from DWARF but whose tag is
+/// not validated by the OEM helper.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OrderedPdnTlv<'a> {
+    pub kind: u8,
+    pub payload: &'a [u8],
+}
+
+fn required_pdn_tlv<'a>(
+    cursor: &mut TlvCursor<'a>,
+    field: PdnResponseField,
+) -> Result<Tlv<'a>, PdnResponseDecodeError> {
+    cursor
+        .next_tlv()?
+        .ok_or(PdnResponseDecodeError::MissingField(field))
+}
+
+fn exact_pdn_field(
+    field: PdnResponseField,
+    payload: &[u8],
+    expected: usize,
+) -> Result<(), PdnResponseDecodeError> {
+    if payload.len() != expected {
+        return Err(PdnResponseDecodeError::UnexpectedFieldLength {
+            field,
+            expected,
+            actual: payload.len(),
+        });
+    }
+    Ok(())
+}
+
+fn bounded_pdn_field(
+    field: PdnResponseField,
+    payload: &[u8],
+    maximum: usize,
+) -> Result<(), PdnResponseDecodeError> {
+    if payload.len() > maximum {
+        return Err(PdnResponseDecodeError::FieldTooLong {
+            field,
+            maximum,
+            actual: payload.len(),
+        });
+    }
+    Ok(())
+}
+
+fn split_initial_pdn_info(bytes: &[u8]) -> Result<(&[u8], &[u8]), TlvDecodeError> {
+    let mut containers = PdnInfoContainers::new(bytes);
+    while containers.next_container()?.is_some() {}
+    let remaining = containers.remaining();
+    let consumed = bytes.len() - remaining.len();
+    Ok((&bytes[..consumed], remaining))
+}
+
+/// Fully split normal PDN-connect response `0xb106`.
+///
+/// The OEM handler consumes a mandatory transaction TLV, then an APN TLV by
+/// position, then up to two nested `0xf0`/`0xf2` containers. Remaining fields
+/// are handled by a descriptor-driven trailing dispatcher.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PdnConnectResponse<'a> {
+    pub result: u16,
+    pub reject_cause1: u16,
+    pub reject_cause2: u16,
+    pub default_eps_id: u16,
+    pub data_path: u8,
+    pub ip_alloc: u8,
+    pub transaction_id: u8,
+    pub apn_ni: OrderedPdnTlv<'a>,
+    initial_pdn_info: &'a [u8],
+    trailing_fields: &'a [u8],
+}
+
+impl<'a> PdnConnectResponse<'a> {
+    /// Decode the complete recovered normal PDN response layout.
+    ///
+    /// # Errors
+    /// Returns [`PdnResponseDecodeError`] for a malformed fixed prefix,
+    /// mandatory transaction field, APN field, or nested container framing.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, PdnResponseDecodeError> {
+        let prefix = PdnConnectResponsePrefix::parse(packet)?;
+        let mut cursor = TlvCursor::new(prefix.optional_fields);
+
+        let transaction = required_pdn_tlv(&mut cursor, PdnResponseField::TransactionId)?;
+        if transaction.kind != 0x20 {
+            return Err(PdnResponseDecodeError::UnexpectedKind {
+                field: PdnResponseField::TransactionId,
+                expected: 0x20,
+                actual: transaction.kind,
+            });
+        }
+        exact_pdn_field(PdnResponseField::TransactionId, transaction.payload, 1)?;
+
+        let apn = required_pdn_tlv(&mut cursor, PdnResponseField::ApnNetworkIdentifier)?;
+        bounded_pdn_field(PdnResponseField::ApnNetworkIdentifier, apn.payload, 64)?;
+
+        let (initial_pdn_info, trailing_fields) = split_initial_pdn_info(cursor.remaining())?;
+        Ok(Self {
+            result: prefix.result,
+            reject_cause1: prefix.reject_cause1,
+            reject_cause2: prefix.reject_cause2,
+            default_eps_id: prefix.default_eps_id,
+            data_path: prefix.data_path,
+            ip_alloc: prefix.ip_alloc,
+            transaction_id: transaction.payload[0],
+            apn_ni: OrderedPdnTlv {
+                kind: apn.kind,
+                payload: apn.payload,
+            },
+            initial_pdn_info,
+            trailing_fields,
+        })
+    }
+
+    #[must_use]
+    pub const fn pdn_info_containers(&self) -> PdnInfoContainers<'a> {
+        PdnInfoContainers::new(self.initial_pdn_info)
+    }
+
+    #[must_use]
+    pub const fn trailing_fields(&self) -> PdnConnectTailCursor<'a> {
+        PdnConnectTailCursor::new(self.trailing_fields)
+    }
+}
+
+/// Recovered semantic field in the trailing normal-PDN dispatcher.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdnConnectTailField<'a> {
+    Ipv4LinkMtu(u16),
+    OperatorPco(&'a [u8]),
+    /// Extra `0xf0` container parsed by the same inner PDN field dispatcher.
+    PdnInfo(&'a [u8]),
+    ApnAmbr {
+        uplink: u32,
+        downlink: u32,
+    },
+    Unknown(Tlv<'a>),
+}
+
+/// Malformed field in the descriptor-driven normal-PDN suffix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdnConnectTailDecodeError {
+    Tlv(TlvDecodeError),
+    UnexpectedLength {
+        kind: u8,
+        expected: usize,
+        actual: usize,
+    },
+    FieldTooLong {
+        kind: u8,
+        maximum: usize,
+        actual: usize,
+    },
+}
+
+impl From<TlvDecodeError> for PdnConnectTailDecodeError {
+    fn from(value: TlvDecodeError) -> Self {
+        Self::Tlv(value)
+    }
+}
+
+/// Cursor over the descriptor-driven suffix of a normal PDN response.
+pub struct PdnConnectTailCursor<'a> {
+    cursor: TlvCursor<'a>,
+}
+
+impl<'a> PdnConnectTailCursor<'a> {
+    #[must_use]
+    pub const fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            cursor: TlvCursor::new(bytes),
+        }
+    }
+
+    #[must_use]
+    pub const fn remaining(&self) -> &'a [u8] {
+        self.cursor.remaining()
+    }
+
+    /// Decode one trailing field using the four recovered OEM descriptors.
+    /// Unknown TLVs are preserved instead of discarded.
+    ///
+    /// # Errors
+    /// Returns an error for malformed TLV framing or a known field with a
+    /// length that would overflow or mis-size the historical destination.
+    pub fn next_field(
+        &mut self,
+    ) -> Result<Option<PdnConnectTailField<'a>>, PdnConnectTailDecodeError> {
+        let Some(tlv) = self.cursor.next_tlv()? else {
+            return Ok(None);
+        };
+        let field = match tlv.kind {
+            0x5b => {
+                if tlv.payload.len() != 2 {
+                    return Err(PdnConnectTailDecodeError::UnexpectedLength {
+                        kind: tlv.kind,
+                        expected: 2,
+                        actual: tlv.payload.len(),
+                    });
+                }
+                PdnConnectTailField::Ipv4LinkMtu(u16::from_be_bytes([
+                    tlv.payload[0],
+                    tlv.payload[1],
+                ]))
+            }
+            0x5d => {
+                if tlv.payload.len() > 100 {
+                    return Err(PdnConnectTailDecodeError::FieldTooLong {
+                        kind: tlv.kind,
+                        maximum: 100,
+                        actual: tlv.payload.len(),
+                    });
+                }
+                PdnConnectTailField::OperatorPco(tlv.payload)
+            }
+            0xf0 => PdnConnectTailField::PdnInfo(tlv.payload),
+            0xf3 => {
+                if tlv.payload.len() != 8 {
+                    return Err(PdnConnectTailDecodeError::UnexpectedLength {
+                        kind: tlv.kind,
+                        expected: 8,
+                        actual: tlv.payload.len(),
+                    });
+                }
+                PdnConnectTailField::ApnAmbr {
+                    uplink: be_u32(tlv.payload, 0),
+                    downlink: be_u32(tlv.payload, 4),
+                }
+            }
+            _ => PdnConnectTailField::Unknown(tlv),
+        };
+        Ok(Some(field))
+    }
+}
+
+/// Fully split extended PDN-connect response `0xb168`.
+///
+/// Unlike the normal response, the SDK does not use a transaction ID here.
+/// It consumes three fixed-order TLVs into `apn_class`, requested APN and
+/// received APN destinations, then runs the shared nested PDN parser. The OEM
+/// ignores bytes after those initial containers; this representation keeps
+/// them borrowed as `unparsed_suffix` instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PdnConnectExtResponse<'a> {
+    pub result: u16,
+    pub reject_cause1: u16,
+    pub reject_cause2: u16,
+    pub default_eps_id: u16,
+    pub data_path: u8,
+    pub ip_alloc: u8,
+    pub throttle_time: u16,
+    pub apn_class_kind: u8,
+    pub apn_class: u8,
+    pub requested_apn_ni: OrderedPdnTlv<'a>,
+    pub received_apn_ni: OrderedPdnTlv<'a>,
+    initial_pdn_info: &'a [u8],
+    pub unparsed_suffix: &'a [u8],
+}
+
+impl<'a> PdnConnectExtResponse<'a> {
+    /// Decode the complete recovered extended PDN response layout.
+    ///
+    /// # Errors
+    /// Returns [`PdnResponseDecodeError`] for malformed ordered TLVs or nested
+    /// container framing.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, PdnResponseDecodeError> {
+        let prefix = PdnConnectExtResponsePrefix::parse(packet)?;
+        let mut cursor = TlvCursor::new(prefix.optional_fields);
+
+        let apn_class = required_pdn_tlv(&mut cursor, PdnResponseField::ApnClass)?;
+        exact_pdn_field(PdnResponseField::ApnClass, apn_class.payload, 1)?;
+        let requested =
+            required_pdn_tlv(&mut cursor, PdnResponseField::RequestedApnNetworkIdentifier)?;
+        bounded_pdn_field(
+            PdnResponseField::RequestedApnNetworkIdentifier,
+            requested.payload,
+            64,
+        )?;
+        let received =
+            required_pdn_tlv(&mut cursor, PdnResponseField::ReceivedApnNetworkIdentifier)?;
+        bounded_pdn_field(
+            PdnResponseField::ReceivedApnNetworkIdentifier,
+            received.payload,
+            64,
+        )?;
+
+        let (initial_pdn_info, unparsed_suffix) = split_initial_pdn_info(cursor.remaining())?;
+        Ok(Self {
+            result: prefix.result,
+            reject_cause1: prefix.reject_cause1,
+            reject_cause2: prefix.reject_cause2,
+            default_eps_id: prefix.default_eps_id,
+            data_path: prefix.data_path,
+            ip_alloc: prefix.ip_alloc,
+            throttle_time: prefix.throttle_time,
+            apn_class_kind: apn_class.kind,
+            apn_class: apn_class.payload[0],
+            requested_apn_ni: OrderedPdnTlv {
+                kind: requested.kind,
+                payload: requested.payload,
+            },
+            received_apn_ni: OrderedPdnTlv {
+                kind: received.kind,
+                payload: received.payload,
+            },
+            initial_pdn_info,
+            unparsed_suffix,
+        })
+    }
+
+    #[must_use]
+    pub const fn pdn_info_containers(&self) -> PdnInfoContainers<'a> {
+        PdnInfoContainers::new(self.initial_pdn_info)
+    }
+}
+
+/// Fully split PDN-disconnect response `0xb108`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PdnDisconnectResponse<'a> {
+    pub result: u16,
+    pub reject_cause1: u16,
+    pub reject_cause2: u16,
+    pub default_eps_id: u16,
+    pub transaction_id: u8,
+    trailing_fields: &'a [u8],
+}
+
+impl<'a> PdnDisconnectResponse<'a> {
+    /// Decode the fixed prefix and mandatory transaction field.
+    ///
+    /// # Errors
+    /// Returns [`PdnResponseDecodeError`] for malformed prefix or transaction
+    /// TLV framing.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, PdnResponseDecodeError> {
+        let prefix = PdnDisconnectResponsePrefix::parse(packet)?;
+        let mut cursor = TlvCursor::new(prefix.optional_fields);
+        let transaction = required_pdn_tlv(&mut cursor, PdnResponseField::TransactionId)?;
+        if transaction.kind != 0x20 {
+            return Err(PdnResponseDecodeError::UnexpectedKind {
+                field: PdnResponseField::TransactionId,
+                expected: 0x20,
+                actual: transaction.kind,
+            });
+        }
+        exact_pdn_field(PdnResponseField::TransactionId, transaction.payload, 1)?;
+        Ok(Self {
+            result: prefix.result,
+            reject_cause1: prefix.reject_cause1,
+            reject_cause2: prefix.reject_cause2,
+            default_eps_id: prefix.default_eps_id,
+            transaction_id: transaction.payload[0],
+            trailing_fields: cursor.remaining(),
+        })
+    }
+
+    #[must_use]
+    pub const fn trailing_fields(&self) -> PdnDisconnectFieldCursor<'a> {
+        PdnDisconnectFieldCursor::new(self.trailing_fields)
+    }
+}
+
+/// Field accepted by the descriptor-driven PDN-disconnect suffix parser.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdnDisconnectField<'a> {
+    ApnNetworkIdentifier(&'a [u8]),
+    OperatorPco(&'a [u8]),
+    Unknown(Tlv<'a>),
+}
+
+/// Error while decoding one known PDN-disconnect trailing field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdnDisconnectFieldDecodeError {
+    Tlv(TlvDecodeError),
+    FieldTooLong {
+        kind: u8,
+        maximum: usize,
+        actual: usize,
+    },
+}
+
+impl From<TlvDecodeError> for PdnDisconnectFieldDecodeError {
+    fn from(value: TlvDecodeError) -> Self {
+        Self::Tlv(value)
+    }
+}
+
+pub struct PdnDisconnectFieldCursor<'a> {
+    cursor: TlvCursor<'a>,
+}
+
+impl<'a> PdnDisconnectFieldCursor<'a> {
+    #[must_use]
+    pub const fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            cursor: TlvCursor::new(bytes),
+        }
+    }
+
+    #[must_use]
+    pub const fn remaining(&self) -> &'a [u8] {
+        self.cursor.remaining()
+    }
+
+    /// Decode one disconnect suffix field while preserving unknown TLVs.
+    ///
+    /// # Errors
+    /// Returns an error for malformed framing or a field larger than the
+    /// recovered historical destination.
+    pub fn next_field(
+        &mut self,
+    ) -> Result<Option<PdnDisconnectField<'a>>, PdnDisconnectFieldDecodeError> {
+        let Some(tlv) = self.cursor.next_tlv()? else {
+            return Ok(None);
+        };
+        let field = match tlv.kind {
+            0x57 => {
+                if tlv.payload.len() > 64 {
+                    return Err(PdnDisconnectFieldDecodeError::FieldTooLong {
+                        kind: tlv.kind,
+                        maximum: 64,
+                        actual: tlv.payload.len(),
+                    });
+                }
+                PdnDisconnectField::ApnNetworkIdentifier(tlv.payload)
+            }
+            0x5d => {
+                if tlv.payload.len() > 100 {
+                    return Err(PdnDisconnectFieldDecodeError::FieldTooLong {
+                        kind: tlv.kind,
+                        maximum: 100,
+                        actual: tlv.payload.len(),
+                    });
+                }
+                PdnDisconnectField::OperatorPco(tlv.payload)
+            }
+            _ => PdnDisconnectField::Unknown(tlv),
+        };
+        Ok(Some(field))
+    }
+}
+
 /// Request with only the four-byte HCI header and no payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmptyRequest {
@@ -1827,5 +2315,186 @@ mod tests {
         let request = DetachRequest::from_raw(0x1122_3344);
         assert_eq!(request.encode(&mut output), Ok(8));
         assert_eq!(output, [0x31, 0x03, 0x00, 0x04, 0x11, 0x22, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn full_normal_pdn_response_follows_recovered_parser_pipeline() {
+        let payload = [
+            0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x12, 0x34, 0x05, 0x06, 0x20, 0x01, 0x07, 0x57,
+            0x08, b'i', b'n', b't', b'e', b'r', b'n', b'e', b't', 0xf0, 0x06, 0x07, 0x04, 10, 20,
+            30, 40, 0xf2, 0x06, 0x40, 0x04, 0, 0, 0, 9, 0x5b, 0x02, 0x05, 0xdc, 0x5d, 0x02, 0xaa,
+            0xbb, 0xf0, 0x06, 0x08, 0x04, 1, 1, 1, 1, 0xf3, 0x08, 0, 0, 0, 100, 0, 0, 0, 200, 0xee,
+            0x01, 0xff,
+        ];
+        let Ok(response) = super::PdnConnectResponse::parse(packet(0xb106, &payload)) else {
+            return;
+        };
+        assert_eq!(response.result, 1);
+        assert_eq!(response.default_eps_id, 0x1234);
+        assert_eq!(response.transaction_id, 7);
+        assert_eq!(response.apn_ni.kind, 0x57);
+        assert_eq!(response.apn_ni.payload, b"internet");
+
+        let mut containers = response.pdn_info_containers();
+        let Ok(Some(first)) = containers.next_container() else {
+            return;
+        };
+        assert_eq!(first.kind, PdnInfoContainerKind::F0);
+        let mut first_fields = first.fields();
+        let Ok(Some(first_tlv)) = first_fields.next_tlv() else {
+            return;
+        };
+        assert_eq!(
+            PdnInfoField::parse(first_tlv),
+            Ok(PdnInfoField::Ipv4Address([10, 20, 30, 40]))
+        );
+        let Ok(Some(second)) = containers.next_container() else {
+            return;
+        };
+        assert_eq!(second.kind, PdnInfoContainerKind::F2);
+        let mut second_fields = second.fields();
+        let Ok(Some(qos_tlv)) = second_fields.next_tlv() else {
+            return;
+        };
+        assert_eq!(
+            PdnInfoField::parse(qos_tlv),
+            Ok(PdnInfoField::Qos {
+                field: QosField::Qci,
+                value: 9,
+            })
+        );
+        assert!(matches!(containers.next_container(), Ok(None)));
+
+        let mut tail = response.trailing_fields();
+        assert_eq!(
+            tail.next_field(),
+            Ok(Some(super::PdnConnectTailField::Ipv4LinkMtu(1500)))
+        );
+        assert_eq!(
+            tail.next_field(),
+            Ok(Some(super::PdnConnectTailField::OperatorPco(&[0xaa, 0xbb])))
+        );
+        assert_eq!(
+            tail.next_field(),
+            Ok(Some(super::PdnConnectTailField::PdnInfo(&[
+                0x08, 0x04, 1, 1, 1, 1
+            ])))
+        );
+        assert_eq!(
+            tail.next_field(),
+            Ok(Some(super::PdnConnectTailField::ApnAmbr {
+                uplink: 100,
+                downlink: 200,
+            }))
+        );
+        assert_eq!(
+            tail.next_field(),
+            Ok(Some(super::PdnConnectTailField::Unknown(Tlv {
+                kind: 0xee,
+                payload: &[0xff],
+            })))
+        );
+        assert_eq!(tail.next_field(), Ok(None));
+    }
+
+    #[test]
+    fn extended_pdn_response_preserves_unchecked_tags_and_ignored_suffix() {
+        let payload = [
+            0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x12, 0x34, 0x05, 0x06, 0x07, 0x08, 0x20, 0x01,
+            0x07, 0x57, 0x03, b'i', b'm', b's', 0x58, 0x03, b'n', b'e', b't', 0xf0, 0x03, 0x05,
+            0x01, 0x03, 0xaa, 0x00,
+        ];
+        let Ok(response) = super::PdnConnectExtResponse::parse(packet(0xb168, &payload)) else {
+            return;
+        };
+        assert_eq!(response.throttle_time, 0x0708);
+        assert_eq!(response.apn_class_kind, 0x20);
+        assert_eq!(response.apn_class, 7);
+        assert_eq!(response.requested_apn_ni.kind, 0x57);
+        assert_eq!(response.requested_apn_ni.payload, b"ims");
+        assert_eq!(response.received_apn_ni.kind, 0x58);
+        assert_eq!(response.received_apn_ni.payload, b"net");
+        assert_eq!(response.unparsed_suffix, &[0xaa, 0x00]);
+
+        let mut containers = response.pdn_info_containers();
+        let Ok(Some(container)) = containers.next_container() else {
+            return;
+        };
+        let mut fields = container.fields();
+        let Ok(Some(tlv)) = fields.next_tlv() else {
+            return;
+        };
+        assert_eq!(PdnInfoField::parse(tlv), Ok(PdnInfoField::PdnType(3)));
+    }
+
+    #[test]
+    fn disconnect_response_decodes_descriptor_suffix_and_unknowns() {
+        let payload = [
+            0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x12, 0x34, 0x20, 0x01, 0x09, 0x57, 0x08, b'i',
+            b'n', b't', b'e', b'r', b'n', b'e', b't', 0x5d, 0x02, 0xaa, 0xbb, 0xee, 0x00,
+        ];
+        let Ok(response) = super::PdnDisconnectResponse::parse(packet(0xb108, &payload)) else {
+            return;
+        };
+        assert_eq!(response.transaction_id, 9);
+        let mut fields = response.trailing_fields();
+        assert_eq!(
+            fields.next_field(),
+            Ok(Some(super::PdnDisconnectField::ApnNetworkIdentifier(
+                b"internet"
+            )))
+        );
+        assert_eq!(
+            fields.next_field(),
+            Ok(Some(super::PdnDisconnectField::OperatorPco(&[0xaa, 0xbb])))
+        );
+        assert_eq!(
+            fields.next_field(),
+            Ok(Some(super::PdnDisconnectField::Unknown(Tlv {
+                kind: 0xee,
+                payload: &[],
+            })))
+        );
+        assert_eq!(fields.next_field(), Ok(None));
+    }
+
+    #[test]
+    fn full_pdn_response_parsers_reject_unsafe_oem_shapes() {
+        let wrong_transaction = [
+            0, 1, 0, 2, 0, 3, 0x12, 0x34, 5, 6, 0x21, 0x01, 7, 0x57, 0x00,
+        ];
+        assert_eq!(
+            super::PdnConnectResponse::parse(packet(0xb106, &wrong_transaction)),
+            Err(super::PdnResponseDecodeError::UnexpectedKind {
+                field: super::PdnResponseField::TransactionId,
+                expected: 0x20,
+                actual: 0x21,
+            })
+        );
+
+        let bad_apn_class = [
+            0, 1, 0, 2, 0, 3, 0x12, 0x34, 5, 6, 7, 8, 0x20, 0x02, 1, 2, 0x57, 0x00, 0x58, 0x00,
+        ];
+        assert_eq!(
+            super::PdnConnectExtResponse::parse(packet(0xb168, &bad_apn_class)),
+            Err(super::PdnResponseDecodeError::UnexpectedFieldLength {
+                field: super::PdnResponseField::ApnClass,
+                expected: 1,
+                actual: 2,
+            })
+        );
+
+        let truncated_nested = [
+            0, 1, 0, 2, 0, 3, 0x12, 0x34, 5, 6, 0x20, 0x01, 7, 0x57, 0x00, 0xf0, 0x04, 0x07, 0x04,
+        ];
+        assert_eq!(
+            super::PdnConnectResponse::parse(packet(0xb106, &truncated_nested)),
+            Err(super::PdnResponseDecodeError::Tlv(
+                gct_hci::TlvDecodeError::TruncatedPayload {
+                    declared: 4,
+                    actual: 2,
+                }
+            ))
+        );
     }
 }
