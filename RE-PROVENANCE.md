@@ -196,3 +196,59 @@ the recovered 64-byte `APN_NI` capacity.
 `gct-lapi` now has typed encoders for normal connect, extended connect and
 disconnect, with golden tests for minimal/optional paths, PCO endianness, live
 APN mapping and recovered size limits.
+
+## Core response-side prefixes
+
+The B014 `decode_hci_packet` dispatch targets and the symbol-rich `lted` DWARF
+provide both modem-wire parser behavior and callback-structure field names.
+The clean implementation models only bytes proven to arrive from the modem;
+it does not mirror the much larger callback structures populated by SDK state.
+
+- Online (`0xb122`), Offline (`0xb124`) and PS Init (`0xb12f`) each carry one
+  four-byte device-endian `u32 result` and no additional wire fields.
+- Detach (`0xb104`) is exactly eight bytes: `u32 result`, then two device-endian
+  `u16` deregistration causes. This matches `_DETACH_RSP_INFO` exactly.
+- Normal attach (`0xb102`) and extended attach (`0xb166`) share the same first
+  15 wire bytes despite different callback-structure layouts: two registration
+  result u16s, default EPS ID u16, EPS ID u16, `data_path`, `ip_alloc`, then the
+  five one-byte `NET_FEATURE_INFO` fields (`ims_voice_over_ps`, `emc_bc`,
+  `epc_lcs`, `sc_lcs`, `ext_sr`). Parser-managed fields follow byte 15.
+- Normal PDN connect (`0xb106`) has a ten-byte fixed prefix: result/reject1/
+  reject2/default-EPS-ID as four u16 values, then `data_path` and `ip_alloc`.
+- Extended PDN connect (`0xb168`) adds a device-endian u16 throttle-time value
+  after that common ten-byte prefix, for twelve fixed bytes total.
+- PDN disconnect (`0xb108`) starts with four device-endian u16 values: result,
+  reject cause 1, reject cause 2 and default EPS ID. Optional fields follow.
+
+`gct-hci::TlvCursor` now decodes the shared borrowed `[type,len,payload...]`
+format with strict truncation checks. `gct-lapi` exposes bounded response parsers
+for every fixed prefix above and leaves the parser-managed suffix borrowed until
+its nested grammar is independently proven.
+
+## Core response-side prefixes
+
+The B014 `decode_hci_packet` dispatch targets and the symbol-rich `lted` DWARF
+provide both modem-wire parser behavior and callback-structure field names.
+The clean implementation models only bytes proven to arrive from the modem;
+it does not mirror the much larger callback structures populated by SDK state.
+
+- Online (`0xb122`), Offline (`0xb124`) and PS Init (`0xb12f`) each carry one
+  four-byte device-endian `u32 result` and no additional wire fields.
+- Detach (`0xb104`) is exactly eight bytes: `u32 result`, then two device-endian
+  `u16` deregistration causes. This matches `_DETACH_RSP_INFO` exactly.
+- Normal attach (`0xb102`) and extended attach (`0xb166`) share the same first
+  15 wire bytes despite different callback-structure layouts: two registration
+  result u16s, default EPS ID u16, EPS ID u16, `data_path`, `ip_alloc`, then the
+  five one-byte `NET_FEATURE_INFO` fields (`ims_voice_over_ps`, `emc_bc`,
+  `epc_lcs`, `sc_lcs`, `ext_sr`). Parser-managed fields follow byte 15.
+- Normal PDN connect (`0xb106`) has a ten-byte fixed prefix: result/reject1/
+  reject2/default-EPS-ID as four u16 values, then `data_path` and `ip_alloc`.
+- Extended PDN connect (`0xb168`) adds a device-endian u16 throttle-time value
+  after that common ten-byte prefix, for twelve fixed bytes total.
+- PDN disconnect (`0xb108`) starts with four device-endian u16 values: result,
+  reject cause 1, reject cause 2 and default EPS ID. Optional fields follow.
+
+`gct-hci::TlvCursor` now decodes the shared borrowed `[type,len,payload...]`
+format with strict truncation checks. `gct-lapi` exposes bounded response parsers
+for every fixed prefix above and leaves the parser-managed suffix borrowed until
+its nested grammar is independently proven.

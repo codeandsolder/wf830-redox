@@ -1,15 +1,348 @@
 #![no_std]
 
-//! Typed encoders for the small GCT LAPI subset needed to bring up the WF830.
+//! Typed codecs for the small GCT LAPI subset needed to bring up the WF830.
 //!
 //! This is a clean implementation from recovered wire behavior. It does not
 //! expose the historical OEM C ABI and intentionally omits commands until
 //! their payload format is proven.
 
 use gct_hci::{
-    EncodeError, HEADER_LEN, Header, TlvError, TlvWriter, encode_packet, public_opcode,
-    recovered_opcode,
+    EncodeError, HEADER_LEN, Header, Packet, TlvCursor, TlvError, TlvWriter, encode_packet,
+    public_opcode, recovered_opcode,
 };
+
+/// Error returned when a proven response prefix does not match its wire
+/// contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResponseDecodeError {
+    /// The HCI packet carries another command/event opcode.
+    UnexpectedOpcode { expected: u16, actual: u16 },
+    /// A fixed-size response contains too few or too many bytes.
+    UnexpectedLength { expected: usize, actual: usize },
+    /// A response with optional trailing fields is shorter than its proven
+    /// fixed prefix.
+    TruncatedPrefix { minimum: usize, actual: usize },
+}
+
+fn response_payload(
+    packet: Packet<'_>,
+    expected_opcode: u16,
+) -> Result<&[u8], ResponseDecodeError> {
+    if packet.header.command != expected_opcode {
+        return Err(ResponseDecodeError::UnexpectedOpcode {
+            expected: expected_opcode,
+            actual: packet.header.command,
+        });
+    }
+    Ok(packet.payload)
+}
+
+fn exact_payload(
+    packet: Packet<'_>,
+    expected_opcode: u16,
+    expected_len: usize,
+) -> Result<&[u8], ResponseDecodeError> {
+    let payload = response_payload(packet, expected_opcode)?;
+    if payload.len() != expected_len {
+        return Err(ResponseDecodeError::UnexpectedLength {
+            expected: expected_len,
+            actual: payload.len(),
+        });
+    }
+    Ok(payload)
+}
+
+fn prefix_payload(
+    packet: Packet<'_>,
+    expected_opcode: u16,
+    minimum_len: usize,
+) -> Result<&[u8], ResponseDecodeError> {
+    let payload = response_payload(packet, expected_opcode)?;
+    if payload.len() < minimum_len {
+        return Err(ResponseDecodeError::TruncatedPrefix {
+            minimum: minimum_len,
+            actual: payload.len(),
+        });
+    }
+    Ok(payload)
+}
+
+const fn be_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+const fn be_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
+/// Four-byte result response shared by Online, Offline and PS Init.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResultResponse {
+    pub result: u32,
+}
+
+/// Selects one of the three independently registered SDK callbacks that share
+/// the same four-byte wire response layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResultResponseKind {
+    Online,
+    Offline,
+    PsInit,
+}
+
+impl ResultResponseKind {
+    #[must_use]
+    pub const fn opcode(self) -> u16 {
+        match self {
+            Self::Online => recovered_opcode::ONLINE_RESPONSE,
+            Self::Offline => recovered_opcode::OFFLINE_RESPONSE,
+            Self::PsInit => recovered_opcode::PS_INIT_RESPONSE,
+        }
+    }
+}
+
+impl ResultResponse {
+    /// Decode the exact four-byte response used by Online, Offline or PS Init.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResponseDecodeError`] for the wrong HCI opcode or any payload
+    /// length other than four bytes.
+    pub fn parse(
+        kind: ResultResponseKind,
+        packet: Packet<'_>,
+    ) -> Result<Self, ResponseDecodeError> {
+        let payload = exact_payload(packet, kind.opcode(), 4)?;
+        Ok(Self {
+            result: be_u32(payload, 0),
+        })
+    }
+}
+
+/// Exact eight-byte detach response recovered from `LAPI` response handler
+/// `0xb104` and `_DETACH_RSP_INFO` DWARF.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DetachResponse {
+    pub result: u32,
+    pub deregister_cause1: u16,
+    pub deregister_cause2: u16,
+}
+
+impl DetachResponse {
+    /// Decode an exact detach response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResponseDecodeError`] for the wrong opcode or payload length.
+    pub fn parse(packet: Packet<'_>) -> Result<Self, ResponseDecodeError> {
+        let payload = exact_payload(packet, recovered_opcode::DETACH_RESPONSE, 8)?;
+        Ok(Self {
+            result: be_u32(payload, 0),
+            deregister_cause1: be_u16(payload, 4),
+            deregister_cause2: be_u16(payload, 6),
+        })
+    }
+}
+
+/// Five one-byte LTE network capability flags recovered from `NET_FEATURE_INFO`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetworkFeatureInfo {
+    pub ims_voice_over_ps: u8,
+    pub emc_bc: u8,
+    pub epc_lcs: u8,
+    pub sc_lcs: u8,
+    pub ext_sr: u8,
+}
+
+/// Normal and extended attach responses share the same first 15 wire bytes,
+/// even though the historical callback structures place fields differently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttachResponsePrefix<'a> {
+    pub register_result1: u16,
+    pub register_result2: u16,
+    pub default_eps_id: u16,
+    pub eps_id: u16,
+    pub data_path: u8,
+    pub ip_alloc: u8,
+    pub network_features: NetworkFeatureInfo,
+    /// Remaining response bytes. These begin at the first parser-managed field
+    /// after the common fixed prefix and are intentionally left borrowed until
+    /// every nested optional-field grammar is proven.
+    pub optional_fields: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachResponseKind {
+    Normal,
+    Extended,
+}
+
+impl AttachResponseKind {
+    #[must_use]
+    pub const fn opcode(self) -> u16 {
+        match self {
+            Self::Normal => recovered_opcode::ATTACH_RESPONSE,
+            Self::Extended => recovered_opcode::ATTACH_RESPONSE_EXT,
+        }
+    }
+}
+
+impl<'a> AttachResponsePrefix<'a> {
+    /// Decode the proven 15-byte common attach-response prefix and borrow the
+    /// parser-managed suffix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResponseDecodeError`] for the wrong opcode or a payload shorter
+    /// than the common prefix.
+    pub fn parse(
+        kind: AttachResponseKind,
+        packet: Packet<'a>,
+    ) -> Result<Self, ResponseDecodeError> {
+        let payload = prefix_payload(packet, kind.opcode(), 15)?;
+        Ok(Self {
+            register_result1: be_u16(payload, 0),
+            register_result2: be_u16(payload, 2),
+            default_eps_id: be_u16(payload, 4),
+            eps_id: be_u16(payload, 6),
+            data_path: payload[8],
+            ip_alloc: payload[9],
+            network_features: NetworkFeatureInfo {
+                ims_voice_over_ps: payload[10],
+                emc_bc: payload[11],
+                epc_lcs: payload[12],
+                sc_lcs: payload[13],
+                ext_sr: payload[14],
+            },
+            optional_fields: &payload[15..],
+        })
+    }
+
+    /// Cursor over the still-unclassified optional suffix. This is useful for
+    /// the portions already known to use the common GCT TLV grammar while the
+    /// nested vendor parser is being reconstructed.
+    #[must_use]
+    pub const fn optional_tlvs(&self) -> TlvCursor<'a> {
+        TlvCursor::new(self.optional_fields)
+    }
+}
+
+/// Proven ten-byte fixed prefix of normal PDN-connect response `0xb106`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PdnConnectResponsePrefix<'a> {
+    pub result: u16,
+    pub reject_cause1: u16,
+    pub reject_cause2: u16,
+    pub default_eps_id: u16,
+    pub data_path: u8,
+    pub ip_alloc: u8,
+    pub optional_fields: &'a [u8],
+}
+
+impl<'a> PdnConnectResponsePrefix<'a> {
+    /// Decode the normal PDN-connect fixed prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResponseDecodeError`] for the wrong opcode or a payload shorter
+    /// than ten bytes.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, ResponseDecodeError> {
+        let payload = prefix_payload(packet, recovered_opcode::PDN_CONNECT_RESPONSE, 10)?;
+        Ok(Self {
+            result: be_u16(payload, 0),
+            reject_cause1: be_u16(payload, 2),
+            reject_cause2: be_u16(payload, 4),
+            default_eps_id: be_u16(payload, 6),
+            data_path: payload[8],
+            ip_alloc: payload[9],
+            optional_fields: &payload[10..],
+        })
+    }
+
+    #[must_use]
+    pub const fn optional_tlvs(&self) -> TlvCursor<'a> {
+        TlvCursor::new(self.optional_fields)
+    }
+}
+
+/// Proven twelve-byte fixed prefix of extended PDN-connect response `0xb168`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PdnConnectExtResponsePrefix<'a> {
+    pub result: u16,
+    pub reject_cause1: u16,
+    pub reject_cause2: u16,
+    pub default_eps_id: u16,
+    pub data_path: u8,
+    pub ip_alloc: u8,
+    pub throttle_time: u16,
+    pub optional_fields: &'a [u8],
+}
+
+impl<'a> PdnConnectExtResponsePrefix<'a> {
+    /// Decode the extended PDN-connect fixed prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResponseDecodeError`] for the wrong opcode or a payload shorter
+    /// than twelve bytes.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, ResponseDecodeError> {
+        let payload = prefix_payload(packet, recovered_opcode::PDN_CONNECT_RESPONSE_EXT, 12)?;
+        Ok(Self {
+            result: be_u16(payload, 0),
+            reject_cause1: be_u16(payload, 2),
+            reject_cause2: be_u16(payload, 4),
+            default_eps_id: be_u16(payload, 6),
+            data_path: payload[8],
+            ip_alloc: payload[9],
+            throttle_time: be_u16(payload, 10),
+            optional_fields: &payload[12..],
+        })
+    }
+
+    #[must_use]
+    pub const fn optional_tlvs(&self) -> TlvCursor<'a> {
+        TlvCursor::new(self.optional_fields)
+    }
+}
+
+/// Proven eight-byte fixed prefix of PDN-disconnect response `0xb108`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PdnDisconnectResponsePrefix<'a> {
+    pub result: u16,
+    pub reject_cause1: u16,
+    pub reject_cause2: u16,
+    pub default_eps_id: u16,
+    pub optional_fields: &'a [u8],
+}
+
+impl<'a> PdnDisconnectResponsePrefix<'a> {
+    /// Decode the PDN-disconnect fixed prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResponseDecodeError`] for the wrong opcode or a payload shorter
+    /// than eight bytes.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, ResponseDecodeError> {
+        let payload = prefix_payload(packet, recovered_opcode::PDN_DISCONNECT_RESPONSE, 8)?;
+        Ok(Self {
+            result: be_u16(payload, 0),
+            reject_cause1: be_u16(payload, 2),
+            reject_cause2: be_u16(payload, 4),
+            default_eps_id: be_u16(payload, 6),
+            optional_fields: &payload[8..],
+        })
+    }
+
+    #[must_use]
+    pub const fn optional_tlvs(&self) -> TlvCursor<'a> {
+        TlvCursor::new(self.optional_fields)
+    }
+}
 
 /// Request with only the four-byte HCI header and no payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -645,10 +978,14 @@ impl<'a> AtCommand<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApnType, AtCommand, AttachEncodeError, AttachField, AttachRequest, DetachRequest,
-        EmptyRequest, PcoInfo, PdnConnectExtRequest, PdnConnectRequest, PdnConnectionControl,
-        PdnDisconnectRequest, PdnEncodeError, PdnField, Positioning,
+        ApnType, AtCommand, AttachEncodeError, AttachField, AttachRequest, AttachResponseKind,
+        AttachResponsePrefix, DetachRequest, DetachResponse, EmptyRequest, NetworkFeatureInfo,
+        PcoInfo, PdnConnectExtRequest, PdnConnectExtResponsePrefix, PdnConnectRequest,
+        PdnConnectResponsePrefix, PdnConnectionControl, PdnDisconnectRequest,
+        PdnDisconnectResponsePrefix, PdnEncodeError, PdnField, Positioning, ResponseDecodeError,
+        ResultResponse, ResultResponseKind,
     };
+    use gct_hci::{Header, Packet, Tlv};
 
     #[test]
     fn empty_requests_match_oem_four_byte_frames() {
@@ -808,6 +1145,156 @@ mod tests {
         assert_eq!(
             invalid_control.encode(&mut output),
             Err(AttachEncodeError::PdnControlOutOfRange)
+        );
+    }
+
+    fn packet(command: u16, payload: &[u8]) -> Packet<'_> {
+        Packet {
+            header: Header {
+                command,
+                payload_len: u16::try_from(payload.len()).unwrap_or(u16::MAX),
+            },
+            payload,
+        }
+    }
+
+    #[test]
+    fn simple_result_responses_are_one_big_endian_word() {
+        for (kind, opcode) in [
+            (ResultResponseKind::Online, 0xb122),
+            (ResultResponseKind::Offline, 0xb124),
+            (ResultResponseKind::PsInit, 0xb12f),
+        ] {
+            assert_eq!(
+                ResultResponse::parse(kind, packet(opcode, &[0x11, 0x22, 0x33, 0x44])),
+                Ok(ResultResponse {
+                    result: 0x1122_3344,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn detach_response_is_exact_eight_byte_structure() {
+        let payload = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        assert_eq!(
+            DetachResponse::parse(packet(0xb104, &payload)),
+            Ok(DetachResponse {
+                result: 0x1122_3344,
+                deregister_cause1: 0x5566,
+                deregister_cause2: 0x7788,
+            })
+        );
+    }
+
+    #[test]
+    fn attach_prefix_is_shared_by_normal_and_extended_wire_responses() {
+        let payload = [
+            0x00, 0x01, 0x00, 0x02, 0x12, 0x34, 0x56, 0x78, 0x09, 0x0a, 1, 2, 3, 4, 5, 0x20, 0x01,
+            0x7f,
+        ];
+        let expected = AttachResponsePrefix {
+            register_result1: 1,
+            register_result2: 2,
+            default_eps_id: 0x1234,
+            eps_id: 0x5678,
+            data_path: 9,
+            ip_alloc: 10,
+            network_features: NetworkFeatureInfo {
+                ims_voice_over_ps: 1,
+                emc_bc: 2,
+                epc_lcs: 3,
+                sc_lcs: 4,
+                ext_sr: 5,
+            },
+            optional_fields: &[0x20, 0x01, 0x7f],
+        };
+        let normal =
+            AttachResponsePrefix::parse(AttachResponseKind::Normal, packet(0xb102, &payload));
+        let extended =
+            AttachResponsePrefix::parse(AttachResponseKind::Extended, packet(0xb166, &payload));
+        assert_eq!(normal, Ok(expected));
+        assert_eq!(extended, Ok(expected));
+        let mut tlvs = expected.optional_tlvs();
+        assert_eq!(
+            tlvs.next_tlv(),
+            Ok(Some(Tlv {
+                kind: 0x20,
+                payload: &[0x7f],
+            }))
+        );
+    }
+
+    #[test]
+    fn pdn_response_prefixes_keep_optional_suffix_borrowed() {
+        let normal = [
+            0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x12, 0x34, 0x05, 0x06, 0x57, 0x01, b'x',
+        ];
+        assert_eq!(
+            PdnConnectResponsePrefix::parse(packet(0xb106, &normal)),
+            Ok(PdnConnectResponsePrefix {
+                result: 1,
+                reject_cause1: 2,
+                reject_cause2: 3,
+                default_eps_id: 0x1234,
+                data_path: 5,
+                ip_alloc: 6,
+                optional_fields: &[0x57, 0x01, b'x'],
+            })
+        );
+
+        let extended = [
+            0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x12, 0x34, 0x05, 0x06, 0x07, 0x08, 0x57, 0x00,
+        ];
+        assert_eq!(
+            PdnConnectExtResponsePrefix::parse(packet(0xb168, &extended)),
+            Ok(PdnConnectExtResponsePrefix {
+                result: 1,
+                reject_cause1: 2,
+                reject_cause2: 3,
+                default_eps_id: 0x1234,
+                data_path: 5,
+                ip_alloc: 6,
+                throttle_time: 0x0708,
+                optional_fields: &[0x57, 0x00],
+            })
+        );
+
+        let disconnect = [0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x12, 0x34, 0x5d, 0x00];
+        assert_eq!(
+            PdnDisconnectResponsePrefix::parse(packet(0xb108, &disconnect)),
+            Ok(PdnDisconnectResponsePrefix {
+                result: 1,
+                reject_cause1: 2,
+                reject_cause2: 3,
+                default_eps_id: 0x1234,
+                optional_fields: &[0x5d, 0x00],
+            })
+        );
+    }
+
+    #[test]
+    fn response_parsers_reject_wrong_opcode_and_short_prefix() {
+        assert_eq!(
+            DetachResponse::parse(packet(0xb106, &[0; 8])),
+            Err(ResponseDecodeError::UnexpectedOpcode {
+                expected: 0xb104,
+                actual: 0xb106,
+            })
+        );
+        assert_eq!(
+            PdnConnectResponsePrefix::parse(packet(0xb106, &[0; 9])),
+            Err(ResponseDecodeError::TruncatedPrefix {
+                minimum: 10,
+                actual: 9,
+            })
+        );
+        assert_eq!(
+            ResultResponse::parse(ResultResponseKind::Online, packet(0xb122, &[0; 3])),
+            Err(ResponseDecodeError::UnexpectedLength {
+                expected: 4,
+                actual: 3,
+            })
         );
     }
 

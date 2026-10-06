@@ -139,6 +139,82 @@ pub fn encode_packet(
     Ok(total)
 }
 
+/// Error returned while decoding one recovered GCT TLV.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TlvDecodeError {
+    /// Fewer than the two TLV header bytes remain.
+    TruncatedHeader,
+    /// The TLV length byte exceeds the bytes still available in the buffer.
+    TruncatedPayload {
+        /// Payload length declared by the TLV header.
+        declared: usize,
+        /// Payload bytes actually available after the header.
+        actual: usize,
+    },
+}
+
+/// One borrowed GCT TLV.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Tlv<'a> {
+    /// One-byte recovered field identifier.
+    pub kind: u8,
+    /// Borrowed TLV payload, excluding type and length bytes.
+    pub payload: &'a [u8],
+}
+
+/// Allocation-free cursor over the `[type, len, payload...]` format shared by
+/// the request encoders and many response-side optional fields.
+pub struct TlvCursor<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> TlvCursor<'a> {
+    /// Create a cursor at the first TLV in `bytes`.
+    #[must_use]
+    pub const fn new(bytes: &'a [u8]) -> Self {
+        Self { remaining: bytes }
+    }
+
+    /// Bytes not yet consumed by successful [`Self::next_tlv`] calls.
+    #[must_use]
+    pub const fn remaining(&self) -> &'a [u8] {
+        self.remaining
+    }
+
+    /// Decode the next TLV without allocating.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlvDecodeError::TruncatedHeader`] when a non-empty suffix has
+    /// fewer than two bytes, or [`TlvDecodeError::TruncatedPayload`] when the
+    /// declared payload length runs past the supplied buffer. On error the
+    /// cursor is left unchanged so callers can report the offending suffix.
+    pub fn next_tlv(&mut self) -> Result<Option<Tlv<'a>>, TlvDecodeError> {
+        if self.remaining.is_empty() {
+            return Ok(None);
+        }
+        let Some(header) = self.remaining.get(..2) else {
+            return Err(TlvDecodeError::TruncatedHeader);
+        };
+        let declared = usize::from(header[1]);
+        let available = self.remaining.len() - 2;
+        if available < declared {
+            return Err(TlvDecodeError::TruncatedPayload {
+                declared,
+                actual: available,
+            });
+        }
+        let end = 2 + declared;
+        let payload = &self.remaining[2..end];
+        let tlv = Tlv {
+            kind: header[0],
+            payload,
+        };
+        self.remaining = &self.remaining[end..];
+        Ok(Some(tlv))
+    }
+}
+
 /// Error returned while appending a recovered GCT TLV.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TlvError {
@@ -288,7 +364,8 @@ pub mod recovered_opcode {
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodeError, EncodeError, Header, Packet, TlvError, TlvWriter, encode_packet, public_opcode,
+        DecodeError, EncodeError, Header, Packet, Tlv, TlvCursor, TlvDecodeError, TlvError,
+        TlvWriter, encode_packet, public_opcode,
     };
 
     #[test]
@@ -346,6 +423,45 @@ mod tests {
             encode_packet(public_opcode::LTE_AT_CMD_TO_DEVICE, b"AT\r", &mut short),
             Err(EncodeError::NoSpace)
         );
+    }
+
+    #[test]
+    fn tlv_cursor_decodes_borrowed_fields() {
+        let bytes = [0x20, 0x01, 0x07, 0x5c, 0x02, 0x12, 0x34];
+        let mut cursor = TlvCursor::new(&bytes);
+        assert_eq!(
+            cursor.next_tlv(),
+            Ok(Some(Tlv {
+                kind: 0x20,
+                payload: &[0x07],
+            }))
+        );
+        assert_eq!(cursor.remaining(), &[0x5c, 0x02, 0x12, 0x34]);
+        assert_eq!(
+            cursor.next_tlv(),
+            Ok(Some(Tlv {
+                kind: 0x5c,
+                payload: &[0x12, 0x34],
+            }))
+        );
+        assert_eq!(cursor.next_tlv(), Ok(None));
+    }
+
+    #[test]
+    fn tlv_cursor_rejects_truncated_suffix_without_consuming_it() {
+        let bytes = [0x57, 0x04, b'a', b'p'];
+        let mut cursor = TlvCursor::new(&bytes);
+        assert_eq!(
+            cursor.next_tlv(),
+            Err(TlvDecodeError::TruncatedPayload {
+                declared: 4,
+                actual: 2,
+            })
+        );
+        assert_eq!(cursor.remaining(), &bytes);
+
+        let mut one_byte = TlvCursor::new(&[0x57]);
+        assert_eq!(one_byte.next_tlv(), Err(TlvDecodeError::TruncatedHeader));
     }
 
     #[test]
