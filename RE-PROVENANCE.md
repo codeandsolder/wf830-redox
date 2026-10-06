@@ -364,3 +364,53 @@ PLMN-list response `0xb10c` is simply one `search_complete` byte followed by
 that same record stream. The SDK-computed `num_plmn_info` words present in the
 DWARF callback structs are not wire fields and are intentionally absent from
 the Rust representation.
+
+## UICC common framing and SIM/PIN bring-up — live P4 confirmed
+
+`LAPI_UICCRequest` is a fifteen-way subtype switch (`0..14`) in both B014 and
+live P4. The common request wire envelope is HCI `0x3504` followed by BE
+`type: u16`, BE `len: u16`, then subtype data. This is not exposed as an
+unrestricted raw public request encoder because several file-operation subtypes
+perform additional field-specific endian conversion after the common copy.
+
+The recovered control subtype values are: 0 status, 1 read binary, 2 read
+record, 3 update binary, 4 update record, 5 authenticate, 6 PIN command, 7 PIN
+status, 8 remote command, 9 PIN required, 10 refresh (the B014 headers also
+contain the typo `REPRESH`), 11 USAT terminal profile, 12 USAT envelope, 13
+USAT terminal response, and 14 poll-interval timer.
+
+Status (`type 0`) has a one-byte request payload `apptype`. This is independently
+confirmed by `lted`'s `make_uicc_control_req_param`: its type-0 branch requires
+one input byte and writes outer `len = 1`. PIN status (`type 7`) always writes
+outer `len = 0`.
+
+PIN command (`type 6`) carries exactly twenty raw bytes after the common UICC
+envelope. B014 DWARF names them as `pin_type`, `pin_cmd`, then two `PIN_DATA`
+objects. Each `PIN_DATA` is one length byte plus an eight-byte fixed-capacity
+code buffer. The SDK copies these twenty bytes without endian fixups. The Rust
+encoder zero-pads the fixed buffers and rejects codes longer than eight bytes.
+The available DWARF does not give a trustworthy value-domain enum for
+`pin_type` or `pin_cmd`, so those remain explicit recovered wire values rather
+than receiving guessed public names.
+
+UICC response HCI opcode is `0xb505`. The outer wire order is BE `result: u16`,
+BE `type: u16`, BE `len: u16`, then `data[len]`. This differs from the historical
+`_UICC_INFO_RSP` callback-memory order in DWARF (`result`, `len`, `type`,
+`data`). Both B014 parser `0x20178` and live P4 parser `0x20f44` explicitly read
+wire bytes 4..5 into callback offset 2 and wire bytes 2..3 into callback offset
+4, proving the reshuffle. The clean `UiccResponse` keeps wire semantics and
+requires the embedded UICC length to equal the actual remaining HCI payload.
+
+For successful (`result == 0`) subtypes used during normal bring-up, both SDK
+versions copy the subtype data raw:
+
+- status response (`type 0`) is two bytes: `uicc_status`, `apptype`;
+- PIN-command response (`type 6`) is five bytes: `uicc_ret`, `umm_pin_type`,
+  `umm_pin_cmd`, PIN retry count, PUK retry count;
+- PIN-status response (`type 7`) is eleven bytes: `uicc_ret`, `global_pin`, then
+  three `PIN_STATUS` triplets (application, universal, local), each
+  `{status, pin_retries, puk_retries}`.
+
+Typed Rust response parsers reject outer nonzero results before interpreting
+subtype data, reject the wrong subtype, and require the exact recovered DWARF
+payload width.

@@ -1377,6 +1377,337 @@ impl PlmnSearchRequest {
     }
 }
 
+/// Recovered UICC control subtypes carried inside HCI request `0x3504` and
+/// response `0xb505`.
+pub mod uicc_control {
+    pub const STATUS: u16 = 0;
+    pub const READ_BINARY: u16 = 1;
+    pub const READ_RECORD: u16 = 2;
+    pub const UPDATE_BINARY: u16 = 3;
+    pub const UPDATE_RECORD: u16 = 4;
+    pub const AUTHENTICATE: u16 = 5;
+    pub const PIN_COMMAND: u16 = 6;
+    pub const PIN_STATUS: u16 = 7;
+    pub const REMOTE_COMMAND: u16 = 8;
+    pub const PIN_REQUIRED: u16 = 9;
+    pub const REFRESH: u16 = 10;
+    pub const USAT_TERMINAL_PROFILE: u16 = 11;
+    pub const USAT_ENVELOPE: u16 = 12;
+    pub const USAT_TERMINAL_RESPONSE: u16 = 13;
+    pub const POLL_INTERVAL_TIMER: u16 = 14;
+}
+
+/// Error while decoding the common UICC response envelope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiccResponseDecodeError {
+    Response(ResponseDecodeError),
+    DataLengthMismatch { declared: usize, actual: usize },
+}
+
+impl From<ResponseDecodeError> for UiccResponseDecodeError {
+    fn from(value: ResponseDecodeError) -> Self {
+        Self::Response(value)
+    }
+}
+
+/// Common borrowed UICC response envelope.
+///
+/// The wire order is `result`, `type`, `len`, `data`. B014 DWARF describes the
+/// historical callback object in a different host order (`result`, `len`,
+/// `type`, `data`); the OEM parser explicitly performs that reshuffle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UiccResponse<'a> {
+    pub result: u16,
+    pub kind: u16,
+    pub data: &'a [u8],
+}
+
+impl<'a> UiccResponse<'a> {
+    /// Decode the common six-byte UICC response envelope and validate its
+    /// embedded data length.
+    ///
+    /// # Errors
+    /// Returns [`UiccResponseDecodeError`] for the wrong HCI opcode, a
+    /// truncated envelope, or a declared UICC length that differs from the
+    /// bytes actually carried by the HCI packet.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, UiccResponseDecodeError> {
+        let payload = prefix_payload(packet, recovered_opcode::UICC_RESPONSE, 6)?;
+        let declared = usize::from(be_u16(payload, 4));
+        let data = &payload[6..];
+        if declared != data.len() {
+            return Err(UiccResponseDecodeError::DataLengthMismatch {
+                declared,
+                actual: data.len(),
+            });
+        }
+        Ok(Self {
+            result: be_u16(payload, 0),
+            kind: be_u16(payload, 2),
+            data,
+        })
+    }
+}
+
+/// Error while narrowing the common UICC envelope to a recovered typed
+/// response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiccTypedDecodeError {
+    Response(UiccResponseDecodeError),
+    FailureResult(u16),
+    UnexpectedKind { expected: u16, actual: u16 },
+    UnexpectedDataLength { expected: usize, actual: usize },
+}
+
+impl From<UiccResponseDecodeError> for UiccTypedDecodeError {
+    fn from(value: UiccResponseDecodeError) -> Self {
+        Self::Response(value)
+    }
+}
+
+fn successful_uicc_data(
+    packet: Packet<'_>,
+    expected_kind: u16,
+    expected_len: usize,
+) -> Result<&[u8], UiccTypedDecodeError> {
+    let response = UiccResponse::parse(packet)?;
+    if response.result != 0 {
+        return Err(UiccTypedDecodeError::FailureResult(response.result));
+    }
+    if response.kind != expected_kind {
+        return Err(UiccTypedDecodeError::UnexpectedKind {
+            expected: expected_kind,
+            actual: response.kind,
+        });
+    }
+    if response.data.len() != expected_len {
+        return Err(UiccTypedDecodeError::UnexpectedDataLength {
+            expected: expected_len,
+            actual: response.data.len(),
+        });
+    }
+    Ok(response.data)
+}
+
+fn encode_uicc_request(kind: u16, data: &[u8], output: &mut [u8]) -> Result<usize, EncodeError> {
+    let data_len = u16::try_from(data.len()).map_err(|_| EncodeError::PayloadTooLong)?;
+    let payload_len = data
+        .len()
+        .checked_add(4)
+        .ok_or(EncodeError::PayloadTooLong)?;
+    let frame_len = payload_len
+        .checked_add(HEADER_LEN)
+        .ok_or(EncodeError::PayloadTooLong)?;
+    if output.len() < frame_len {
+        return Err(EncodeError::NoSpace);
+    }
+    let payload_len_u16 = u16::try_from(payload_len).map_err(|_| EncodeError::PayloadTooLong)?;
+    output[..2].copy_from_slice(&recovered_opcode::UICC_REQUEST.to_be_bytes());
+    output[2..4].copy_from_slice(&payload_len_u16.to_be_bytes());
+    output[4..6].copy_from_slice(&kind.to_be_bytes());
+    output[6..8].copy_from_slice(&data_len.to_be_bytes());
+    output[8..frame_len].copy_from_slice(data);
+    Ok(frame_len)
+}
+
+/// UICC-status request (`type 0`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UiccStatusRequest {
+    pub app_type: u8,
+}
+
+impl UiccStatusRequest {
+    /// Encode the one-byte status request proven by `lted` and live P4.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than nine
+    /// bytes.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        encode_uicc_request(uicc_control::STATUS, &[self.app_type], output)
+    }
+}
+
+/// Successful status response (`type 0`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UiccStatusResponse {
+    pub uicc_status: u8,
+    pub app_type: u8,
+}
+
+impl UiccStatusResponse {
+    /// Decode a successful two-byte status response.
+    ///
+    /// # Errors
+    /// Returns [`UiccTypedDecodeError`] for outer failure, another subtype or
+    /// a status payload whose size differs from the recovered DWARF layout.
+    pub fn parse(packet: Packet<'_>) -> Result<Self, UiccTypedDecodeError> {
+        let data = successful_uicc_data(packet, uicc_control::STATUS, 2)?;
+        Ok(Self {
+            uicc_status: data[0],
+            app_type: data[1],
+        })
+    }
+}
+
+/// UICC PIN-status request (`type 7`). The OEM always emits a zero-length
+/// subtype payload.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UiccPinStatusRequest;
+
+impl UiccPinStatusRequest {
+    /// Encode the exact eight-byte HCI frame used by B014 and P4.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than eight
+    /// bytes.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        encode_uicc_request(uicc_control::PIN_STATUS, &[], output)
+    }
+}
+
+/// One three-byte PIN status triplet embedded in the type-7 response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PinStatus {
+    pub status: u8,
+    pub pin_retries: u8,
+    pub puk_retries: u8,
+}
+
+const fn pin_status(bytes: &[u8], offset: usize) -> PinStatus {
+    PinStatus {
+        status: bytes[offset],
+        pin_retries: bytes[offset + 1],
+        puk_retries: bytes[offset + 2],
+    }
+}
+
+/// Successful PIN-status response (`type 7`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UiccPinStatusResponse {
+    pub uicc_return: u8,
+    pub global_pin: u8,
+    pub application: PinStatus,
+    pub universal: PinStatus,
+    pub local: PinStatus,
+}
+
+impl UiccPinStatusResponse {
+    /// Decode the eleven-byte type-7 response described by B014 DWARF and
+    /// copied raw by both SDK response parsers.
+    ///
+    /// # Errors
+    /// Returns [`UiccTypedDecodeError`] for outer failure, another subtype or
+    /// the wrong payload size.
+    pub fn parse(packet: Packet<'_>) -> Result<Self, UiccTypedDecodeError> {
+        let data = successful_uicc_data(packet, uicc_control::PIN_STATUS, 11)?;
+        Ok(Self {
+            uicc_return: data[0],
+            global_pin: data[1],
+            application: pin_status(data, 2),
+            universal: pin_status(data, 5),
+            local: pin_status(data, 8),
+        })
+    }
+}
+
+/// One PIN/PUK string in the type-6 command request. The recovered SDK stores
+/// one length byte followed by an eight-byte fixed-capacity code buffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PinData<'a> {
+    pub code: &'a [u8],
+}
+
+/// Error while encoding a typed PIN command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiccPinEncodeError {
+    PinTooLong { maximum: usize, actual: usize },
+    Hci(EncodeError),
+}
+
+impl From<EncodeError> for UiccPinEncodeError {
+    fn from(value: EncodeError) -> Self {
+        Self::Hci(value)
+    }
+}
+
+fn encode_pin_data(pin: PinData<'_>, output: &mut [u8; 9]) -> Result<(), UiccPinEncodeError> {
+    if pin.code.len() > 8 {
+        return Err(UiccPinEncodeError::PinTooLong {
+            maximum: 8,
+            actual: pin.code.len(),
+        });
+    }
+    output[0] = u8::try_from(pin.code.len()).map_err(|_| UiccPinEncodeError::PinTooLong {
+        maximum: 8,
+        actual: pin.code.len(),
+    })?;
+    output[1..=pin.code.len()].copy_from_slice(pin.code);
+    Ok(())
+}
+
+/// UICC PIN command (`type 6`). `pin_type` and `pin_command` are intentionally
+/// kept as recovered wire values: the available DWARF names the fields but
+/// does not provide a trustworthy enum for their value domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UiccPinCommandRequest<'a> {
+    pub pin_type: u8,
+    pub pin_command: u8,
+    pub old_pin: PinData<'a>,
+    pub new_pin: PinData<'a>,
+}
+
+impl UiccPinCommandRequest<'_> {
+    /// Encode the exact twenty-byte type-6 payload copied by the live SDK.
+    ///
+    /// # Errors
+    /// Returns [`UiccPinEncodeError::PinTooLong`] for a PIN/PUK longer than
+    /// eight bytes or [`UiccPinEncodeError::Hci`] if the output buffer is too
+    /// short.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, UiccPinEncodeError> {
+        let mut data = [0_u8; 20];
+        data[0] = self.pin_type;
+        data[1] = self.pin_command;
+        let mut old = [0_u8; 9];
+        let mut new = [0_u8; 9];
+        encode_pin_data(self.old_pin, &mut old)?;
+        encode_pin_data(self.new_pin, &mut new)?;
+        data[2..11].copy_from_slice(&old);
+        data[11..20].copy_from_slice(&new);
+        Ok(encode_uicc_request(
+            uicc_control::PIN_COMMAND,
+            &data,
+            output,
+        )?)
+    }
+}
+
+/// Successful five-byte response to UICC PIN command (`type 6`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UiccPinCommandResponse {
+    pub uicc_return: u8,
+    pub pin_type: u8,
+    pub pin_command: u8,
+    pub pin_retries: u8,
+    pub puk_retries: u8,
+}
+
+impl UiccPinCommandResponse {
+    /// Decode the raw five-byte type-6 response copied by the OEM parser.
+    ///
+    /// # Errors
+    /// Returns [`UiccTypedDecodeError`] for outer failure, another subtype or
+    /// the wrong payload size.
+    pub fn parse(packet: Packet<'_>) -> Result<Self, UiccTypedDecodeError> {
+        let data = successful_uicc_data(packet, uicc_control::PIN_COMMAND, 5)?;
+        Ok(Self {
+            uicc_return: data[0],
+            pin_type: data[1],
+            pin_command: data[2],
+            pin_retries: data[3],
+            puk_retries: data[4],
+        })
+    }
+}
+
 /// Request with only the four-byte HCI header and no payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmptyRequest {
@@ -2986,6 +3317,135 @@ mod tests {
                 expected: 4,
                 actual: 3,
             })
+        );
+    }
+
+    #[test]
+    fn uicc_status_and_pin_status_requests_match_live_wire_frames() {
+        let mut status = [0_u8; 9];
+        assert_eq!(
+            super::UiccStatusRequest { app_type: 2 }.encode(&mut status),
+            Ok(9)
+        );
+        assert_eq!(
+            status,
+            [0x35, 0x04, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x02]
+        );
+
+        let mut pin_status = [0_u8; 8];
+        assert_eq!(super::UiccPinStatusRequest.encode(&mut pin_status), Ok(8));
+        assert_eq!(pin_status, [0x35, 0x04, 0x00, 0x04, 0x00, 0x07, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn uicc_response_envelope_uses_result_type_len_wire_order() {
+        let payload = [0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x05, 0x02];
+        assert_eq!(
+            super::UiccResponse::parse(packet(0xb505, &payload)),
+            Ok(super::UiccResponse {
+                result: 0,
+                kind: super::uicc_control::STATUS,
+                data: &[0x05, 0x02],
+            })
+        );
+        assert_eq!(
+            super::UiccStatusResponse::parse(packet(0xb505, &payload)),
+            Ok(super::UiccStatusResponse {
+                uicc_status: 5,
+                app_type: 2,
+            })
+        );
+
+        let mismatched = [0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x05, 0x02];
+        assert_eq!(
+            super::UiccResponse::parse(packet(0xb505, &mismatched)),
+            Err(super::UiccResponseDecodeError::DataLengthMismatch {
+                declared: 3,
+                actual: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn uicc_pin_status_and_command_responses_match_dwarf_layouts() {
+        let pin_status = [
+            0x00, 0x00, 0x00, 0x07, 0x00, 0x0b, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+        ];
+        assert_eq!(
+            super::UiccPinStatusResponse::parse(packet(0xb505, &pin_status)),
+            Ok(super::UiccPinStatusResponse {
+                uicc_return: 1,
+                global_pin: 2,
+                application: super::PinStatus {
+                    status: 3,
+                    pin_retries: 4,
+                    puk_retries: 5,
+                },
+                universal: super::PinStatus {
+                    status: 6,
+                    pin_retries: 7,
+                    puk_retries: 8,
+                },
+                local: super::PinStatus {
+                    status: 9,
+                    pin_retries: 10,
+                    puk_retries: 11,
+                },
+            })
+        );
+
+        let pin_command = [0x00, 0x00, 0x00, 0x06, 0x00, 0x05, 1, 2, 3, 4, 5];
+        assert_eq!(
+            super::UiccPinCommandResponse::parse(packet(0xb505, &pin_command)),
+            Ok(super::UiccPinCommandResponse {
+                uicc_return: 1,
+                pin_type: 2,
+                pin_command: 3,
+                pin_retries: 4,
+                puk_retries: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn uicc_pin_command_request_is_bounded_and_zero_pads_fixed_pin_data() {
+        let request = super::UiccPinCommandRequest {
+            pin_type: 1,
+            pin_command: 2,
+            old_pin: super::PinData { code: b"1234" },
+            new_pin: super::PinData { code: b"" },
+        };
+        let mut wire = [0_u8; 28];
+        assert_eq!(request.encode(&mut wire), Ok(28));
+        assert_eq!(
+            wire,
+            [
+                0x35, 0x04, 0x00, 0x18, 0x00, 0x06, 0x00, 0x14, 0x01, 0x02, 0x04, b'1', b'2', b'3',
+                b'4', 0, 0, 0, 0, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+            ]
+        );
+
+        let too_long = super::UiccPinCommandRequest {
+            pin_type: 1,
+            pin_command: 2,
+            old_pin: super::PinData { code: b"123456789" },
+            new_pin: super::PinData { code: b"" },
+        };
+        assert_eq!(
+            too_long.encode(&mut wire),
+            Err(super::UiccPinEncodeError::PinTooLong {
+                maximum: 8,
+                actual: 9,
+            })
+        );
+    }
+
+    #[test]
+    fn typed_uicc_response_rejects_outer_failure_before_interpreting_data() {
+        let payload = [0x00, 0x05, 0x00, 0x07, 0x00, 0x00];
+        assert_eq!(
+            super::UiccPinStatusResponse::parse(packet(0xb505, &payload)),
+            Err(super::UiccTypedDecodeError::FailureResult(5))
         );
     }
 }
