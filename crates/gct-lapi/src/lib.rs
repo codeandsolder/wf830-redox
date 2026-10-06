@@ -7,9 +7,218 @@
 //! their payload format is proven.
 
 use gct_hci::{
-    EncodeError, HEADER_LEN, Header, Packet, TlvCursor, TlvError, TlvWriter, encode_packet,
-    public_opcode, recovered_opcode,
+    EncodeError, HEADER_LEN, Header, Packet, Tlv, TlvCursor, TlvDecodeError, TlvError, TlvWriter,
+    encode_packet, public_opcode, recovered_opcode,
 };
+
+/// The two outer container tags consumed by the OEM `ATTACH_PDN_RSP_INFO`
+/// parser. The SDK accepts either tag in either of its two container slots and
+/// dispatches their contents through the same inner field table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdnInfoContainerKind {
+    F0,
+    F2,
+}
+
+impl TryFrom<u8> for PdnInfoContainerKind {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0xf0 => Ok(Self::F0),
+            0xf2 => Ok(Self::F2),
+            other => Err(other),
+        }
+    }
+}
+
+/// One borrowed nested PDN-info container.
+pub struct PdnInfoContainer<'a> {
+    pub kind: PdnInfoContainerKind,
+    fields: TlvCursor<'a>,
+}
+
+impl<'a> PdnInfoContainer<'a> {
+    /// Cursor over the inner `[type,len,payload]` fields.
+    #[must_use]
+    pub fn fields(self) -> TlvCursor<'a> {
+        self.fields
+    }
+}
+
+/// Cursor over the at-most-two contiguous `0xf0`/`0xf2` containers consumed by
+/// the OEM nested PDN parser.
+pub struct PdnInfoContainers<'a> {
+    cursor: TlvCursor<'a>,
+    count: u8,
+}
+
+impl<'a> PdnInfoContainers<'a> {
+    #[must_use]
+    pub const fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            cursor: TlvCursor::new(bytes),
+            count: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn remaining(&self) -> &'a [u8] {
+        self.cursor.remaining()
+    }
+
+    /// Decode the next OEM-recognized PDN container without swallowing the
+    /// enclosing response's first non-container TLV.
+    ///
+    /// # Errors
+    /// Returns [`TlvDecodeError`] for a truncated recognized container.
+    pub fn next_container(&mut self) -> Result<Option<PdnInfoContainer<'a>>, TlvDecodeError> {
+        if self.count >= 2 {
+            return Ok(None);
+        }
+        let remaining = self.cursor.remaining();
+        let Some(&kind_byte) = remaining.first() else {
+            return Ok(None);
+        };
+        let Ok(kind) = PdnInfoContainerKind::try_from(kind_byte) else {
+            return Ok(None);
+        };
+        let Some(container) = self.cursor.next_tlv()? else {
+            return Ok(None);
+        };
+        self.count += 1;
+        Ok(Some(PdnInfoContainer {
+            kind,
+            fields: TlvCursor::new(container.payload),
+        }))
+    }
+}
+
+/// `QoS` word selected by nested PDN TLVs `0x40..=0x44`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QosField {
+    Qci,
+    MaxBitRateUl,
+    MaxBitRateDl,
+    GuaranteedBitRateUl,
+    GuaranteedBitRateDl,
+}
+
+/// Semantic view of one inner field accepted by the OEM PDN-info dispatcher.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdnInfoField<'a> {
+    AccessPointName(&'a [u8]),
+    PdnType(u8),
+    PdnTypeCause(u32),
+    Ipv4Address([u8; 4]),
+    Ipv4DnsPrimary([u8; 4]),
+    Ipv4DnsSecondary([u8; 4]),
+    Ipv6DnsPrimary([u8; 16]),
+    Ipv6DnsSecondary([u8; 16]),
+    Ipv6InterfaceId([u8; 8]),
+    PcscfIpv6 {
+        index: u8,
+        address: [u8; 16],
+    },
+    PcscfIpv4 {
+        index: u8,
+        address: [u8; 4],
+    },
+    Qos {
+        field: QosField,
+        value: u32,
+    },
+    /// Field kind not present in the recovered first-match dispatch table.
+    Unknown(Tlv<'a>),
+}
+
+/// Semantic PDN field has a length inconsistent with its recovered target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PdnInfoFieldLengthError {
+    pub kind: u8,
+    pub expected: usize,
+    pub actual: usize,
+}
+
+fn exact_array<const N: usize>(tlv: Tlv<'_>) -> Result<[u8; N], PdnInfoFieldLengthError> {
+    <[u8; N]>::try_from(tlv.payload).map_err(|_| PdnInfoFieldLengthError {
+        kind: tlv.kind,
+        expected: N,
+        actual: tlv.payload.len(),
+    })
+}
+
+fn exact_u8(tlv: Tlv<'_>) -> Result<u8, PdnInfoFieldLengthError> {
+    exact_array::<1>(tlv).map(|bytes| bytes[0])
+}
+
+fn exact_u32(tlv: Tlv<'_>) -> Result<u32, PdnInfoFieldLengthError> {
+    exact_array::<4>(tlv).map(u32::from_be_bytes)
+}
+
+impl<'a> PdnInfoField<'a> {
+    /// Interpret one inner TLV using the recovered first-match dispatch table.
+    ///
+    /// The OEM table contains two entries for `0x22`; its dispatcher returns
+    /// after the first match, making the second (`opspec`) handler unreachable.
+    /// Effective firmware behavior therefore maps `0x22` to P-CSCF IPv4 #3.
+    ///
+    /// # Errors
+    /// Returns [`PdnInfoFieldLengthError`] for malformed known fields.
+    pub fn parse(tlv: Tlv<'a>) -> Result<Self, PdnInfoFieldLengthError> {
+        let field = match tlv.kind {
+            0x04 => {
+                if tlv.payload.len() > 128 {
+                    return Err(PdnInfoFieldLengthError {
+                        kind: 0x04,
+                        expected: 128,
+                        actual: tlv.payload.len(),
+                    });
+                }
+                Self::AccessPointName(tlv.payload)
+            }
+            0x05 => Self::PdnType(exact_u8(tlv)?),
+            0x06 => Self::PdnTypeCause(exact_u32(tlv)?),
+            0x07 => Self::Ipv4Address(exact_array(tlv)?),
+            0x08 => Self::Ipv4DnsPrimary(exact_array(tlv)?),
+            0x09 => Self::Ipv4DnsSecondary(exact_array(tlv)?),
+            0x0a => Self::Ipv6DnsPrimary(exact_array(tlv)?),
+            0x0b => Self::Ipv6DnsSecondary(exact_array(tlv)?),
+            0x0c => Self::Ipv6InterfaceId(exact_array(tlv)?),
+            0x0d..=0x11 => Self::PcscfIpv6 {
+                index: tlv.kind - 0x0c,
+                address: exact_array(tlv)?,
+            },
+            0x1f => Self::PcscfIpv4 {
+                index: 1,
+                address: exact_array(tlv)?,
+            },
+            0x21 => Self::PcscfIpv4 {
+                index: 2,
+                address: exact_array(tlv)?,
+            },
+            0x22 => Self::PcscfIpv4 {
+                index: 3,
+                address: exact_array(tlv)?,
+            },
+            0x40..=0x44 => {
+                let qos = match tlv.kind {
+                    0x40 => QosField::Qci,
+                    0x41 => QosField::MaxBitRateUl,
+                    0x42 => QosField::MaxBitRateDl,
+                    0x43 => QosField::GuaranteedBitRateUl,
+                    _ => QosField::GuaranteedBitRateDl,
+                };
+                Self::Qos {
+                    field: qos,
+                    value: exact_u32(tlv)?,
+                }
+            }
+            _ => Self::Unknown(tlv),
+        };
+        Ok(field)
+    }
+}
 
 /// Error returned when a proven response prefix does not match its wire
 /// contract.
@@ -982,8 +1191,9 @@ mod tests {
         AttachResponsePrefix, DetachRequest, DetachResponse, EmptyRequest, NetworkFeatureInfo,
         PcoInfo, PdnConnectExtRequest, PdnConnectExtResponsePrefix, PdnConnectRequest,
         PdnConnectResponsePrefix, PdnConnectionControl, PdnDisconnectRequest,
-        PdnDisconnectResponsePrefix, PdnEncodeError, PdnField, Positioning, ResponseDecodeError,
-        ResultResponse, ResultResponseKind,
+        PdnDisconnectResponsePrefix, PdnEncodeError, PdnField, PdnInfoContainerKind,
+        PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, Positioning, QosField,
+        ResponseDecodeError, ResultResponse, ResultResponseKind,
     };
     use gct_hci::{Header, Packet, Tlv};
 
@@ -1145,6 +1355,117 @@ mod tests {
         assert_eq!(
             invalid_control.encode(&mut output),
             Err(AttachEncodeError::PdnControlOutOfRange)
+        );
+    }
+
+    #[test]
+    fn nested_pdn_containers_stop_before_enclosing_suffix() {
+        let bytes = [
+            0xf0, 0x09, 0x07, 0x04, 10, 20, 30, 40, 0x05, 0x01, 3, 0xf2, 0x06, 0x40, 0x04, 0, 0, 0,
+            9, 0x5d, 0x00,
+        ];
+        let mut containers = PdnInfoContainers::new(&bytes);
+        let Ok(Some(first)) = containers.next_container() else {
+            return;
+        };
+        assert_eq!(first.kind, PdnInfoContainerKind::F0);
+        let mut fields = first.fields();
+        let Ok(Some(first_tlv)) = fields.next_tlv() else {
+            return;
+        };
+        assert_eq!(
+            PdnInfoField::parse(first_tlv),
+            Ok(PdnInfoField::Ipv4Address([10, 20, 30, 40]))
+        );
+        let Ok(Some(second_tlv)) = fields.next_tlv() else {
+            return;
+        };
+        assert_eq!(
+            PdnInfoField::parse(second_tlv),
+            Ok(PdnInfoField::PdnType(3))
+        );
+        assert!(matches!(fields.next_tlv(), Ok(None)));
+
+        let Ok(Some(second)) = containers.next_container() else {
+            return;
+        };
+        assert_eq!(second.kind, PdnInfoContainerKind::F2);
+        let mut qos_fields = second.fields();
+        let Ok(Some(qos_tlv)) = qos_fields.next_tlv() else {
+            return;
+        };
+        assert_eq!(
+            PdnInfoField::parse(qos_tlv),
+            Ok(PdnInfoField::Qos {
+                field: QosField::Qci,
+                value: 9
+            })
+        );
+        assert!(matches!(containers.next_container(), Ok(None)));
+        assert_eq!(containers.remaining(), &[0x5d, 0x00]);
+    }
+
+    #[test]
+    fn pdn_inner_dispatch_maps_recovered_fields() {
+        assert_eq!(
+            PdnInfoField::parse(Tlv {
+                kind: 0x08,
+                payload: &[1, 1, 1, 1]
+            }),
+            Ok(PdnInfoField::Ipv4DnsPrimary([1, 1, 1, 1]))
+        );
+        assert_eq!(
+            PdnInfoField::parse(Tlv {
+                kind: 0x0d,
+                payload: &[1; 16]
+            }),
+            Ok(PdnInfoField::PcscfIpv6 {
+                index: 1,
+                address: [1; 16]
+            })
+        );
+        assert_eq!(
+            PdnInfoField::parse(Tlv {
+                kind: 0x22,
+                payload: &[2, 3, 4, 5]
+            }),
+            Ok(PdnInfoField::PcscfIpv4 {
+                index: 3,
+                address: [2, 3, 4, 5]
+            })
+        );
+        assert_eq!(
+            PdnInfoField::parse(Tlv {
+                kind: 0x44,
+                payload: &[0, 0, 1, 0]
+            }),
+            Ok(PdnInfoField::Qos {
+                field: QosField::GuaranteedBitRateDl,
+                value: 256
+            })
+        );
+    }
+
+    #[test]
+    fn pdn_inner_dispatch_rejects_bad_known_lengths_and_preserves_unknowns() {
+        assert_eq!(
+            PdnInfoField::parse(Tlv {
+                kind: 0x07,
+                payload: &[1, 2, 3]
+            }),
+            Err(PdnInfoFieldLengthError {
+                kind: 0x07,
+                expected: 4,
+                actual: 3
+            })
+        );
+        let unknown = Tlv {
+            kind: 0xee,
+            payload: &[1, 2],
+        };
+        assert_eq!(
+            PdnInfoField::parse(unknown),
+            Ok(PdnInfoField::Unknown(unknown))
         );
     }
 

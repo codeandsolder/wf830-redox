@@ -252,3 +252,62 @@ it does not mirror the much larger callback structures populated by SDK state.
 format with strict truncation checks. `gct-lapi` exposes bounded response parsers
 for every fixed prefix above and leaves the parser-managed suffix borrowed until
 its nested grammar is independently proven.
+
+## Nested ATTACH/PDN response information
+
+The PIC table used by the inner nested parser resolves to B014 VA `0x89c54`.
+It contains 23 first-match entries. Correlating each handler's destination offset
+with B014 `PDN`/`LTE_QOS` DWARF gives the effective wire mapping:
+
+- `0x04`: APN (`PDN.ap_name`, max recovered destination 128 bytes)
+- `0x05`: PDN type (u8)
+- `0x06`: PDN type cause (device-endian u32)
+- `0x07`: IPv4 address
+- `0x08`, `0x09`: primary/secondary IPv4 DNS
+- `0x0a`, `0x0b`: primary/secondary IPv6 DNS
+- `0x0c`: IPv6 interface ID (8 bytes)
+- `0x0d..0x11`: P-CSCF IPv6 addresses 1..5
+- `0x1f`, `0x21`, `0x22`: P-CSCF IPv4 addresses 1..3
+- `0x40..0x44`: QCI, max UL, max DL, guaranteed UL, guaranteed DL as
+  five device-endian u32 values in `LTE_QOS`.
+
+The table then contains a second `0x22` entry whose handler writes `PDN.opspec_len`
+and `PDN.opspec`. The dispatcher returns after the first matching type, so this
+second `0x22` handler is unreachable in the OEM implementation. The clean parser
+records the effective first-match behavior (`0x22` = P-CSCF IPv4 #3) rather than
+inventing a corrected opcode for the dead handler.
+
+The enclosing nested parser accepts at most two contiguous outer containers,
+each tagged `0xf0` or `0xf2`, and runs the same inner dispatch table over their
+payloads. It stops before the first non-container field. `gct-lapi` now exposes
+this as borrowed `PdnInfoContainers` plus semantic `PdnInfoField` values, with
+strict fixed-length validation and unknown inner TLVs preserved as raw data.
+
+## Nested ATTACH/PDN response information
+
+The PIC table used by the inner nested parser resolves to B014 VA `0x89c54`.
+It contains 23 first-match entries. Correlating each handler destination offset
+with B014 `PDN`/`LTE_QOS` DWARF gives the effective wire mapping:
+
+- `0x04`: APN (`PDN.ap_name`, max recovered destination 128 bytes)
+- `0x05`: PDN type (u8)
+- `0x06`: PDN type cause (device-endian u32)
+- `0x07`: IPv4 address
+- `0x08`, `0x09`: primary/secondary IPv4 DNS
+- `0x0a`, `0x0b`: primary/secondary IPv6 DNS
+- `0x0c`: IPv6 interface ID (8 bytes)
+- `0x0d..0x11`: P-CSCF IPv6 addresses 1..5
+- `0x1f`, `0x21`, `0x22`: P-CSCF IPv4 addresses 1..3
+- `0x40..0x44`: QCI, max UL, max DL, guaranteed UL, guaranteed DL as five device-endian u32 values in `LTE_QOS`.
+
+The table then contains a second `0x22` entry whose handler writes `PDN.opspec_len`
+and `PDN.opspec`. The dispatcher returns after the first matching type, so this
+second `0x22` handler is unreachable in the OEM implementation. The clean parser
+records the effective first-match behavior (`0x22` = P-CSCF IPv4 #3) rather than
+inventing a corrected opcode for the dead handler.
+
+The enclosing nested parser accepts at most two contiguous outer containers,
+each tagged `0xf0` or `0xf2`, and runs the same inner dispatch table over their
+payloads. It stops before the first non-container field. `gct-lapi` now exposes
+this as borrowed `PdnInfoContainers` plus semantic `PdnInfoField` values, with
+strict fixed-length validation and unknown inner TLVs preserved as raw data.
