@@ -303,3 +303,64 @@ TLV `0x20`, then a descriptor-driven suffix: `0x57` = APN-NI (max 64 bytes),
 views. It is intentionally stricter than the old C on malformed input: exact
 one-byte transaction/apn-class fields, exact MTU/AMBR widths, APN/PCO destination
 bounds, truncation errors, and preservation of unknown or OEM-ignored bytes.
+
+## PLMN search/list wire grammar — live P4 confirmed
+
+B014 DWARF names `_PLMN_SEARCH_REQ_PARAM` as a nine-byte host structure
+(`search_mode`, three MCC digits, three MNC digits, `emergency_mode`,
+`roaming_option`), but `LAPI_PLMNSearchRequest` does not transmit that structure
+raw. B014 `0x436a8` and live P4 `0x46a1c` have the same encoder:
+
+- payload byte 0 is `search_mode`;
+- mode 0 emits wildcard PLMN bytes `ff ff ff`;
+- other modes pack the digit nibbles as `(mcc[1]<<4)|mcc[0]`,
+  `(mnc[2]<<4)|mcc[2]`, `(mnc[1]<<4)|mnc[0]`;
+- TLV `0x62` carries the one-byte emergency mode;
+- TLV `0x63` carries the one-byte roaming option.
+
+The resulting payload is ten bytes. `PLMNListRequest` (`0x310b`) remains an
+empty/header-only request.
+
+The response dispatch table maps `0xb10a` to B014 `0xf664` / P4 `0xfa88`, and
+`0xb10c` to B014 `0x1055c` / P4 `0x10980`. P4 preserves the same parser shape:
+search subtracts/adds a fixed 27-byte prefix, while list skips exactly one
+leading byte before calling the common record parser.
+
+PLMN-search response `0xb10a` has this fixed wire prefix:
+
+- `result: u32` at 0;
+- `selection_mode: u8` at 4;
+- selected PLMN ID `[u8;3]` at 5;
+- `next_index: u16` at 8;
+- `network_interval: u16` at 10;
+- signed `remaining_count: i8` at 12;
+- `band: u16` at 13;
+- `cell_id: u16` at 15;
+- `frequency: u32` at 17;
+- TAC `[u8;2]` at 21;
+- 28-bit-style cell ID stored as `u32` at 23.
+
+On successful search (`result == 0`) the OEM optionally consumes, in order,
+TLV `0x13` into the callback's standalone PLMN-priority word and TLV `0x26`
+into its 49-byte SIB1 PLMN-list destination. The `0x26` helper clamps lengths
+above 49 by modifying the incoming TLV length byte; the clean parser rejects
+such input instead. Remaining bytes are the shared PLMN-record stream.
+
+A wire PLMN record is *not* the eleven-byte `PLMN_INFO` callback structure.
+Helper table `0x89d2c` (B014) proves that one semantic record is assembled from
+three TLVs:
+
+- `0x12`: three-byte PLMN ID;
+- `0x13`: BE `u32` priority;
+- `0x14`: BE `u32` status.
+
+The old parser accepts those three tags in arbitrary order, increments the
+record destination only after three recognized fields, and allocates room for
+32 records. `PlmnInfoCursor` preserves order-independence for valid records but
+requires exactly one of each field, rejects unknown/duplicate/mis-sized TLVs,
+and enforces the recovered 32-record bound.
+
+PLMN-list response `0xb10c` is simply one `search_complete` byte followed by
+that same record stream. The SDK-computed `num_plmn_info` words present in the
+DWARF callback structs are not wire fields and are intentionally absent from
+the Rust representation.

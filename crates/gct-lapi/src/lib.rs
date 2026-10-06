@@ -1041,6 +1041,342 @@ impl<'a> PdnDisconnectFieldCursor<'a> {
     }
 }
 
+/// One semantic PLMN record assembled from the three TLVs used by GCT.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlmnInfo {
+    pub plmn_id: [u8; 3],
+    pub priority: u32,
+    pub status: u32,
+}
+
+/// Field names in one recovered PLMN record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlmnInfoField {
+    PlmnId,
+    Priority,
+    Status,
+}
+
+/// Error while assembling one PLMN record from its TLV stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlmnInfoDecodeError {
+    Tlv(TlvDecodeError),
+    UnknownKind(u8),
+    UnexpectedLength {
+        kind: u8,
+        expected: usize,
+        actual: usize,
+    },
+    DuplicateField(PlmnInfoField),
+    IncompleteRecord,
+    TooManyRecords,
+}
+
+impl From<TlvDecodeError> for PlmnInfoDecodeError {
+    fn from(value: TlvDecodeError) -> Self {
+        Self::Tlv(value)
+    }
+}
+
+/// Allocation-free cursor over GCT PLMN records.
+///
+/// The OEM parser writes into `PLMN_INFO[32]`, but one record is not an
+/// eleven-byte wire struct. It is exactly three TLVs: `0x12` PLMN ID (3
+/// bytes), `0x13` priority (BE u32) and `0x14` status (BE u32). The old code
+/// accepts those three tags in any order and advances to the next destination
+/// after three recognized fields. The clean parser keeps that order
+/// independence while requiring each semantic field exactly once.
+pub struct PlmnInfoCursor<'a> {
+    cursor: TlvCursor<'a>,
+    records: u8,
+}
+
+impl<'a> PlmnInfoCursor<'a> {
+    #[must_use]
+    pub const fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            cursor: TlvCursor::new(bytes),
+            records: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn remaining(&self) -> &'a [u8] {
+        self.cursor.remaining()
+    }
+
+    /// Decode one complete PLMN record.
+    ///
+    /// # Errors
+    /// Returns [`PlmnInfoDecodeError`] for malformed TLV framing, unknown or
+    /// duplicate record fields, wrong fixed widths, an incomplete record, or
+    /// more than the 32 records provisioned by the historical SDK.
+    pub fn next_record(&mut self) -> Result<Option<PlmnInfo>, PlmnInfoDecodeError> {
+        if self.cursor.remaining().is_empty() {
+            return Ok(None);
+        }
+        if self.records >= 32 {
+            return Err(PlmnInfoDecodeError::TooManyRecords);
+        }
+
+        let mut plmn_id = None;
+        let mut priority = None;
+        let mut status = None;
+        for _ in 0..3 {
+            let Some(tlv) = self.cursor.next_tlv()? else {
+                return Err(PlmnInfoDecodeError::IncompleteRecord);
+            };
+            match tlv.kind {
+                0x12 => {
+                    let Ok(value) = <[u8; 3]>::try_from(tlv.payload) else {
+                        return Err(PlmnInfoDecodeError::UnexpectedLength {
+                            kind: tlv.kind,
+                            expected: 3,
+                            actual: tlv.payload.len(),
+                        });
+                    };
+                    if plmn_id.replace(value).is_some() {
+                        return Err(PlmnInfoDecodeError::DuplicateField(PlmnInfoField::PlmnId));
+                    }
+                }
+                0x13 => {
+                    let Ok(value) = <[u8; 4]>::try_from(tlv.payload) else {
+                        return Err(PlmnInfoDecodeError::UnexpectedLength {
+                            kind: tlv.kind,
+                            expected: 4,
+                            actual: tlv.payload.len(),
+                        });
+                    };
+                    if priority.replace(u32::from_be_bytes(value)).is_some() {
+                        return Err(PlmnInfoDecodeError::DuplicateField(PlmnInfoField::Priority));
+                    }
+                }
+                0x14 => {
+                    let Ok(value) = <[u8; 4]>::try_from(tlv.payload) else {
+                        return Err(PlmnInfoDecodeError::UnexpectedLength {
+                            kind: tlv.kind,
+                            expected: 4,
+                            actual: tlv.payload.len(),
+                        });
+                    };
+                    if status.replace(u32::from_be_bytes(value)).is_some() {
+                        return Err(PlmnInfoDecodeError::DuplicateField(PlmnInfoField::Status));
+                    }
+                }
+                other => return Err(PlmnInfoDecodeError::UnknownKind(other)),
+            }
+        }
+
+        let (Some(plmn_id), Some(priority), Some(status)) = (plmn_id, priority, status) else {
+            return Err(PlmnInfoDecodeError::IncompleteRecord);
+        };
+        self.records += 1;
+        Ok(Some(PlmnInfo {
+            plmn_id,
+            priority,
+            status,
+        }))
+    }
+}
+
+/// Borrowed SIB1 PLMN-list payload from search-response TLV `0x26`.
+///
+/// The old destination is 49 bytes (`count` + 48 payload bytes). The OEM
+/// clamps larger TLVs by mutating their length byte; this clean parser rejects
+/// that malformed shape instead. A zero-length payload is representable because
+/// the historical destination was zero-initialized before a zero-byte copy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sib1PlmnList<'a> {
+    pub count: u8,
+    pub packed_plmn: &'a [u8],
+}
+
+/// Error returned while decoding a complete PLMN search response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlmnSearchDecodeError {
+    Response(ResponseDecodeError),
+    Tlv(TlvDecodeError),
+    UnexpectedMetadataLength {
+        kind: u8,
+        expected: usize,
+        actual: usize,
+    },
+    Sib1PlmnTooLong {
+        maximum: usize,
+        actual: usize,
+    },
+    MissingMetadata(u8),
+}
+
+impl From<ResponseDecodeError> for PlmnSearchDecodeError {
+    fn from(value: ResponseDecodeError) -> Self {
+        Self::Response(value)
+    }
+}
+
+impl From<TlvDecodeError> for PlmnSearchDecodeError {
+    fn from(value: TlvDecodeError) -> Self {
+        Self::Tlv(value)
+    }
+}
+
+/// Decoded fixed prefix and borrowed record stream of PLMN-search response
+/// `0xb10a`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlmnSearchResponse<'a> {
+    pub result: u32,
+    pub selection_mode: u8,
+    pub selected_plmn_id: [u8; 3],
+    pub next_index: u16,
+    pub network_interval: u16,
+    pub remaining_count: i8,
+    pub band: u16,
+    pub cell_id: u16,
+    pub frequency: u32,
+    pub tac: [u8; 2],
+    pub bit28_cell_id: u32,
+    pub plmn_priority: Option<u32>,
+    pub sib1_plmn: Option<Sib1PlmnList<'a>>,
+    records: &'a [u8],
+}
+
+impl<'a> PlmnSearchResponse<'a> {
+    /// Decode the recovered 27-byte fixed prefix plus the two contextual
+    /// success-only metadata TLVs at the head of the remaining stream.
+    ///
+    /// # Errors
+    /// Returns [`PlmnSearchDecodeError`] for the wrong opcode, truncated fixed
+    /// prefix or malformed contextual `0x13`/`0x26` metadata.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, PlmnSearchDecodeError> {
+        let payload = prefix_payload(packet, recovered_opcode::PLMN_SEARCH_RESPONSE, 27)?;
+        let result = be_u32(payload, 0);
+        let mut cursor = TlvCursor::new(&payload[27..]);
+        let mut plmn_priority = None;
+        let mut sib1_plmn = None;
+
+        if result == 0 {
+            if cursor.remaining().first() == Some(&0x13) {
+                let tlv = cursor
+                    .next_tlv()?
+                    .ok_or(PlmnSearchDecodeError::MissingMetadata(0x13))?;
+                let Ok(bytes) = <[u8; 4]>::try_from(tlv.payload) else {
+                    return Err(PlmnSearchDecodeError::UnexpectedMetadataLength {
+                        kind: tlv.kind,
+                        expected: 4,
+                        actual: tlv.payload.len(),
+                    });
+                };
+                plmn_priority = Some(u32::from_be_bytes(bytes));
+            }
+            if cursor.remaining().first() == Some(&0x26) {
+                let tlv = cursor
+                    .next_tlv()?
+                    .ok_or(PlmnSearchDecodeError::MissingMetadata(0x26))?;
+                if tlv.payload.len() > 49 {
+                    return Err(PlmnSearchDecodeError::Sib1PlmnTooLong {
+                        maximum: 49,
+                        actual: tlv.payload.len(),
+                    });
+                }
+                let (count, packed_plmn) = match tlv.payload.split_first() {
+                    Some((&count, rest)) => (count, rest),
+                    None => (0, &[][..]),
+                };
+                sib1_plmn = Some(Sib1PlmnList { count, packed_plmn });
+            }
+        }
+
+        Ok(Self {
+            result,
+            selection_mode: payload[4],
+            selected_plmn_id: [payload[5], payload[6], payload[7]],
+            next_index: be_u16(payload, 8),
+            network_interval: be_u16(payload, 10),
+            remaining_count: payload[12].cast_signed(),
+            band: be_u16(payload, 13),
+            cell_id: be_u16(payload, 15),
+            frequency: be_u32(payload, 17),
+            tac: [payload[21], payload[22]],
+            bit28_cell_id: be_u32(payload, 23),
+            plmn_priority,
+            sib1_plmn,
+            records: cursor.remaining(),
+        })
+    }
+
+    #[must_use]
+    pub const fn records(&self) -> PlmnInfoCursor<'a> {
+        PlmnInfoCursor::new(self.records)
+    }
+}
+
+/// PLMN-list response `0xb10c`: one `search_complete` byte followed by the
+/// shared PLMN-info TLV stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlmnListResponse<'a> {
+    pub search_complete: u8,
+    records: &'a [u8],
+}
+
+impl<'a> PlmnListResponse<'a> {
+    /// Decode the list-response prefix and borrow its PLMN record stream.
+    ///
+    /// # Errors
+    /// Returns [`ResponseDecodeError`] for the wrong opcode or an empty
+    /// payload.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, ResponseDecodeError> {
+        let payload = prefix_payload(packet, recovered_opcode::PLMN_LIST_RESPONSE, 1)?;
+        Ok(Self {
+            search_complete: payload[0],
+            records: &payload[1..],
+        })
+    }
+
+    #[must_use]
+    pub const fn records(&self) -> PlmnInfoCursor<'a> {
+        PlmnInfoCursor::new(self.records)
+    }
+}
+
+/// Typed PLMN-search request `0x3109`.
+///
+/// `search_mode == 0` makes the SDK send the wildcard PLMN bytes `ff ff ff`.
+/// Other modes pack caller-provided MCC/MNC nibbles into the same three-byte
+/// representation used by the live P4 implementation. `mnc[2] = 0x0f` is the
+/// conventional filler for a two-digit MNC; the codec deliberately does not
+/// invent digit validation absent from the OEM encoder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlmnSearchRequest {
+    pub search_mode: u8,
+    pub mcc: [u8; 3],
+    pub mnc: [u8; 3],
+    pub emergency_mode: u8,
+    pub roaming_option: u8,
+}
+
+impl PlmnSearchRequest {
+    /// Encode the exact ten-byte search payload recovered from B014 and live
+    /// P4, including TLVs `0x62` and `0x63`.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than the
+    /// fourteen-byte HCI frame.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        let mut payload = [0_u8; 10];
+        payload[0] = self.search_mode;
+        if self.search_mode == 0 {
+            payload[1..4].fill(0xff);
+        } else {
+            payload[1] = (self.mcc[1] << 4) | self.mcc[0];
+            payload[2] = (self.mnc[2] << 4) | self.mcc[2];
+            payload[3] = (self.mnc[1] << 4) | self.mnc[0];
+        }
+        payload[4..7].copy_from_slice(&[0x62, 0x01, self.emergency_mode]);
+        payload[7..10].copy_from_slice(&[0x63, 0x01, self.roaming_option]);
+        encode_packet(recovered_opcode::PLMN_SEARCH_REQUEST, &payload, output)
+    }
+}
+
 /// Request with only the four-byte HCI header and no payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmptyRequest {
@@ -2495,6 +2831,161 @@ mod tests {
                     actual: 2,
                 }
             ))
+        );
+    }
+
+    #[test]
+    fn plmn_search_request_matches_live_p4_packing() {
+        let automatic = super::PlmnSearchRequest {
+            search_mode: 0,
+            mcc: [2, 6, 0],
+            mnc: [0, 1, 0x0f],
+            emergency_mode: 1,
+            roaming_option: 2,
+        };
+        let mut automatic_wire = [0_u8; 14];
+        assert_eq!(automatic.encode(&mut automatic_wire), Ok(14));
+        assert_eq!(
+            automatic_wire,
+            [
+                0x31, 0x09, 0x00, 0x0a, 0x00, 0xff, 0xff, 0xff, 0x62, 0x01, 0x01, 0x63, 0x01, 0x02,
+            ]
+        );
+
+        let manual = super::PlmnSearchRequest {
+            search_mode: 1,
+            mcc: [2, 6, 0],
+            mnc: [0, 1, 0x0f],
+            emergency_mode: 3,
+            roaming_option: 4,
+        };
+        let mut manual_wire = [0_u8; 14];
+        assert_eq!(manual.encode(&mut manual_wire), Ok(14));
+        assert_eq!(
+            manual_wire,
+            [
+                0x31, 0x09, 0x00, 0x0a, 0x01, 0x62, 0xf0, 0x10, 0x62, 0x01, 0x03, 0x63, 0x01, 0x04,
+            ]
+        );
+
+        let mut short = [0_u8; 13];
+        assert_eq!(
+            manual.encode(&mut short),
+            Err(gct_hci::EncodeError::NoSpace)
+        );
+    }
+
+    #[test]
+    fn plmn_list_response_assembles_three_tlvs_per_record() {
+        let payload = [
+            0x01, 0x12, 0x03, 0x62, 0xf0, 0x10, 0x13, 0x04, 0, 0, 0, 7, 0x14, 0x04, 0, 0, 0, 9,
+            0x14, 0x04, 0, 0, 0, 3, 0x12, 0x03, 0x21, 0x43, 0x65, 0x13, 0x04, 0, 0, 0, 2,
+        ];
+        let Ok(response) = super::PlmnListResponse::parse(packet(0xb10c, &payload)) else {
+            return;
+        };
+        assert_eq!(response.search_complete, 1);
+        let mut records = response.records();
+        assert_eq!(
+            records.next_record(),
+            Ok(Some(super::PlmnInfo {
+                plmn_id: [0x62, 0xf0, 0x10],
+                priority: 7,
+                status: 9,
+            }))
+        );
+        assert_eq!(
+            records.next_record(),
+            Ok(Some(super::PlmnInfo {
+                plmn_id: [0x21, 0x43, 0x65],
+                priority: 2,
+                status: 3,
+            }))
+        );
+        assert_eq!(records.next_record(), Ok(None));
+    }
+
+    #[test]
+    fn plmn_search_response_splits_fixed_metadata_and_records() {
+        let payload = [
+            0x00, 0x00, 0x00, 0x00, 0x02, 0x62, 0xf0, 0x10, 0x00, 0x11, 0x00, 0x1e, 0xfe, 0x00,
+            0x03, 0x12, 0x34, 0x00, 0x00, 0x18, 0x9c, 0xaa, 0xbb, 0x01, 0x23, 0x45, 0x67, 0x13,
+            0x04, 0x00, 0x00, 0x00, 0x07, 0x26, 0x04, 0x01, 0x62, 0xf0, 0x10, 0x12, 0x03, 0x62,
+            0xf0, 0x10, 0x13, 0x04, 0x00, 0x00, 0x00, 0x01, 0x14, 0x04, 0x00, 0x00, 0x00, 0x02,
+        ];
+        let Ok(response) = super::PlmnSearchResponse::parse(packet(0xb10a, &payload)) else {
+            return;
+        };
+        assert_eq!(response.result, 0);
+        assert_eq!(response.selection_mode, 2);
+        assert_eq!(response.selected_plmn_id, [0x62, 0xf0, 0x10]);
+        assert_eq!(response.next_index, 0x11);
+        assert_eq!(response.network_interval, 30);
+        assert_eq!(response.remaining_count, -2);
+        assert_eq!(response.band, 3);
+        assert_eq!(response.cell_id, 0x1234);
+        assert_eq!(response.frequency, 6300);
+        assert_eq!(response.tac, [0xaa, 0xbb]);
+        assert_eq!(response.bit28_cell_id, 0x0123_4567);
+        assert_eq!(response.plmn_priority, Some(7));
+        assert_eq!(
+            response.sib1_plmn,
+            Some(super::Sib1PlmnList {
+                count: 1,
+                packed_plmn: &[0x62, 0xf0, 0x10],
+            })
+        );
+
+        let mut records = response.records();
+        assert_eq!(
+            records.next_record(),
+            Ok(Some(super::PlmnInfo {
+                plmn_id: [0x62, 0xf0, 0x10],
+                priority: 1,
+                status: 2,
+            }))
+        );
+        assert_eq!(records.next_record(), Ok(None));
+    }
+
+    #[test]
+    fn plmn_parsers_reject_ambiguous_or_unsafe_vendor_shapes() {
+        let duplicate = [
+            1, 0x12, 0x03, 1, 2, 3, 0x12, 0x03, 4, 5, 6, 0x14, 0x04, 0, 0, 0, 1,
+        ];
+        let Ok(response) = super::PlmnListResponse::parse(packet(0xb10c, &duplicate)) else {
+            return;
+        };
+        let mut records = response.records();
+        assert_eq!(
+            records.next_record(),
+            Err(super::PlmnInfoDecodeError::DuplicateField(
+                super::PlmnInfoField::PlmnId
+            ))
+        );
+
+        let mut oversized_sib1 = [0_u8; 79];
+        oversized_sib1[27] = 0x26;
+        oversized_sib1[28] = 50;
+        assert_eq!(
+            super::PlmnSearchResponse::parse(packet(0xb10a, &oversized_sib1)),
+            Err(super::PlmnSearchDecodeError::Sib1PlmnTooLong {
+                maximum: 49,
+                actual: 50,
+            })
+        );
+
+        let short_priority = [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x13,
+            0x03, 1, 2, 3,
+        ];
+        assert_eq!(
+            super::PlmnSearchResponse::parse(packet(0xb10a, &short_priority)),
+            Err(super::PlmnSearchDecodeError::UnexpectedMetadataLength {
+                kind: 0x13,
+                expected: 4,
+                actual: 3,
+            })
         );
     }
 }
