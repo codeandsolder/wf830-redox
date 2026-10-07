@@ -9,7 +9,10 @@
 use std::{io, io::Write};
 
 use gct_lapi::{EmptyRequest, ResultResponse, ResultResponseKind};
-use gct_runtime::{Modem, ModemCommand, SendCommandError};
+use gct_runtime::{
+    Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
+    SendTrackedCommandError,
+};
 use lted_compat::Server;
 use lted_proto::{SdkApiRequest, SdkCallback, SdkCallbackKind, SdkCommand};
 
@@ -22,7 +25,9 @@ pub enum HandleError {
     Ipc(io::Error),
     UnsupportedCommand(u16),
     UnexpectedParameters { command: u16, actual: usize },
+    UnknownDevice { requested: u32, expected: u32 },
     Send(SendCommandError),
+    Tracked(SendTrackedCommandError),
 }
 
 impl std::fmt::Display for HandleError {
@@ -36,7 +41,15 @@ impl std::fmt::Display for HandleError {
                 f,
                 "lted SDK command {command} expected zero parameters, got {actual} bytes"
             ),
+            Self::UnknownDevice {
+                requested,
+                expected,
+            } => write!(
+                f,
+                "lted SDK request addressed device {requested}, expected {expected}"
+            ),
             Self::Send(error) => write!(f, "modem send failed: {error:?}"),
+            Self::Tracked(error) => write!(f, "tracked modem send failed: {error:?}"),
         }
     }
 }
@@ -45,7 +58,11 @@ impl std::error::Error for HandleError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Ipc(error) => Some(error),
-            Self::UnsupportedCommand(_) | Self::UnexpectedParameters { .. } | Self::Send(_) => None,
+            Self::UnsupportedCommand(_)
+            | Self::UnexpectedParameters { .. }
+            | Self::UnknownDevice { .. }
+            | Self::Send(_)
+            | Self::Tracked(_) => None,
         }
     }
 }
@@ -59,6 +76,12 @@ impl From<io::Error> for HandleError {
 impl From<SendCommandError> for HandleError {
     fn from(value: SendCommandError) -> Self {
         Self::Send(value)
+    }
+}
+
+impl From<SendTrackedCommandError> for HandleError {
+    fn from(value: SendTrackedCommandError) -> Self {
+        Self::Tracked(value)
     }
 }
 
@@ -125,68 +148,141 @@ pub fn broadcast_result_callback(
     Ok(report)
 }
 
-/// Execute one stock SDK request and complete the OEM semaphore/shm synchronous
-/// return path.
+/// Per-physical-modem compatibility state.
 ///
-/// The recovered OEM sequence is preserved: acquire the daemon semaphore,
-/// clear `lte_api_ret`, attempt the LAPI send, store `0` on success or `1` on
-/// failure, then release the daemon semaphore. A logical/send failure is still
-/// returned to the caller after the stock client has been unblocked with status
-/// `1`.
-///
-/// # Errors
-/// Returns [`HandleError`] for an unused client slot, System V IPC failure,
-/// an unsupported/not-yet-translated command, unexpected legacy parameters, or
-/// a modem encode/write failure.
-pub fn handle_sdk_api<T: Write>(
-    server: &mut Server,
-    modem: &mut Modem<T>,
-    client_id: u8,
-    request: SdkApiRequest<'_>,
-) -> Result<HandledCall, HandleError> {
-    let context = server.client_context(client_id)?;
-    context.daemon_acquire()?;
-    if let Err(error) = context.write_i32_be(LTE_API_RET_OFFSET, 0) {
-        let _ = context.daemon_release();
-        return Err(error.into());
-    }
-
-    let dispatch = dispatch_zero_parameter(modem, request);
-    let status = i32::from(dispatch.is_err());
-    let status_result = context.write_i32_be(LTE_API_RET_OFFSET, status);
-    let release_result = context.daemon_release();
-
-    status_result?;
-    release_result?;
-    dispatch
+/// The stock SDK resolves every request through `device_find(handle, device_id)`
+/// and response handlers pass `device->device_id` back as the first callback
+/// argument. The replacement therefore binds one stable OEM device ID to one
+/// modem runtime instead of inventing request-side callback tokens.
+#[derive(Debug, Eq, PartialEq)]
+pub struct DeviceBridge {
+    device_id: u32,
+    pending: PendingRequests,
 }
 
-fn dispatch_zero_parameter<T: Write>(
-    modem: &mut Modem<T>,
-    request: SdkApiRequest<'_>,
-) -> Result<HandledCall, HandleError> {
-    let command = request
-        .known_command()
-        .map_err(|_| HandleError::UnsupportedCommand(request.command))?;
-    let empty = match command {
-        SdkCommand::PsInit => EmptyRequest::PsInit,
-        SdkCommand::Online => EmptyRequest::Online,
-        SdkCommand::Offline => EmptyRequest::Offline,
-        SdkCommand::PlmnList => EmptyRequest::PlmnList,
-        _ => return Err(HandleError::UnsupportedCommand(request.command)),
-    };
-    if !request.params.is_empty() {
-        return Err(HandleError::UnexpectedParameters {
-            command: request.command,
-            actual: request.params.len(),
-        });
+impl DeviceBridge {
+    #[must_use]
+    pub const fn new(device_id: u32) -> Self {
+        Self {
+            device_id,
+            pending: PendingRequests::new(),
+        }
     }
-    let bytes_written = modem.send_command(ModemCommand::Empty(empty))?;
-    Ok(HandledCall {
-        command,
-        device_id: request.device_id,
-        bytes_written,
-    })
+
+    #[must_use]
+    pub const fn device_id(&self) -> u32 {
+        self.device_id
+    }
+
+    #[must_use]
+    pub const fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Execute one stock SDK request and complete the OEM semaphore/shm
+    /// synchronous return path.
+    ///
+    /// The recovered OEM sequence is preserved: acquire the daemon semaphore,
+    /// clear `lte_api_ret`, attempt the LAPI send, store `0` on success or `1`
+    /// on failure, then release the daemon semaphore. Result-family requests are
+    /// tracked before touching GLIF so a second indistinguishable request cannot
+    /// steal the eventual callback.
+    ///
+    /// # Errors
+    /// Returns [`HandleError`] for an unused client slot, System V IPC failure,
+    /// a request for another physical device, an unsupported/not-yet-translated
+    /// command, unexpected legacy parameters, or a modem encode/write/pending
+    /// failure.
+    pub fn handle_sdk_api<T: Write>(
+        &mut self,
+        server: &mut Server,
+        modem: &mut Modem<T>,
+        client_id: u8,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let context = server.client_context(client_id)?;
+        context.daemon_acquire()?;
+        if let Err(error) = context.write_i32_be(LTE_API_RET_OFFSET, 0) {
+            let _ = context.daemon_release();
+            return Err(error.into());
+        }
+
+        let dispatch = if request.device_id == self.device_id {
+            self.dispatch_zero_parameter(modem, request)
+        } else {
+            Err(HandleError::UnknownDevice {
+                requested: request.device_id,
+                expected: self.device_id,
+            })
+        };
+        let status = i32::from(dispatch.is_err());
+        let status_result = context.write_i32_be(LTE_API_RET_OFFSET, status);
+        let release_result = context.daemon_release();
+
+        status_result?;
+        release_result?;
+        dispatch
+    }
+
+    /// Route one decoded modem event through the asynchronous stock callback
+    /// path implemented so far.
+    ///
+    /// Only terminal four-byte Online/Offline/PSInit result responses are
+    /// handled here. A result without a matching tracked request is ignored,
+    /// matching the replacement's conservative correlation policy.
+    ///
+    /// # Errors
+    /// Returns [`HandleError::Ipc`] when broadcasting to a subscribed stock
+    /// client fails.
+    pub fn handle_modem_event(
+        &mut self,
+        server: &mut Server,
+        event: &ModemEvent<'_>,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        let ModemEvent::Result { kind, response } = event else {
+            return Ok(None);
+        };
+        let key = ResponseKey::Result(*kind);
+        if !self.pending.remove(key) {
+            return Ok(None);
+        }
+        broadcast_result_callback(server, *kind, self.device_id, *response).map(Some)
+    }
+
+    fn dispatch_zero_parameter<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let command = request
+            .known_command()
+            .map_err(|_| HandleError::UnsupportedCommand(request.command))?;
+        let empty = match command {
+            SdkCommand::PsInit => EmptyRequest::PsInit,
+            SdkCommand::Online => EmptyRequest::Online,
+            SdkCommand::Offline => EmptyRequest::Offline,
+            SdkCommand::PlmnList => EmptyRequest::PlmnList,
+            _ => return Err(HandleError::UnsupportedCommand(request.command)),
+        };
+        if !request.params.is_empty() {
+            return Err(HandleError::UnexpectedParameters {
+                command: request.command,
+                actual: request.params.len(),
+            });
+        }
+        let modem_command = ModemCommand::Empty(empty);
+        let bytes_written = match empty {
+            EmptyRequest::Online | EmptyRequest::Offline | EmptyRequest::PsInit => {
+                modem.send_tracked_command(&mut self.pending, modem_command)?
+            }
+            EmptyRequest::PlmnList => modem.send_command(modem_command)?,
+        };
+        Ok(HandledCall {
+            command,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -201,7 +297,7 @@ mod tests {
     };
 
     use gct_lapi::{ResultResponse, ResultResponseKind};
-    use gct_runtime::Modem;
+    use gct_runtime::{Modem, ModemEvent};
     use gct_transport::HciIo;
     use lted_compat::Server;
     use lted_proto::{
@@ -210,7 +306,7 @@ mod tests {
     };
 
     use super::{
-        BroadcastReport, HandleError, LTE_API_RET_OFFSET, broadcast_result_callback, handle_sdk_api,
+        BroadcastReport, DeviceBridge, HandleError, LTE_API_RET_OFFSET, broadcast_result_callback,
     };
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -311,7 +407,9 @@ mod tests {
         let parsed = SdkApiRequest::parse(packet).unwrap_or_else(|_| std::process::abort());
         let transport = HciIo::new(Cursor::new(Vec::new()));
         let mut modem = Modem::new(transport);
-        let handled = handle_sdk_api(&mut server, &mut modem, id, parsed)
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        let handled = bridge
+            .handle_sdk_api(&mut server, &mut modem, id, parsed)
             .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(handled.command, SdkCommand::PsInit);
@@ -338,12 +436,15 @@ mod tests {
             let (_client, id) = open_client(&mut server, &dir, 0);
             let transport = HciIo::new(Cursor::new(Vec::new()));
             let mut modem = Modem::new(transport);
+            let device_id = u32::try_from(index).unwrap_or_else(|_| std::process::abort());
+            let mut bridge = DeviceBridge::new(device_id);
             let request = SdkApiRequest {
                 command: command as u16,
-                device_id: u32::try_from(index).unwrap_or_else(|_| std::process::abort()),
+                device_id,
                 params: &[],
             };
-            handle_sdk_api(&mut server, &mut modem, id, request)
+            bridge
+                .handle_sdk_api(&mut server, &mut modem, id, request)
                 .unwrap_or_else(|_| std::process::abort());
             assert_eq!(read_api_ret(&mut server, id), 0);
             assert_eq!(modem.into_transport().into_inner().into_inner(), expected);
@@ -433,6 +534,94 @@ mod tests {
         }
     }
 
+    #[test]
+    fn result_response_uses_stable_device_id_and_releases_pending_family() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (client, id) = open_client(&mut server, &dir, 0);
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::Online.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        let request = SdkApiRequest {
+            command: SdkCommand::Online as u16,
+            device_id: 0x1122_3344,
+            params: &[],
+        };
+        bridge
+            .handle_sdk_api(&mut server, &mut modem, id, request)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.pending_count(), 1);
+
+        let duplicate = bridge.handle_sdk_api(&mut server, &mut modem, id, request);
+        assert!(matches!(duplicate, Err(HandleError::Tracked(_))));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 1);
+
+        let event = ModemEvent::Result {
+            kind: ResultResponseKind::Online,
+            response: ResultResponse { result: 7 },
+        };
+        let report = bridge
+            .handle_modem_event(&mut server, &event)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            report,
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 16];
+        let len = client
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 59);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(callback.data, 7_u32.to_be_bytes());
+
+        bridge
+            .handle_sdk_api(&mut server, &mut modem, id, request)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(read_api_ret(&mut server, id), 0);
+    }
+
+    #[test]
+    fn request_for_another_physical_device_fails_before_glif_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(7);
+        let request = SdkApiRequest {
+            command: SdkCommand::PsInit as u16,
+            device_id: 8,
+            params: &[],
+        };
+        assert!(matches!(
+            bridge.handle_sdk_api(&mut server, &mut modem, id, request),
+            Err(HandleError::UnknownDevice {
+                requested: 8,
+                expected: 7,
+            })
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
+    }
+
     struct FailingWriter;
 
     impl Write for FailingWriter {
@@ -451,14 +640,15 @@ mod tests {
         let mut server = bind_server(&dir);
         let (_client, id) = open_client(&mut server, &dir, 0);
         let mut modem = Modem::new(HciIo::new(FailingWriter));
+        let mut bridge = DeviceBridge::new(1);
         let request = SdkApiRequest {
             command: SdkCommand::Online as u16,
             device_id: 1,
             params: &[],
         };
         assert!(matches!(
-            handle_sdk_api(&mut server, &mut modem, id, request),
-            Err(HandleError::Send(_))
+            bridge.handle_sdk_api(&mut server, &mut modem, id, request),
+            Err(HandleError::Tracked(_))
         ));
         assert_eq!(read_api_ret(&mut server, id), 1);
     }
@@ -470,6 +660,7 @@ mod tests {
         let (_client, id) = open_client(&mut server, &dir, 0);
         let transport = HciIo::new(Cursor::new(Vec::new()));
         let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
         let params = [0_u8; 352];
         let request = SdkApiRequest {
             command: SdkCommand::Attach as u16,
@@ -477,7 +668,7 @@ mod tests {
             params: &params,
         };
         assert!(matches!(
-            handle_sdk_api(&mut server, &mut modem, id, request),
+            bridge.handle_sdk_api(&mut server, &mut modem, id, request),
             Err(HandleError::UnsupportedCommand(value)) if value == SdkCommand::Attach as u16
         ));
         assert_eq!(read_api_ret(&mut server, id), 1);
@@ -494,13 +685,14 @@ mod tests {
         let (_client, id) = open_client(&mut server, &dir, 0);
         let transport = HciIo::new(Cursor::new(Vec::new()));
         let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
         let request = SdkApiRequest {
             command: SdkCommand::PsInit as u16,
             device_id: 1,
             params: &[0xaa],
         };
         assert!(matches!(
-            handle_sdk_api(&mut server, &mut modem, id, request),
+            bridge.handle_sdk_api(&mut server, &mut modem, id, request),
             Err(HandleError::UnexpectedParameters {
                 command,
                 actual: 1,
