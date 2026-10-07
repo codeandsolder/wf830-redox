@@ -9,7 +9,8 @@
 use std::{io, io::Write};
 
 use gct_lapi::{
-    EmptyRequest, PlmnInfoDecodeError, PlmnListResponse, ResultResponse, ResultResponseKind,
+    ApnType, AttachRequest, EmptyRequest, PdnConnectionControl, PlmnInfoDecodeError,
+    PlmnListResponse, Positioning, ResultResponse, ResultResponseKind,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -30,6 +31,7 @@ pub enum HandleError {
     UnsupportedCommand(u16),
     UnexpectedParameters { command: u16, actual: usize },
     UnknownDevice { requested: u32, expected: u32 },
+    LegacyAttach(LegacyAttachDecodeError),
     PlmnList(PlmnInfoDecodeError),
     Send(SendCommandError),
     Tracked(SendTrackedCommandError),
@@ -53,6 +55,7 @@ impl std::fmt::Display for HandleError {
                 f,
                 "lted SDK request addressed device {requested}, expected {expected}"
             ),
+            Self::LegacyAttach(error) => write!(f, "invalid stock attach request: {error:?}"),
             Self::PlmnList(error) => write!(f, "invalid PLMN-list response: {error:?}"),
             Self::Send(error) => write!(f, "modem send failed: {error:?}"),
             Self::Tracked(error) => write!(f, "tracked modem send failed: {error:?}"),
@@ -67,6 +70,7 @@ impl std::error::Error for HandleError {
             Self::UnsupportedCommand(_)
             | Self::UnexpectedParameters { .. }
             | Self::UnknownDevice { .. }
+            | Self::LegacyAttach(_)
             | Self::PlmnList(_)
             | Self::Send(_)
             | Self::Tracked(_) => None,
@@ -90,6 +94,143 @@ impl From<SendTrackedCommandError> for HandleError {
     fn from(value: SendTrackedCommandError) -> Self {
         Self::Tracked(value)
     }
+}
+
+pub const LEGACY_ATTACH_PARAMS_LEN: usize = 0x160;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyAttachStringField {
+    Apn,
+    Username,
+    Password,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyAttachDecodeError {
+    UnexpectedLength { expected: usize, actual: usize },
+    MissingTerminator(LegacyAttachStringField),
+    OperatorPcoTooLong { maximum: usize, actual: usize },
+}
+
+fn legacy_c_string(
+    bytes: &[u8],
+    field: LegacyAttachStringField,
+) -> Result<&[u8], LegacyAttachDecodeError> {
+    let Some(end) = bytes.iter().position(|&byte| byte == 0) else {
+        return Err(LegacyAttachDecodeError::MissingTerminator(field));
+    };
+    Ok(&bytes[..end])
+}
+
+const fn legacy_apn_type(value: u8) -> ApnType {
+    match value {
+        0 => ApnType::Internet,
+        1 => ApnType::Ims,
+        2 => ApnType::Admin,
+        3 => ApnType::App,
+        4 => ApnType::Emergency,
+        5 => ApnType::Reserved1,
+        6 => ApnType::Reserved2,
+        7 => ApnType::Reserved3,
+        _ => ApnType::NotSet,
+    }
+}
+
+/// Decode the exact 352-byte stock `_ATTACH_REQ_PARAM` into the clean request.
+///
+/// The offsets come from B014 DWARF and the fields consumed by live P4
+/// `LAPI_AttachRequest` were independently checked in disassembly. Fixed C
+/// strings are bounded here instead of reproducing the OEM `strlen` over-read
+/// hazard. When `optional_info == 0`, the modem wire request contains only that
+/// byte, so dead legacy fields are deliberately not validated.
+///
+/// # Errors
+/// Returns [`LegacyAttachDecodeError`] for a wrong legacy structure size,
+/// unterminated fixed string, or operator PCO length beyond its 100-byte slot.
+pub fn decode_legacy_attach(params: &[u8]) -> Result<AttachRequest<'_>, LegacyAttachDecodeError> {
+    if params.len() != LEGACY_ATTACH_PARAMS_LEN {
+        return Err(LegacyAttachDecodeError::UnexpectedLength {
+            expected: LEGACY_ATTACH_PARAMS_LEN,
+            actual: params.len(),
+        });
+    }
+
+    let optional_info = params[0];
+    if optional_info == 0 {
+        return Ok(AttachRequest {
+            optional_info,
+            transaction_id: 0,
+            apn: &[],
+            pdn_type: 0,
+            ip_alloc: 0,
+            username: &[],
+            password: &[],
+            auth_flag: 0,
+            general_pco: None,
+            operator_pco: None,
+            req_apn_type: ApnType::NotSet,
+            attach_type: 0,
+            request_type: 0,
+            emergency_mode: 0,
+            positioning: Positioning {
+                lpp: false,
+                lcs: false,
+            },
+            nas_sig_low_priority_ind: 0,
+            pdn_control: PdnConnectionControl {
+                max_conn: 0,
+                max_conn_t: 0,
+                wait_time: 0,
+            },
+            secure_pco: 0,
+        });
+    }
+
+    let apn = legacy_c_string(&params[0x002..0x066], LegacyAttachStringField::Apn)?;
+    let username = legacy_c_string(&params[0x068..0x0a8], LegacyAttachStringField::Username)?;
+    let password = legacy_c_string(&params[0x0a8..0x0e8], LegacyAttachStringField::Password)?;
+    let general_pco =
+        (params[0x0e9] != 0).then(|| u16::from_be_bytes([params[0x0ea], params[0x0eb]]));
+    let operator_pco = if params[0x0ec] == 0 {
+        None
+    } else {
+        let len = usize::from(params[0x0ed]);
+        if len > 100 {
+            return Err(LegacyAttachDecodeError::OperatorPcoTooLong {
+                maximum: 100,
+                actual: len,
+            });
+        }
+        Some(&params[0x0ee..0x0ee + len])
+    };
+
+    Ok(AttachRequest {
+        optional_info,
+        transaction_id: params[0x001],
+        apn,
+        pdn_type: params[0x066],
+        ip_alloc: params[0x067],
+        username,
+        password,
+        auth_flag: params[0x0e8],
+        general_pco,
+        operator_pco,
+        req_apn_type: legacy_apn_type(params[0x152]),
+        attach_type: params[0x153],
+        request_type: params[0x154],
+        emergency_mode: params[0x155],
+        positioning: Positioning {
+            lpp: params[0x156] == 1,
+            lcs: params[0x157] == 1,
+        },
+        nas_sig_low_priority_ind: params[0x158],
+        pdn_control: PdnConnectionControl {
+            max_conn: u16::from_be_bytes([params[0x159], params[0x15a]]),
+            max_conn_t: u16::from_be_bytes([params[0x15b], params[0x15c]]),
+            wait_time: u16::from_be_bytes([params[0x15d], params[0x15e]]),
+        },
+        secure_pco: params[0x15f],
+    })
 }
 
 const MAX_PLMN_RECORDS: usize = 32;
@@ -345,6 +486,7 @@ impl DeviceBridge {
                         })
                     }
                 }
+                Ok(SdkCommand::Attach) => self.dispatch_attach(modem, request),
                 Ok(_) => self.dispatch_zero_parameter(modem, request),
                 Err(_) => Err(HandleError::UnsupportedCommand(request.command)),
             }
@@ -410,6 +552,21 @@ impl DeviceBridge {
         }
     }
 
+    fn dispatch_attach<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let attach = decode_legacy_attach(request.params).map_err(HandleError::LegacyAttach)?;
+        let bytes_written =
+            modem.send_tracked_command(&mut self.pending, ModemCommand::Attach(attach))?;
+        Ok(HandledCall {
+            command: SdkCommand::Attach,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
     fn dispatch_zero_parameter<T: Write>(
         &mut self,
         modem: &mut Modem<T>,
@@ -468,8 +625,9 @@ mod tests {
     };
 
     use super::{
-        BroadcastReport, DeviceBridge, HandleError, LTE_API_RET_OFFSET, PS_INIT_COMPLETE_OFFSET,
-        StartupPhase, broadcast_result_callback,
+        BroadcastReport, DeviceBridge, HandleError, LTE_API_RET_OFFSET, LegacyAttachDecodeError,
+        LegacyAttachStringField, PS_INIT_COMPLETE_OFFSET, StartupPhase, broadcast_result_callback,
+        decode_legacy_attach,
     };
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -1035,27 +1193,133 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_call_is_released_with_failure_status() {
+    fn minimal_stock_attach_ignores_dead_legacy_fields() {
         let dir = TestDir::new();
         let mut server = bind_server(&dir);
         let (_client, id) = open_client(&mut server, &dir, 0);
         let transport = HciIo::new(Cursor::new(Vec::new()));
         let mut modem = Modem::new(transport);
         let mut bridge = DeviceBridge::new(1);
-        let params = [0_u8; 352];
+        let mut params = [0xff_u8; 352];
+        params[0] = 0;
         let request = SdkApiRequest {
             command: SdkCommand::Attach as u16,
             device_id: 1,
             params: &params,
         };
+
+        let call = bridge
+            .handle_sdk_api(&mut server, &mut modem, id, request)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.command, SdkCommand::Attach);
+        assert_eq!(call.bytes_written, 5);
+        assert_eq!(read_api_ret(&mut server, id), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            [0x31, 0x01, 0x00, 0x01, 0x00]
+        );
+    }
+
+    #[test]
+    fn stock_attach_layout_translates_to_exact_live_p4_hci() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let mut params = [0_u8; 352];
+        params[0x000] = 1;
+        params[0x001] = 7;
+        params[0x002..0x00a].copy_from_slice(b"internet");
+        params[0x066] = 3;
+        params[0x067] = 1;
+        params[0x068] = b'u';
+        params[0x0a8] = b'p';
+        params[0x0e8] = 2;
+        params[0x0e9] = 1;
+        params[0x0ea..0x0ec].copy_from_slice(&0x1234_u16.to_be_bytes());
+        params[0x0ec] = 1;
+        params[0x0ed] = 2;
+        params[0x0ee..0x0f0].copy_from_slice(&[0xaa, 0xbb]);
+        params[0x152] = 0;
+        params[0x153] = 4;
+        params[0x154] = 5;
+        params[0x155] = 0;
+        params[0x156] = 1;
+        params[0x157] = 0;
+        params[0x158] = 1;
+        params[0x159..0x15b].copy_from_slice(&20_u16.to_be_bytes());
+        params[0x15b..0x15d].copy_from_slice(&300_u16.to_be_bytes());
+        params[0x15d..0x15f].copy_from_slice(&10_u16.to_be_bytes());
+        params[0x15f] = 1;
+        let request = SdkApiRequest {
+            command: SdkCommand::Attach as u16,
+            device_id: 1,
+            params: &params,
+        };
+
+        let call = bridge
+            .handle_sdk_api(&mut server, &mut modem, id, request)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.command, SdkCommand::Attach);
+        assert_eq!(call.bytes_written, 71);
+        assert_eq!(read_api_ret(&mut server, id), 0);
+        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            [
+                0x31, 0x01, 0x00, 0x43, 0x01, 0x20, 0x01, 0x07, 0x02, 0x01, 0x75, 0x03, 0x01, 0x70,
+                0x04, 0x08, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x6e, 0x65, 0x74, 0x1e, 0x01, 0x02, 0x05,
+                0x01, 0x03, 0x01, 0x01, 0x01, 0x5c, 0x02, 0x12, 0x34, 0x5d, 0x02, 0xaa, 0xbb, 0x5f,
+                0x01, 0x04, 0x60, 0x01, 0x05, 0x70, 0x01, 0x03, 0x62, 0x01, 0x00, 0xf5, 0x02, 0x01,
+                0x00, 0xf6, 0x01, 0x01, 0x71, 0x06, 0x00, 0x14, 0x01, 0x2c, 0x00, 0x0a, 0xf7, 0x01,
+                0x01,
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_stock_attach_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let params = [0xff_u8; 352];
+        let request = SdkApiRequest {
+            command: SdkCommand::Attach as u16,
+            device_id: 1,
+            params: &params,
+        };
+
         assert!(matches!(
             bridge.handle_sdk_api(&mut server, &mut modem, id, request),
-            Err(HandleError::UnsupportedCommand(value)) if value == SdkCommand::Attach as u16
+            Err(HandleError::LegacyAttach(
+                LegacyAttachDecodeError::MissingTerminator(LegacyAttachStringField::Apn)
+            ))
         ));
         assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 0);
         assert_eq!(
             modem.into_transport().into_inner().into_inner(),
             Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn oversized_operator_pco_is_rejected_by_legacy_decoder() {
+        let mut params = [0_u8; 352];
+        params[0] = 1;
+        params[0x0ec] = 1;
+        params[0x0ed] = 101;
+        assert_eq!(
+            decode_legacy_attach(&params),
+            Err(LegacyAttachDecodeError::OperatorPcoTooLong {
+                maximum: 100,
+                actual: 101,
+            })
         );
     }
 

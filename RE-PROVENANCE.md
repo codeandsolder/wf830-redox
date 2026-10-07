@@ -156,6 +156,10 @@ The normal attach payload begins with the one-byte `optional_info`. If it is zer
 
 `gct-lapi::AttachRequest` now implements this live-P4 behavior directly. It uses borrowed byte slices rather than the historical fixed C arrays, but intentionally caps inputs to the proven safe OEM storage limits. The OEM SDK silently rewrites out-of-range PDN control values; the clean Rust API rejects them instead.
 
+`lted-bridge` now also translates stock SDK command 25 from the exact 352-byte `_ATTACH_REQ_PARAM` IPC payload into that clean request. The bridge uses the DWARF-proven offsets but does not recreate the C struct: APN/username/password are borrowed as bounded NUL-terminated slices, operator PCO length is checked against its 100-byte slot, packed `u16` fields are decoded big-endian, and `optional_info == 0` deliberately ignores all dead trailing legacy bytes. Unterminated fixed strings and impossible lengths fail before GLIF is touched.
+
+This request path has an independent stock-library gate. A tiny BE8 ARMv7 harness, dynamically linked to the unchanged P4 `liblted.so` and OEM uClibc under `qemu-armeb`, called `lted_client_init_ex` followed by `LTED_AttachRequest` against Rust `gctd`. After the normal automatic PSInit→Online startup, the pseudo-GLIF peer received exactly 71 bytes beginning `31 01 00 43` and matching the clean golden frame byte-for-byte; the stock wrapper returned success. This proves request-side command 25 interop through the real library. Stock Attach callback materialization remains a separate, not-yet-implemented proof gate.
+
 ## Typed PDN requests — live P4 authority
 
 B014 `lted` DWARF reconstructs the request-side C layouts used by the SDK:
