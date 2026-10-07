@@ -488,3 +488,71 @@ payload byte becomes `_AT_COMMAND_EXT_DATA.channel`; `cmd` points at byte 1 and
 shape. The OEM subtracts one without checking for a zero-length packet; the
 Rust parser requires the one-byte channel prefix and returns a truncation error
 for an empty `0xb324` payload instead of representing an underflowed length.
+
+## Live P4 GLIF transport and kernel read semantics
+
+The runtime transport is simpler than several earlier research notes implied.
+Live P4 `LAPI_LTEAPIOpen` at `0x40b98` allocates the SDK API handle and mutex
+state; it does not itself open `/dev/glif0`. The actual transport setup occurs
+inside P4 `io_recv_thread` at `0x718f0`:
+
+- `net_open` (`0x6b35c`) creates an `AF_PACKET`/`SOCK_DGRAM` socket used for
+  netdev/private-ioctl bookkeeping;
+- a separate character-device helper opens `/dev/glif0` with `O_RDWR`;
+- only the `/dev/glif0` fd is inserted into the receive thread's `select()`
+  read set;
+- when readable, the SDK calls `read(glif_fd, buffer, 32768)` and eventually
+  hands the returned byte count to `decode_hci_packet` (`0x37c3c`);
+- transmit paths, including `io_send_data` (`0x710dc`), ultimately call ordinary
+  `write(glif_fd, frame, len)` after OEM-local filtering/side effects.
+
+The live P4 kernel gives the exact stream behavior. In the symbolized kernel,
+`glif_open` is `0xd001bb88` and delegates to generic `gif_open`; the shared
+file operations are `gif_write` at `0xd001c02c` and `gif_read` at
+`0xd001c244`. The kernel is ARM BE8, so these functions must be decoded as
+little-endian ARM instruction words despite the big-endian ELF data encoding.
+
+`gif_read` dequeues one kernel buffer entry and computes its remaining byte
+count. If the caller buffer can hold the whole remainder, it copies all bytes
+to userspace, frees that entry and returns its full remaining length. If the
+caller buffer is smaller, it copies exactly the caller capacity, advances the
+entry's internal offset and leaves the rest queued for the next read. Therefore
+a userspace read can end in the middle of an HCI frame or batch. When no entry
+is ready the path uses `prepare_to_wait`, `schedule` and `finish_wait`, proving
+normal blocking character-device semantics rather than a message-only syscall.
+
+Conversely, P4 `decode_hci_packet` explicitly loops over the returned read
+buffer: it reads one BE HCI header, dispatches that packet, advances by
+`4 + payload_len`, and continues while consumed bytes are less than the read
+length. Thus one GLIF read can also contain multiple concatenated HCI packets.
+A correct clean runtime must support both directions of mismatch: many frames
+in one read and one frame split over multiple reads.
+
+`gif_write` forwards the supplied userspace byte pointer and length through the
+registered lower-driver callback chain and returns that callback result. The
+clean transport therefore uses normal safe Rust `Read`/`Write` semantics and
+`write_all` rather than reproducing SDK mutex/filter machinery in the byte
+transport itself.
+
+The SDK's nearby startup private ioctl is a separate netdev operation, not a
+character-device prerequisite. P4 `io_ioctl` (`0x70350`) sends outer
+`SIOCDEVPRIVATE` (`0x89f0`) through the packet socket with a 32-byte block
+containing interface name, private command, subcommand, length and user data
+pointer. Startup uses private command `0x8d10`, subcommand 7, length 2. Live
+`gdmlte.ko:gdm_lte_ioctl` (`0x2658`, decoded with ARM little-endian instruction
+words) routes that exact subcommand to a path that copies two zero bytes back to
+userspace and returns; it does not configure GLIF/HCI receive state. It can be
+preserved later as an OEM-compatible readiness probe, but it does not belong in
+the core `/dev/glif0` byte transport.
+
+The SDK also sends a separate zero-payload HCI command `0x3337` during startup
+from helper `0x71800`. Its semantic name is not yet proven by an authoritative
+header, so it remains a documented recovered initialization handshake rather
+than receiving a guessed typed API.
+
+`gct-transport` implements the proven core without `unsafe`: `GlifTransport`
+opens `/dev/glif0` read/write, while `HciStreamDecoder` retains an incomplete
+suffix across reads and dispatches all complete borrowed HCI packets. The
+observed 32768-byte SDK read buffer is exposed only as an informational
+constant, not as a protocol maximum; the actual HCI framing limit remains a
+four-byte header plus the `u16` payload length.

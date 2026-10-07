@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/gct-hci",
+    "crates/gct-transport",
     "crates/gct-lapi",
     "crates/lted-proto",
 ]

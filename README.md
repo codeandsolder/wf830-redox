@@ -9,7 +9,8 @@ and extracted proprietary files. Reverse-engineering inputs remain in the parent
 Current crates:
 
 - `gct-hci`: exact GCT HCI framing plus only verified public/recovered opcodes.
-- `gct-lapi`: typed clean encoders for proven attach/detach, PDN, PLMN, online/offline and AT request paths.
+- `gct-lapi`: typed clean codecs for proven attach/detach, PDN, PLMN, UICC, online/offline and AT paths.
+- `gct-transport`: safe `/dev/glif0` byte transport plus incremental HCI stream framing across split/coalesced reads.
 - `lted-proto`: exact local `lted` framing and the minimum critical SDK command set.
 
 The rule is evidence first: guessed layouts do not enter executable protocol

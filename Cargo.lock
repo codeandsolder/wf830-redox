@@ -14,5 +14,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "gct-transport"
+version = "0.1.0"
+dependencies = [
+ "gct-hci",
+]
+
+[[package]]
 name = "lted-proto"
 version = "0.1.0"
