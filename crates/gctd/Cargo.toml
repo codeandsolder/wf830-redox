@@ -1,0 +1,17 @@
+[package]
+name = "gctd"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gct-runtime = { path = "../gct-runtime" }
+gct-transport = { path = "../gct-transport" }
+lted-bridge = { path = "../lted-bridge" }
+lted-compat = { path = "../lted-compat" }
+lted-proto = { path = "../lted-proto" }
+rustix = { version = "1.1.5", features = ["event"] }
+
+[lints]
+workspace = true

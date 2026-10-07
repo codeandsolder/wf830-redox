@@ -6,7 +6,10 @@
 use std::{
     ffi::OsString,
     fs, io,
-    os::unix::net::{SocketAddr, UnixDatagram},
+    os::unix::{
+        fs::FileTypeExt,
+        net::{SocketAddr, UnixDatagram},
+    },
     path::{Path, PathBuf},
 };
 
@@ -112,6 +115,12 @@ impl Server {
         &self.common_path
     }
 
+    /// Borrow the common UNIX datagram socket for external readiness polling.
+    #[must_use]
+    pub const fn common_socket(&self) -> &UnixDatagram {
+        &self.common
+    }
+
     #[must_use]
     pub fn client_count(&self) -> usize {
         self.clients.iter().flatten().count()
@@ -144,6 +153,14 @@ impl Server {
             .get(usize::from(id))
             .and_then(Option::as_ref)
             .map(|client| client.socket_path.as_path())
+    }
+
+    /// Borrow one allocated private client socket for external readiness polling.
+    ///
+    /// # Errors
+    /// Returns `NotFound` for an unused client ID.
+    pub fn client_socket(&self, id: u8) -> io::Result<&UnixDatagram> {
+        self.client(id).map(|client| &client.socket)
     }
 
     /// Receive and complete one common-socket API-open handshake.
@@ -295,9 +312,32 @@ fn private_path(prefix: &Path, id: u8) -> PathBuf {
 }
 
 fn remove_stale_socket(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("refusing to replace non-socket path {}", path.display()),
+        ));
+    }
+
+    let probe = UnixDatagram::unbound()?;
+    match probe.connect(path) {
+        Ok(()) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("UNIX datagram endpoint {} is active", path.display()),
+        )),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            fs::remove_file(path)
+        }
         Err(error) => Err(error),
     }
 }
@@ -378,6 +418,46 @@ mod tests {
             .as_pathname()
             .map_or_else(|| std::process::abort(), Path::to_path_buf);
         (client, client_path, opened.id, source_path)
+    }
+
+    #[test]
+    fn active_common_socket_is_never_unlinked() {
+        let dir = TestDir::new();
+        let common = dir.join("daemon");
+        let _active = UnixDatagram::bind(&common).unwrap_or_else(|_| std::process::abort());
+        let error = Server::bind_paths(&common, dir.join("client-"))
+            .err()
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(common.exists());
+    }
+
+    #[test]
+    fn orphaned_common_socket_is_reclaimed() {
+        let dir = TestDir::new();
+        let common = dir.join("daemon");
+        {
+            let _orphan = UnixDatagram::bind(&common).unwrap_or_else(|_| std::process::abort());
+        }
+        assert!(common.exists());
+        let server = Server::bind_paths(&common, dir.join("client-"))
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(server.common_path(), common);
+    }
+
+    #[test]
+    fn non_socket_common_path_is_never_deleted() {
+        let dir = TestDir::new();
+        let common = dir.join("daemon");
+        fs::write(&common, b"do not delete").unwrap_or_else(|_| std::process::abort());
+        let error = Server::bind_paths(&common, dir.join("client-"))
+            .err()
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(
+            fs::read(&common).unwrap_or_else(|_| std::process::abort()),
+            b"do not delete"
+        );
     }
 
     #[test]
