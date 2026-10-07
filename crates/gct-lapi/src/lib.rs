@@ -1464,11 +1464,10 @@ impl From<UiccResponseDecodeError> for UiccTypedDecodeError {
     }
 }
 
-fn successful_uicc_data(
+fn successful_uicc_response(
     packet: Packet<'_>,
     expected_kind: u16,
-    expected_len: usize,
-) -> Result<&[u8], UiccTypedDecodeError> {
+) -> Result<UiccResponse<'_>, UiccTypedDecodeError> {
     let response = UiccResponse::parse(packet)?;
     if response.result != 0 {
         return Err(UiccTypedDecodeError::FailureResult(response.result));
@@ -1479,6 +1478,15 @@ fn successful_uicc_data(
             actual: response.kind,
         });
     }
+    Ok(response)
+}
+
+fn successful_uicc_data(
+    packet: Packet<'_>,
+    expected_kind: u16,
+    expected_len: usize,
+) -> Result<&[u8], UiccTypedDecodeError> {
+    let response = successful_uicc_response(packet, expected_kind)?;
     if response.data.len() != expected_len {
         return Err(UiccTypedDecodeError::UnexpectedDataLength {
             expected: expected_len,
@@ -1507,6 +1515,166 @@ fn encode_uicc_request(kind: u16, data: &[u8], output: &mut [u8]) -> Result<usiz
     output[6..8].copy_from_slice(&data_len.to_be_bytes());
     output[8..frame_len].copy_from_slice(data);
     Ok(frame_len)
+}
+
+/// UICC READ BINARY request (`type 1`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UiccReadBinaryRequest {
+    pub app_type: u8,
+    pub fid: u32,
+    pub offset: u16,
+    pub length: u16,
+}
+
+impl UiccReadBinaryRequest {
+    /// Encode the nine-byte subtype payload recovered from `lted` and live P4.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when the output buffer is too short.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        let mut data = [0_u8; 9];
+        data[0] = self.app_type;
+        data[1..5].copy_from_slice(&self.fid.to_be_bytes());
+        data[5..7].copy_from_slice(&self.offset.to_be_bytes());
+        data[7..9].copy_from_slice(&self.length.to_be_bytes());
+        encode_uicc_request(uicc_control::READ_BINARY, &data, output)
+    }
+}
+
+/// UICC READ RECORD request (`type 2`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UiccReadRecordRequest {
+    pub app_type: u8,
+    pub fid: u32,
+    pub record_index: u8,
+}
+
+impl UiccReadRecordRequest {
+    /// Encode the six-byte subtype payload recovered from `lted` and live P4.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when the output buffer is too short.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        let mut data = [0_u8; 6];
+        data[0] = self.app_type;
+        data[1..5].copy_from_slice(&self.fid.to_be_bytes());
+        data[5] = self.record_index;
+        encode_uicc_request(uicc_control::READ_RECORD, &data, output)
+    }
+}
+
+/// Error while decoding a variable-length UICC file-read response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiccFileDecodeError {
+    Typed(UiccTypedDecodeError),
+    TruncatedData { minimum: usize, actual: usize },
+    EmbeddedLengthMismatch { declared: usize, actual: usize },
+}
+
+impl From<UiccTypedDecodeError> for UiccFileDecodeError {
+    fn from(value: UiccTypedDecodeError) -> Self {
+        Self::Typed(value)
+    }
+}
+
+/// Borrowed successful READ BINARY response (`type 1`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UiccReadBinaryResponse<'a> {
+    pub uicc_return: u8,
+    pub app_type: u8,
+    pub fid: u32,
+    pub sw1: u8,
+    pub sw2: u8,
+    pub data: &'a [u8],
+}
+
+impl<'a> UiccReadBinaryResponse<'a> {
+    /// Decode the ten-byte fixed READ BINARY prefix and borrow exactly the
+    /// number of bytes declared by its BE `len` field.
+    ///
+    /// # Errors
+    /// Returns [`UiccFileDecodeError`] for a failed/wrong outer UICC response,
+    /// a truncated subtype prefix, or an embedded data length mismatch.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, UiccFileDecodeError> {
+        let response = successful_uicc_response(packet, uicc_control::READ_BINARY)?;
+        if response.data.len() < 10 {
+            return Err(UiccFileDecodeError::TruncatedData {
+                minimum: 10,
+                actual: response.data.len(),
+            });
+        }
+        let declared = usize::from(be_u16(response.data, 8));
+        let data = &response.data[10..];
+        if declared != data.len() {
+            return Err(UiccFileDecodeError::EmbeddedLengthMismatch {
+                declared,
+                actual: data.len(),
+            });
+        }
+        Ok(Self {
+            uicc_return: response.data[0],
+            app_type: response.data[1],
+            fid: be_u32(response.data, 2),
+            sw1: response.data[6],
+            sw2: response.data[7],
+            data,
+        })
+    }
+}
+
+/// Borrowed successful READ RECORD response (`type 2`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UiccReadRecordResponse<'a> {
+    pub uicc_return: u8,
+    pub app_type: u8,
+    pub fid: u32,
+    pub sw1: u8,
+    pub sw2: u8,
+    pub record_index: u8,
+    /// Total bytes returned in `data`, not `record_count * record_size`.
+    pub length: u8,
+    pub record_count: u8,
+    pub data: &'a [u8],
+}
+
+impl<'a> UiccReadRecordResponse<'a> {
+    /// Decode the eleven-byte READ RECORD prefix and borrow its payload.
+    ///
+    /// The B014 `lted` consumer iterates exactly to the byte at offset 9
+    /// (`len`) and merely reports `record_num` separately, so the embedded
+    /// length is validated directly against the remaining bytes.
+    ///
+    /// # Errors
+    /// Returns [`UiccFileDecodeError`] for a failed/wrong outer UICC response,
+    /// a truncated subtype prefix, or an embedded data length mismatch.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, UiccFileDecodeError> {
+        let response = successful_uicc_response(packet, uicc_control::READ_RECORD)?;
+        if response.data.len() < 11 {
+            return Err(UiccFileDecodeError::TruncatedData {
+                minimum: 11,
+                actual: response.data.len(),
+            });
+        }
+        let declared = usize::from(response.data[9]);
+        let data = &response.data[11..];
+        if declared != data.len() {
+            return Err(UiccFileDecodeError::EmbeddedLengthMismatch {
+                declared,
+                actual: data.len(),
+            });
+        }
+        Ok(Self {
+            uicc_return: response.data[0],
+            app_type: response.data[1],
+            fid: be_u32(response.data, 2),
+            sw1: response.data[6],
+            sw2: response.data[7],
+            record_index: response.data[8],
+            length: response.data[9],
+            record_count: response.data[10],
+            data,
+        })
+    }
 }
 
 /// UICC-status request (`type 0`).
@@ -3446,6 +3614,92 @@ mod tests {
         assert_eq!(
             super::UiccPinStatusResponse::parse(packet(0xb505, &payload)),
             Err(super::UiccTypedDecodeError::FailureResult(5))
+        );
+    }
+
+    #[test]
+    fn uicc_read_requests_match_recovered_big_endian_layouts() {
+        let binary = super::UiccReadBinaryRequest {
+            app_type: 2,
+            fid: 0x6f07,
+            offset: 0x0123,
+            length: 0x0040,
+        };
+        let mut binary_wire = [0_u8; 17];
+        assert_eq!(binary.encode(&mut binary_wire), Ok(17));
+        assert_eq!(
+            binary_wire,
+            [
+                0x35, 0x04, 0x00, 0x0d, 0x00, 0x01, 0x00, 0x09, 0x02, 0x00, 0x00, 0x6f, 0x07, 0x01,
+                0x23, 0x00, 0x40,
+            ]
+        );
+
+        let record = super::UiccReadRecordRequest {
+            app_type: 1,
+            fid: 0x6f3a,
+            record_index: 7,
+        };
+        let mut record_wire = [0_u8; 14];
+        assert_eq!(record.encode(&mut record_wire), Ok(14));
+        assert_eq!(
+            record_wire,
+            [
+                0x35, 0x04, 0x00, 0x0a, 0x00, 0x02, 0x00, 0x06, 0x01, 0x00, 0x00, 0x6f, 0x3a, 0x07,
+            ]
+        );
+    }
+
+    #[test]
+    fn uicc_read_binary_response_borrows_exact_embedded_length() {
+        let payload = [
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x0e, 0x00, 0x02, 0x00, 0x00, 0x6f, 0x07, 0x90, 0x00,
+            0x00, 0x04, 0xde, 0xad, 0xbe, 0xef,
+        ];
+        assert_eq!(
+            super::UiccReadBinaryResponse::parse(packet(0xb505, &payload)),
+            Ok(super::UiccReadBinaryResponse {
+                uicc_return: 0,
+                app_type: 2,
+                fid: 0x6f07,
+                sw1: 0x90,
+                sw2: 0x00,
+                data: &[0xde, 0xad, 0xbe, 0xef],
+            })
+        );
+
+        let bad_inner_len = [
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x0d, 0x00, 0x02, 0x00, 0x00, 0x6f, 0x07, 0x90, 0x00,
+            0x00, 0x04, 0xde, 0xad, 0xbe,
+        ];
+        assert_eq!(
+            super::UiccReadBinaryResponse::parse(packet(0xb505, &bad_inner_len)),
+            Err(super::UiccFileDecodeError::EmbeddedLengthMismatch {
+                declared: 4,
+                actual: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn uicc_read_record_response_uses_len_as_total_returned_bytes() {
+        let payload = [
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x6f, 0x3a, 0x90, 0x00,
+            0x07, 0x05, 0x02, 1, 2, 3, 4, 5,
+        ];
+        assert_eq!(
+            super::UiccReadRecordResponse::parse(packet(0xb505, &payload)),
+            Ok(super::UiccReadRecordResponse {
+                uicc_return: 0,
+                app_type: 1,
+                fid: 0x6f3a,
+                sw1: 0x90,
+                sw2: 0x00,
+                record_index: 7,
+                length: 5,
+                record_count: 2,
+                data: &[1, 2, 3, 4, 5],
+            })
         );
     }
 }

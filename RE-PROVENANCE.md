@@ -414,3 +414,32 @@ versions copy the subtype data raw:
 Typed Rust response parsers reject outer nonzero results before interpreting
 subtype data, reject the wrong subtype, and require the exact recovered DWARF
 payload width.
+
+## UICC READ BINARY / READ RECORD — live P4 confirmed
+
+B014 DWARF describes `_UICC_READ_BINARY_REQ` as exactly nine bytes:
+`app_type:u8`, `fid:u32`, `offset:u16`, `len:u16`. `_UICC_READ_RECORD_REQ` is
+exactly six bytes: `app_type:u8`, `fid:u32`, `record_idx:u8`. Both B014
+`LAPI_UICCRequest` and live P4 perform host-to-device conversion on the multi-
+byte fields before transmitting them inside the common UICC request envelope.
+The clean encoders therefore emit BE `fid`, BE binary offset and BE binary
+length directly, without materializing the historical packed structs.
+
+Successful READ BINARY response (`type 1`) is a ten-byte fixed subtype prefix
+followed by file data. B014 DWARF names the prefix fields as `uicc_ret`,
+`app_type`, `fid:u32`, `sw1`, `sw2`, `len:u16`; the response helper converts
+`fid` and `len` from device order. The Rust view borrows `data` and requires the
+BE embedded `len` at offset 8 to equal the actual remaining subtype bytes.
+This replaces the OEM callback's fixed 2028-byte data array.
+
+Successful READ RECORD response (`type 2`) is an eleven-byte fixed subtype
+prefix followed by record bytes: `uicc_ret`, `app_type`, `fid:u32`, `sw1`,
+`sw2`, `record_idx`, `len:u8`, `record_num:u8`, then `data`. Only `fid` needs
+endian conversion. The B014 `lted` consumer `print_uicc_read_record` iterates
+from zero up to byte 9 (`len`) and uses `record_num` only as separately reported
+metadata. Consequently `len` is validated as the total number of returned data
+bytes; it is not multiplied by `record_num`.
+
+Both response types remain allocation-free borrowed views and reject truncated
+fixed prefixes or disagreement between their embedded length and the common
+UICC envelope payload.
