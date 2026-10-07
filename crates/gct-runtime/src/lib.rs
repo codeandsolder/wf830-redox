@@ -14,15 +14,16 @@ use std::{
 use gct_hci::{EncodeError, Header, Packet, public_opcode, recovered_opcode};
 use gct_lapi::{
     AtCommand, AtCommandExt, AtCommandFromDevice, AtCommandFromDeviceExt, AttachEncodeError,
-    AttachRequest, AttachResponse, AttachResponseDecodeError, AttachResponseKind,
-    AttachResponsePrefix, DetachRequest, DetachRequiredIndication, DetachResponse, EmptyRequest,
-    PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse,
-    PdnDisconnectRequest, PdnDisconnectResponse, PdnEncodeError, PdnResponseDecodeError,
-    PlmnListResponse, PlmnSearchDecodeError, PlmnSearchRequest, PlmnSearchResponse,
-    PlmnSearchStopRequest, PlmnSearchStopResponse, ResponseDecodeError, ResultResponse,
-    ResultResponseKind, UiccAuthenticateEncodeError, UiccAuthenticateRequest,
-    UiccPinCommandRequest, UiccPinEncodeError, UiccPinStatusRequest, UiccReadBinaryRequest,
-    UiccReadRecordRequest, UiccResponse, UiccResponseDecodeError, UiccStatusRequest, uicc_control,
+    AttachExtEncodeError, AttachExtRequest, AttachRequest, AttachResponse,
+    AttachResponseDecodeError, AttachResponseKind, AttachResponsePrefix, DetachRequest,
+    DetachRequiredIndication, DetachResponse, EmptyRequest, PdnConnectExtRequest,
+    PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse, PdnDisconnectRequest,
+    PdnDisconnectResponse, PdnEncodeError, PdnResponseDecodeError, PlmnListResponse,
+    PlmnSearchDecodeError, PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest,
+    PlmnSearchStopResponse, ResponseDecodeError, ResultResponse, ResultResponseKind,
+    UiccAuthenticateEncodeError, UiccAuthenticateRequest, UiccPinCommandRequest,
+    UiccPinEncodeError, UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest,
+    UiccResponse, UiccResponseDecodeError, UiccStatusRequest, uicc_control,
 };
 use gct_transport::{
     GlifTransport, HciIo, HciStreamDecoder, MAX_HCI_FRAME_LEN, OEM_READ_BUFFER_LEN,
@@ -78,12 +79,12 @@ pub enum EventDecodeError {
 
 /// Typed outbound commands with fully recovered request encoders.
 ///
-/// Known-but-not-yet-recovered request families are deliberately absent. In
-/// particular, extended attach remains absent until its large request grammar
-/// is fully recovered rather than inferred from its known opcode.
+/// Request families remain absent until their executable wire grammar is
+/// independently recovered; known opcode adjacency alone is not sufficient.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModemCommand<'a> {
     Attach(AttachRequest<'a>),
+    AttachExt(AttachExtRequest<'a>),
     Detach(DetachRequest),
     PdnConnect(PdnConnectRequest<'a>),
     PdnConnectExt(PdnConnectExtRequest<'a>),
@@ -110,6 +111,7 @@ pub enum ModemCommand<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResponseKey {
     Attach(u8),
+    AttachExt,
     Detach,
     PdnConnect(u8),
     PdnConnectExt,
@@ -131,6 +133,7 @@ impl ModemCommand<'_> {
     pub const fn response_key(self) -> Option<ResponseKey> {
         match self {
             Self::Attach(request) => Some(ResponseKey::Attach(request.transaction_id)),
+            Self::AttachExt(_) => Some(ResponseKey::AttachExt),
             Self::Detach(_) => Some(ResponseKey::Detach),
             Self::PdnConnect(request) => Some(ResponseKey::PdnConnect(request.transaction_id)),
             Self::PdnConnectExt(_) => Some(ResponseKey::PdnConnectExt),
@@ -169,11 +172,8 @@ impl ModemEvent<'_> {
     pub const fn response_key(&self) -> Option<ResponseKey> {
         match self {
             Self::Attach(response) => Some(ResponseKey::Attach(response.transaction_id)),
-            Self::AttachExt(_)
-            | Self::DetachRequired(_)
-            | Self::At(_)
-            | Self::AtExt(_)
-            | Self::Unknown(_) => None,
+            Self::AttachExt(_) => Some(ResponseKey::AttachExt),
+            Self::DetachRequired(_) | Self::At(_) | Self::AtExt(_) | Self::Unknown(_) => None,
             Self::Detach(_) => Some(ResponseKey::Detach),
             Self::PdnConnect(response) => Some(ResponseKey::PdnConnect(response.transaction_id)),
             Self::PdnConnectExt(_) => Some(ResponseKey::PdnConnectExt),
@@ -262,6 +262,7 @@ impl PendingRequests {
 pub enum CommandEncodeError {
     Hci(EncodeError),
     Attach(AttachEncodeError),
+    AttachExt(AttachExtEncodeError),
     Pdn(PdnEncodeError),
     UiccAuthenticate(UiccAuthenticateEncodeError),
     UiccPin(UiccPinEncodeError),
@@ -276,6 +277,12 @@ impl From<EncodeError> for CommandEncodeError {
 impl From<AttachEncodeError> for CommandEncodeError {
     fn from(value: AttachEncodeError) -> Self {
         Self::Attach(value)
+    }
+}
+
+impl From<AttachExtEncodeError> for CommandEncodeError {
+    fn from(value: AttachExtEncodeError) -> Self {
+        Self::AttachExt(value)
     }
 }
 
@@ -346,6 +353,7 @@ pub fn encode_command(
 ) -> Result<usize, CommandEncodeError> {
     match command {
         ModemCommand::Attach(request) => Ok(request.encode(output)?),
+        ModemCommand::AttachExt(request) => Ok(request.encode(output)?),
         ModemCommand::Detach(request) => Ok(request.encode(output)?),
         ModemCommand::PdnConnect(request) => Ok(request.encode(output)?),
         ModemCommand::PdnConnectExt(request) => Ok(request.encode(output)?),
@@ -633,8 +641,9 @@ mod tests {
 
     use gct_hci::{Header, Packet, public_opcode, recovered_opcode};
     use gct_lapi::{
-        AtCommand, AtCommandExt, AtCommandFromDevice, EmptyRequest, PinData, PlmnSearchStopRequest,
-        ResponseDecodeError, ResultResponseKind, UiccPinCommandRequest,
+        AtCommand, AtCommandExt, AtCommandFromDevice, AttachExtProfile, AttachExtRequest,
+        EmptyRequest, PcoInfo, PinData, PlmnSearchStopRequest, ResponseDecodeError,
+        ResultResponseKind, UiccPinCommandRequest,
     };
     use gct_transport::HciIo;
 
@@ -676,6 +685,67 @@ mod tests {
                 0x33, 0x07, 0x00, 0x03, b'A', b'T', b'\n', // AT
             ]
         );
+    }
+
+    #[test]
+    fn runtime_tracks_extended_attach_as_single_family() {
+        let profile = AttachExtProfile {
+            ip_alloc: 0,
+            apn_class: 0,
+            apn: b"",
+            pdn_type: 0,
+            username: b"",
+            password: b"",
+            auth_flag: 0,
+            pco: PcoInfo {
+                first_pco: 0,
+                second_pco: 0,
+                n_pco: 0,
+                first_os_pco: 0,
+                second_os_pco: 0,
+                third_os_pco: 0,
+            },
+        };
+        let request = AttachExtRequest {
+            optional_info: 0,
+            primary: profile,
+            retry: profile,
+        };
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut pending = PendingRequests::new();
+
+        assert!(matches!(
+            modem.send_tracked_command(&mut pending, ModemCommand::AttachExt(request)),
+            Ok(5)
+        ));
+        assert!(pending.contains(ResponseKey::AttachExt));
+        assert!(matches!(
+            modem.send_tracked_command(&mut pending, ModemCommand::AttachExt(request)),
+            Err(SendTrackedCommandError::Pending(
+                PendingError::AlreadyPending(ResponseKey::AttachExt)
+            ))
+        ));
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![0x31, 0x65, 0x00, 0x01, 0x00]
+        );
+    }
+
+    #[test]
+    fn extended_attach_response_matches_family_key() {
+        let payload = [0, 1, 0, 2, 0x12, 0x34, 0x56, 0x78, 9, 10, 1, 2, 3, 4, 5];
+        let packet = Packet {
+            header: Header {
+                command: recovered_opcode::ATTACH_RESPONSE_EXT,
+                payload_len: 15,
+            },
+            payload: &payload,
+        };
+        let Ok(event) = decode_event(packet) else {
+            return;
+        };
+        assert_eq!(event.response_key(), Some(ResponseKey::AttachExt));
     }
 
     #[test]

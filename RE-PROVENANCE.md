@@ -607,16 +607,16 @@ not prerequisites for keeping the core HCI parser correct.
 
 The modem core now has a symmetric typed TX surface. `ModemCommand` contains
 only request families whose executable wire encoders have already been proven
-in `gct-lapi`: normal attach/detach, normal and extended PDN connect, PDN
-disconnect, PLMN search, the recovered zero-payload online/offline/PS-init and
-PLMN-list requests, normal AT, plus status/read-binary/read-record/authenticate/
-PIN-status/PIN-command UICC requests.
+in `gct-lapi`: normal and extended attach, detach, normal and extended PDN
+connect, PDN disconnect, PLMN search/search-stop, the recovered zero-payload
+online/offline/PS-init and PLMN-list requests, normal and extended AT, plus
+status/read-binary/read-record/authenticate/PIN-status/PIN-command UICC
+requests.
 
 Known SDK operations without a recovered encoder are intentionally absent.
-Specifically, the runtime does not synthesize extended-attach, extended-AT or
-PLMN-search-stop frames from opcode adjacency alone. Callers that truly need an
-untyped experimental frame still have the explicit low-level `send_bytes`
-escape hatch, but it is not part of the typed request API.
+Callers that truly need an untyped experimental frame still have the explicit
+low-level `send_bytes` escape hatch, but it is not part of the typed request
+API.
 
 `Modem::send_command` encodes into one reusable `MAX_HCI_FRAME_LEN` scratch
 buffer (4 + 65535 bytes) and only touches the GLIF writer after validation and
@@ -650,10 +650,10 @@ analogy.
 
 `gct-runtime::ResponseKey` consequently uses exact transaction IDs only for
 normal attach, normal PDN connect and PDN disconnect, where the response grammar
-actually exposes one. Detach, extended PDN, PLMN search/list and the individual
-online/offline/PS-init families use family-level identities; UICC uses its
-response subtype. AT is deliberately untracked because its inbound byte stream
-has no recovered one-request identity.
+actually exposes one. Extended attach, detach, extended PDN, PLMN search/list
+and the individual online/offline/PS-init families use family-level identities;
+UICC uses its response subtype. AT is deliberately untracked because its
+inbound byte stream has no recovered one-request identity.
 
 `PendingRequests` prevents a second indistinguishable request from being sent
 through `Modem::send_tracked_command`, while allowing concurrent exact-ID
@@ -661,6 +661,56 @@ requests with different TIDs. It intentionally does not auto-remove a key when
 an event arrives: some families (notably PLMN search/list) can be multipart, so
 terminal-response policy belongs in the command-specific state machine once
 that behavior is proven.
+
+## Extended attach — live P4 authority
+
+B014 DWARF describes `_ATTACH_REQ_EXT_PARAM` as a 484-byte historical C object.
+Its apparent size is mostly two fixed-capacity copies of the same logical PDN
+profile rather than 484 bytes of distinct protocol state:
+
+- `optional_info` at offset 0.
+- Primary profile: `ip_alloc` 1, `apn_class` 2, APN 3..102, `pdn_type` 103,
+  username 104..167, password 168..231, `auth_flag` 232 and nine-byte
+  `_PCO_INFO` at 233..241.
+- Retry profile: `ip_alloc` 242, `apn_class` 243, APN 244..343, `pdn_type` 344,
+  username 345..408, password 409..472, `auth_flag` 473 and `_PCO_INFO`
+  474..482.
+- `req_apn_type` at offset 483.
+
+The authoritative live P4 `LAPI_AttachRequestEXT` is at `0x44b70`; B014 has the
+same exported function at `0x417dc`. Both allocate a 2048-byte temporary frame,
+write request opcode `0x3165`, copy `optional_info` as payload byte 0 and, when
+that byte is zero, send a one-byte payload (five-byte HCI frame total).
+
+When optional data is enabled, live P4 calls its shared TLV encoder at
+`0x42564` in this exact order for the primary profile:
+
+`01 ip_alloc`, `20 apn_class`, `04 apn`, `05 pdn_type`, `02 username`,
+`03 password`, `1e auth_flag`, `21 PCO[9]`.
+
+It then emits the retry profile with the exact same tag sequence. B014 does the
+same through its shared helper at `0x3f2f4`. The three `u16` protocol IDs inside
+`_PCO_INFO` are converted through `H2D()` before the nine-byte block is emitted,
+so `AttachExtProfile` reuses the already-proven `PcoInfo` wire conversion.
+Context matters here: tag `0x20` is APN class in extended attach, whereas the
+normal-attach grammar uses `0x20` for its transaction ID.
+
+The old 100-byte APN arrays and 64-byte username/password arrays imply maximum
+serialized lengths of 99/63/63 bytes when preserving the OEM C-string safety
+boundary. The clean encoder validates those limits only when `optional_info`
+causes the fields to be serialized; the live SDK does not inspect those strings
+on the zero-optional path either.
+
+`req_apn_type` is intentionally not present in `AttachExtRequest`. Live P4 reads
+byte 483 before constructing the frame and stores it at offset `0x108` in its
+private per-device bookkeeping object, but no call to the TLV helper references
+that member and it never appears on the modem wire. Reproducing that SDK-local
+side effect would incorrectly turn implementation state into protocol syntax.
+
+The extended-attach response (`0xb166`) has no recovered transaction identity.
+`gct-runtime` therefore uses the conservative family key `ResponseKey::AttachExt`
+and rejects a second in-flight extended attach rather than inventing correlation
+metadata absent from the response.
 
 ## Extended AT and PLMN-search-stop
 

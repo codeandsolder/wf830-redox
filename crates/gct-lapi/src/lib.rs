@@ -2440,6 +2440,145 @@ impl AttachRequest<'_> {
     }
 }
 
+/// Variable-sized field in one of the two extended-attach PDN profiles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachExtField {
+    PrimaryApn,
+    PrimaryUsername,
+    PrimaryPassword,
+    RetryApn,
+    RetryUsername,
+    RetryPassword,
+}
+
+/// Error returned by the recovered extended-attach encoder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachExtEncodeError {
+    FieldTooLong(AttachExtField),
+    NoSpace,
+}
+
+impl From<TlvError> for AttachExtEncodeError {
+    fn from(value: TlvError) -> Self {
+        match value {
+            TlvError::NoSpace | TlvError::PayloadTooLong => Self::NoSpace,
+        }
+    }
+}
+
+/// One PDN profile carried by extended attach (`0x3165`).
+///
+/// The OEM ABI stores two copies of this logical shape at unrelated offsets in
+/// a 484-byte C structure. The clean type keeps only fields proven to be
+/// serialized by the live P4 encoder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttachExtProfile<'a> {
+    pub ip_alloc: u8,
+    pub apn_class: u8,
+    pub apn: &'a [u8],
+    pub pdn_type: u8,
+    pub username: &'a [u8],
+    pub password: &'a [u8],
+    pub auth_flag: u8,
+    pub pco: PcoInfo,
+}
+
+/// Clean representation of the live extended-attach request (`0x3165`).
+///
+/// `optional_info == 0` sends only that single byte. Otherwise the modem gets
+/// a complete primary profile followed by a complete retry profile. The OEM
+/// `req_apn_type` member is deliberately absent: live P4 copies it into SDK
+/// bookkeeping state but never serializes it into this HCI request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttachExtRequest<'a> {
+    pub optional_info: u8,
+    pub primary: AttachExtProfile<'a>,
+    pub retry: AttachExtProfile<'a>,
+}
+
+impl AttachExtRequest<'_> {
+    fn validate_profile(
+        profile: AttachExtProfile<'_>,
+        apn: AttachExtField,
+        username: AttachExtField,
+        password: AttachExtField,
+    ) -> Result<(), AttachExtEncodeError> {
+        if profile.apn.len() > 99 {
+            return Err(AttachExtEncodeError::FieldTooLong(apn));
+        }
+        if profile.username.len() > 63 {
+            return Err(AttachExtEncodeError::FieldTooLong(username));
+        }
+        if profile.password.len() > 63 {
+            return Err(AttachExtEncodeError::FieldTooLong(password));
+        }
+        Ok(())
+    }
+
+    fn encode_profile(
+        profile: AttachExtProfile<'_>,
+        tlv: &mut TlvWriter<'_>,
+    ) -> Result<(), AttachExtEncodeError> {
+        tlv.push_raw(0x01, &[profile.ip_alloc])?;
+        tlv.push_raw(0x20, &[profile.apn_class])?;
+        tlv.push_raw(0x04, profile.apn)?;
+        tlv.push_raw(0x05, &[profile.pdn_type])?;
+        tlv.push_raw(0x02, profile.username)?;
+        tlv.push_raw(0x03, profile.password)?;
+        tlv.push_raw(0x1e, &[profile.auth_flag])?;
+        tlv.push_raw(0x21, &profile.pco.wire_bytes())?;
+        Ok(())
+    }
+
+    /// Encode the exact live-P4 extended-attach frame.
+    ///
+    /// # Errors
+    /// Returns [`AttachExtEncodeError::FieldTooLong`] for a serialized string
+    /// exceeding its recovered fixed C capacity, or
+    /// [`AttachExtEncodeError::NoSpace`] when `output` is too small.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, AttachExtEncodeError> {
+        let Some(payload) = output.get_mut(HEADER_LEN..) else {
+            return Err(AttachExtEncodeError::NoSpace);
+        };
+        let Some(optional_info) = payload.first_mut() else {
+            return Err(AttachExtEncodeError::NoSpace);
+        };
+        *optional_info = self.optional_info;
+
+        let payload_len = if self.optional_info == 0 {
+            1
+        } else {
+            Self::validate_profile(
+                self.primary,
+                AttachExtField::PrimaryApn,
+                AttachExtField::PrimaryUsername,
+                AttachExtField::PrimaryPassword,
+            )?;
+            Self::validate_profile(
+                self.retry,
+                AttachExtField::RetryApn,
+                AttachExtField::RetryUsername,
+                AttachExtField::RetryPassword,
+            )?;
+            let mut tlv = TlvWriter::new(&mut payload[1..]);
+            Self::encode_profile(self.primary, &mut tlv)?;
+            Self::encode_profile(self.retry, &mut tlv)?;
+            1 + tlv.len()
+        };
+
+        let payload_len_u16 =
+            u16::try_from(payload_len).map_err(|_| AttachExtEncodeError::NoSpace)?;
+        output[..HEADER_LEN].copy_from_slice(
+            &Header {
+                command: recovered_opcode::ATTACH_REQUEST_EXT,
+                payload_len: payload_len_u16,
+            }
+            .encode(),
+        );
+        Ok(HEADER_LEN + payload_len)
+    }
+}
+
 /// Compact packet-configuration option block used by extended PDN connect.
 ///
 /// The old C structure is nine bytes. The three 16-bit protocol identifiers are
@@ -3502,6 +3641,134 @@ mod tests {
                 .any(|x| x == [0x71, 0x06, 0x00, 0x14, 0x01, 0x2c, 0x00, 0x0a])
         );
         assert_eq!(&encoded[encoded.len() - 3..], &[0x70, 0x01, 0x03]);
+    }
+
+    #[test]
+    fn extended_attach_matches_live_two_profile_wire_order() {
+        let primary = super::AttachExtProfile {
+            ip_alloc: 1,
+            apn_class: 7,
+            apn: b"ims",
+            pdn_type: 3,
+            username: b"u",
+            password: b"p",
+            auth_flag: 2,
+            pco: PcoInfo {
+                first_pco: 0x11,
+                second_pco: 0x22,
+                n_pco: 3,
+                first_os_pco: 0x1234,
+                second_os_pco: 0x5678,
+                third_os_pco: 0x9abc,
+            },
+        };
+        let retry = super::AttachExtProfile {
+            ip_alloc: 2,
+            apn_class: 8,
+            apn: b"r",
+            pdn_type: 4,
+            username: b"",
+            password: b"",
+            auth_flag: 1,
+            pco: PcoInfo {
+                first_pco: 0,
+                second_pco: 0,
+                n_pco: 0,
+                first_os_pco: 0,
+                second_os_pco: 0,
+                third_os_pco: 0,
+            },
+        };
+        let request = super::AttachExtRequest {
+            optional_info: 1,
+            primary,
+            retry,
+        };
+        let mut output = [0_u8; 69];
+        assert_eq!(request.encode(&mut output), Ok(69));
+        assert_eq!(
+            output,
+            [
+                0x31, 0x65, 0x00, 0x41, 0x01, 0x01, 0x01, 0x01, 0x20, 0x01, 0x07, 0x04, 0x03, b'i',
+                b'm', b's', 0x05, 0x01, 0x03, 0x02, 0x01, b'u', 0x03, 0x01, b'p', 0x1e, 0x01, 0x02,
+                0x21, 0x09, 0x11, 0x22, 0x03, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0x01, 0x01, 0x02,
+                0x20, 0x01, 0x08, 0x04, 0x01, b'r', 0x05, 0x01, 0x04, 0x02, 0x00, 0x03, 0x00, 0x1e,
+                0x01, 0x01, 0x21, 0x09, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ]
+        );
+    }
+
+    #[test]
+    fn extended_attach_optional_zero_is_exact_five_byte_frame() {
+        let oversized_apn = [b'a'; 100];
+        let oversized_credential = [b'x'; 64];
+        let ignored = super::AttachExtProfile {
+            ip_alloc: 0xff,
+            apn_class: 0xff,
+            apn: &oversized_apn,
+            pdn_type: 0xff,
+            username: &oversized_credential,
+            password: &oversized_credential,
+            auth_flag: 0xff,
+            pco: PcoInfo {
+                first_pco: 0xff,
+                second_pco: 0xff,
+                n_pco: 0xff,
+                first_os_pco: 0xffff,
+                second_os_pco: 0xffff,
+                third_os_pco: 0xffff,
+            },
+        };
+        let mut output = [0_u8; 5];
+        assert_eq!(
+            super::AttachExtRequest {
+                optional_info: 0,
+                primary: ignored,
+                retry: ignored,
+            }
+            .encode(&mut output),
+            Ok(5)
+        );
+        assert_eq!(output, [0x31, 0x65, 0x00, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn extended_attach_rejects_serialized_profile_overflow() {
+        let oversized_apn = [b'a'; 100];
+        let pco = PcoInfo {
+            first_pco: 0,
+            second_pco: 0,
+            n_pco: 0,
+            first_os_pco: 0,
+            second_os_pco: 0,
+            third_os_pco: 0,
+        };
+        let primary = super::AttachExtProfile {
+            ip_alloc: 0,
+            apn_class: 0,
+            apn: &oversized_apn,
+            pdn_type: 0,
+            username: b"",
+            password: b"",
+            auth_flag: 0,
+            pco,
+        };
+        let retry = super::AttachExtProfile {
+            apn: b"ok",
+            ..primary
+        };
+        let mut output = [0_u8; 512];
+        assert_eq!(
+            super::AttachExtRequest {
+                optional_info: 1,
+                primary,
+                retry,
+            }
+            .encode(&mut output),
+            Err(super::AttachExtEncodeError::FieldTooLong(
+                super::AttachExtField::PrimaryApn
+            ))
+        );
     }
 
     #[test]
