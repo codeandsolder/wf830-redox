@@ -425,6 +425,96 @@ impl AttachResponseKind {
     }
 }
 
+/// Error while decoding the recovered ordered portion of a normal attach
+/// response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachResponseDecodeError {
+    Response(ResponseDecodeError),
+    Tlv(TlvDecodeError),
+    MissingTransaction,
+    UnexpectedTransactionKind { expected: u8, actual: u8 },
+    UnexpectedTransactionLength { expected: usize, actual: usize },
+}
+
+impl From<ResponseDecodeError> for AttachResponseDecodeError {
+    fn from(value: ResponseDecodeError) -> Self {
+        Self::Response(value)
+    }
+}
+
+impl From<TlvDecodeError> for AttachResponseDecodeError {
+    fn from(value: TlvDecodeError) -> Self {
+        Self::Tlv(value)
+    }
+}
+
+/// Fully split proven portion of normal attach response `0xb102`.
+///
+/// Live P4 consumes the common 15-byte prefix and then calls a dedicated
+/// helper whose first operation requires tag `0x20`; it copies the first
+/// payload byte into `_ATTACH_RSP_INFO.transaction_id`. The clean parser also
+/// validates the recovered TLV length rather than reproducing the OEM helper's
+/// unchecked byte access. The remaining response fields stay borrowed until
+/// their descriptor grammar is independently recovered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttachResponse<'a> {
+    pub register_result1: u16,
+    pub register_result2: u16,
+    pub default_eps_id: u16,
+    pub eps_id: u16,
+    pub data_path: u8,
+    pub ip_alloc: u8,
+    pub network_features: NetworkFeatureInfo,
+    pub transaction_id: u8,
+    trailing_fields: &'a [u8],
+}
+
+impl<'a> AttachResponse<'a> {
+    /// Decode the common prefix plus mandatory normal-attach transaction TLV.
+    ///
+    /// # Errors
+    /// Returns [`AttachResponseDecodeError`] for the wrong opcode, a truncated
+    /// fixed prefix/TLV, a missing transaction field, any first suffix tag
+    /// other than `0x20`, or a transaction payload whose length is not one.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, AttachResponseDecodeError> {
+        let prefix = AttachResponsePrefix::parse(AttachResponseKind::Normal, packet)?;
+        let mut cursor = TlvCursor::new(prefix.optional_fields);
+        let transaction = cursor
+            .next_tlv()?
+            .ok_or(AttachResponseDecodeError::MissingTransaction)?;
+        if transaction.kind != 0x20 {
+            return Err(AttachResponseDecodeError::UnexpectedTransactionKind {
+                expected: 0x20,
+                actual: transaction.kind,
+            });
+        }
+        if transaction.payload.len() != 1 {
+            return Err(AttachResponseDecodeError::UnexpectedTransactionLength {
+                expected: 1,
+                actual: transaction.payload.len(),
+            });
+        }
+
+        Ok(Self {
+            register_result1: prefix.register_result1,
+            register_result2: prefix.register_result2,
+            default_eps_id: prefix.default_eps_id,
+            eps_id: prefix.eps_id,
+            data_path: prefix.data_path,
+            ip_alloc: prefix.ip_alloc,
+            network_features: prefix.network_features,
+            transaction_id: transaction.payload[0],
+            trailing_fields: cursor.remaining(),
+        })
+    }
+
+    /// Remaining descriptor-managed fields after the transaction TLV.
+    #[must_use]
+    pub const fn trailing_tlvs(&self) -> TlvCursor<'a> {
+        TlvCursor::new(self.trailing_fields)
+    }
+}
+
 impl<'a> AttachResponsePrefix<'a> {
     /// Decode the proven 15-byte common attach-response prefix and borrow the
     /// parser-managed suffix.
@@ -2746,13 +2836,13 @@ impl<'a> AtCommandFromDeviceExt<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApnType, AtCommand, AttachEncodeError, AttachField, AttachRequest, AttachResponseKind,
-        AttachResponsePrefix, DetachRequest, DetachResponse, EmptyRequest, NetworkFeatureInfo,
-        PcoInfo, PdnConnectExtRequest, PdnConnectExtResponsePrefix, PdnConnectRequest,
-        PdnConnectResponsePrefix, PdnConnectionControl, PdnDisconnectRequest,
-        PdnDisconnectResponsePrefix, PdnEncodeError, PdnField, PdnInfoContainerKind,
-        PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, Positioning, QosField,
-        ResponseDecodeError, ResultResponse, ResultResponseKind,
+        ApnType, AtCommand, AttachEncodeError, AttachField, AttachRequest, AttachResponse,
+        AttachResponseDecodeError, AttachResponseKind, AttachResponsePrefix, DetachRequest,
+        DetachResponse, EmptyRequest, NetworkFeatureInfo, PcoInfo, PdnConnectExtRequest,
+        PdnConnectExtResponsePrefix, PdnConnectRequest, PdnConnectResponsePrefix,
+        PdnConnectionControl, PdnDisconnectRequest, PdnDisconnectResponsePrefix, PdnEncodeError,
+        PdnField, PdnInfoContainerKind, PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError,
+        Positioning, QosField, ResponseDecodeError, ResultResponse, ResultResponseKind,
     };
     use gct_hci::{Header, Packet, Tlv};
 
@@ -2914,6 +3004,61 @@ mod tests {
         assert_eq!(
             invalid_control.encode(&mut output),
             Err(AttachEncodeError::PdnControlOutOfRange)
+        );
+    }
+
+    #[test]
+    fn normal_attach_response_requires_exact_transaction_tlv() {
+        let payload = [
+            0x00, 0x01, 0x00, 0x02, 0x12, 0x34, 0x56, 0x78, 0x09, 0x0a, 1, 2, 3, 4, 5, 0x20, 0x01,
+            0x7f, 0x5d, 0x00,
+        ];
+        let response = AttachResponse::parse(packet(0xb102, &payload));
+        let Ok(response) = response else {
+            return;
+        };
+        assert_eq!(response.transaction_id, 0x7f);
+        assert_eq!(response.register_result1, 1);
+        assert_eq!(response.default_eps_id, 0x1234);
+        let mut trailing = response.trailing_tlvs();
+        assert_eq!(
+            trailing.next_tlv(),
+            Ok(Some(Tlv {
+                kind: 0x5d,
+                payload: &[],
+            }))
+        );
+        assert_eq!(trailing.next_tlv(), Ok(None));
+    }
+
+    #[test]
+    fn normal_attach_response_rejects_missing_or_malformed_transaction() {
+        let prefix = [
+            0x00, 0x01, 0x00, 0x02, 0x12, 0x34, 0x56, 0x78, 0x09, 0x0a, 1, 2, 3, 4, 5,
+        ];
+        assert_eq!(
+            AttachResponse::parse(packet(0xb102, &prefix)),
+            Err(AttachResponseDecodeError::MissingTransaction)
+        );
+
+        let mut wrong_kind = prefix.to_vec();
+        wrong_kind.extend_from_slice(&[0x21, 0x01, 0x07]);
+        assert_eq!(
+            AttachResponse::parse(packet(0xb102, &wrong_kind)),
+            Err(AttachResponseDecodeError::UnexpectedTransactionKind {
+                expected: 0x20,
+                actual: 0x21,
+            })
+        );
+
+        let mut wrong_len = prefix.to_vec();
+        wrong_len.extend_from_slice(&[0x20, 0x02, 0x07, 0x08]);
+        assert_eq!(
+            AttachResponse::parse(packet(0xb102, &wrong_len)),
+            Err(AttachResponseDecodeError::UnexpectedTransactionLength {
+                expected: 1,
+                actual: 2,
+            })
         );
     }
 

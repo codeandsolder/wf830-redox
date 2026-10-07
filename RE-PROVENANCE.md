@@ -623,3 +623,41 @@ buffer (4 + 65535 bytes) and only touches the GLIF writer after validation and
 encoding succeed. This preserves the `u16` HCI maximum without per-request heap
 allocation and guarantees that local validation failures cannot produce a
 partial modem command.
+
+## Normal attach transaction identity and conservative correlation
+
+Live P4 gives a stronger normal-attach response grammar than the earlier
+15-byte-prefix-only model. Dispatch opcode `0xb102` targets handler `0xac9c`.
+After decoding the common fixed 15-byte prefix, the handler passes the suffix to
+helper `0xa9a0` and points the destination at `_ATTACH_RSP_INFO.transaction_id`.
+That helper checks the first suffix tag for `0x20`, copies byte 2 to the
+destination, and reports three bytes consumed. B014 `lted` DWARF independently
+places `transaction_id` at callback offset 634 (`0x27a`).
+
+The OEM helper does not validate the TLV length byte before reading byte 2. The
+clean `AttachResponse` parser therefore strengthens the recovered grammar to a
+mandatory first TLV `20 01 <tid>` and rejects missing, wrong-tag, truncated or
+non-one-byte transaction fields. Descriptor-managed fields after that TLV
+remain borrowed rather than guessed.
+
+The live normal-attach handler also reveals why transaction identity must not be
+invented for every response family: if its callback transaction field remains
+`0xff`, it falls back to `getTidByTid_type(1)` from SDK bookkeeping. In other
+words, the OEM SDK sometimes supplements modem wire data with local pending
+state. The extended-attach handler at `0xb4d8` has no equivalent TID-list path,
+and the clean runtime does not transfer normal-attach semantics to it by
+analogy.
+
+`gct-runtime::ResponseKey` consequently uses exact transaction IDs only for
+normal attach, normal PDN connect and PDN disconnect, where the response grammar
+actually exposes one. Detach, extended PDN, PLMN search/list and the individual
+online/offline/PS-init families use family-level identities; UICC uses its
+response subtype. AT is deliberately untracked because its inbound byte stream
+has no recovered one-request identity.
+
+`PendingRequests` prevents a second indistinguishable request from being sent
+through `Modem::send_tracked_command`, while allowing concurrent exact-ID
+requests with different TIDs. It intentionally does not auto-remove a key when
+an event arrives: some families (notably PLMN search/list) can be multipart, so
+terminal-response policy belongs in the command-specific state machine once
+that behavior is proven.

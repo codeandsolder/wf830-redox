@@ -14,14 +14,14 @@ use std::{
 use gct_hci::{EncodeError, Header, Packet, public_opcode, recovered_opcode};
 use gct_lapi::{
     AtCommand, AtCommandFromDevice, AtCommandFromDeviceExt, AttachEncodeError, AttachRequest,
-    AttachResponseKind, AttachResponsePrefix, DetachRequest, DetachRequiredIndication,
-    DetachResponse, EmptyRequest, PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest,
-    PdnConnectResponse, PdnDisconnectRequest, PdnDisconnectResponse, PdnEncodeError,
-    PdnResponseDecodeError, PlmnListResponse, PlmnSearchDecodeError, PlmnSearchRequest,
-    PlmnSearchResponse, ResponseDecodeError, ResultResponse, ResultResponseKind,
-    UiccAuthenticateEncodeError, UiccAuthenticateRequest, UiccPinCommandRequest,
-    UiccPinEncodeError, UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest,
-    UiccResponse, UiccResponseDecodeError, UiccStatusRequest,
+    AttachResponse, AttachResponseDecodeError, AttachResponseKind, AttachResponsePrefix,
+    DetachRequest, DetachRequiredIndication, DetachResponse, EmptyRequest, PdnConnectExtRequest,
+    PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse, PdnDisconnectRequest,
+    PdnDisconnectResponse, PdnEncodeError, PdnResponseDecodeError, PlmnListResponse,
+    PlmnSearchDecodeError, PlmnSearchRequest, PlmnSearchResponse, ResponseDecodeError,
+    ResultResponse, ResultResponseKind, UiccAuthenticateEncodeError, UiccAuthenticateRequest,
+    UiccPinCommandRequest, UiccPinEncodeError, UiccPinStatusRequest, UiccReadBinaryRequest,
+    UiccReadRecordRequest, UiccResponse, UiccResponseDecodeError, UiccStatusRequest, uicc_control,
 };
 use gct_transport::{
     GlifTransport, HciIo, HciStreamDecoder, MAX_HCI_FRAME_LEN, OEM_READ_BUFFER_LEN,
@@ -44,10 +44,8 @@ pub struct PollOutcome {
 /// unsupported event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModemEvent<'a> {
-    Attach {
-        kind: AttachResponseKind,
-        response: AttachResponsePrefix<'a>,
-    },
+    Attach(AttachResponse<'a>),
+    AttachExt(AttachResponsePrefix<'a>),
     Detach(DetachResponse),
     DetachRequired(DetachRequiredIndication),
     PdnConnect(PdnConnectResponse<'a>),
@@ -70,6 +68,7 @@ pub enum ModemEvent<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventDecodeError {
     Response(ResponseDecodeError),
+    Attach(AttachResponseDecodeError),
     Pdn(PdnResponseDecodeError),
     PlmnSearch(PlmnSearchDecodeError),
     Uicc(UiccResponseDecodeError),
@@ -96,6 +95,157 @@ pub enum ModemCommand<'a> {
     UiccAuthenticate(UiccAuthenticateRequest<'a>),
     UiccPinStatus(UiccPinStatusRequest),
     UiccPinCommand(UiccPinCommandRequest<'a>),
+}
+
+/// Identity available on both sides of a proven request/response exchange.
+///
+/// Exact transaction IDs are used only where the recovered modem response
+/// actually carries them. Families without a wire identity deliberately use a
+/// family-level key, preventing two indistinguishable requests from being
+/// tracked concurrently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResponseKey {
+    Attach(u8),
+    Detach,
+    PdnConnect(u8),
+    PdnConnectExt,
+    PdnDisconnect(u8),
+    PlmnSearch,
+    PlmnList,
+    Result(ResultResponseKind),
+    Uicc(u16),
+}
+
+impl ModemCommand<'_> {
+    /// Response identity recoverable for this command.
+    ///
+    /// AT commands intentionally return `None`: their response stream has no
+    /// recovered request identifier and may produce multiple asynchronous AT
+    /// chunks.
+    #[must_use]
+    pub const fn response_key(self) -> Option<ResponseKey> {
+        match self {
+            Self::Attach(request) => Some(ResponseKey::Attach(request.transaction_id)),
+            Self::Detach(_) => Some(ResponseKey::Detach),
+            Self::PdnConnect(request) => Some(ResponseKey::PdnConnect(request.transaction_id)),
+            Self::PdnConnectExt(_) => Some(ResponseKey::PdnConnectExt),
+            Self::PdnDisconnect(request) => {
+                Some(ResponseKey::PdnDisconnect(request.transaction_id))
+            }
+            Self::PlmnSearch(_) => Some(ResponseKey::PlmnSearch),
+            Self::Empty(EmptyRequest::PlmnList) => Some(ResponseKey::PlmnList),
+            Self::Empty(EmptyRequest::Online) => {
+                Some(ResponseKey::Result(ResultResponseKind::Online))
+            }
+            Self::Empty(EmptyRequest::Offline) => {
+                Some(ResponseKey::Result(ResultResponseKind::Offline))
+            }
+            Self::Empty(EmptyRequest::PsInit) => {
+                Some(ResponseKey::Result(ResultResponseKind::PsInit))
+            }
+            Self::At(_) => None,
+            Self::UiccStatus(_) => Some(ResponseKey::Uicc(uicc_control::STATUS)),
+            Self::UiccReadBinary(_) => Some(ResponseKey::Uicc(uicc_control::READ_BINARY)),
+            Self::UiccReadRecord(_) => Some(ResponseKey::Uicc(uicc_control::READ_RECORD)),
+            Self::UiccAuthenticate(_) => Some(ResponseKey::Uicc(uicc_control::AUTHENTICATE)),
+            Self::UiccPinStatus(_) => Some(ResponseKey::Uicc(uicc_control::PIN_STATUS)),
+            Self::UiccPinCommand(_) => Some(ResponseKey::Uicc(uicc_control::PIN_COMMAND)),
+        }
+    }
+}
+
+impl ModemEvent<'_> {
+    /// Request identity carried or implied by this inbound event.
+    ///
+    /// Matching does not imply completion: PLMN search/list responses can be
+    /// multipart, so pending lifetime remains an explicit higher-layer choice.
+    #[must_use]
+    pub const fn response_key(&self) -> Option<ResponseKey> {
+        match self {
+            Self::Attach(response) => Some(ResponseKey::Attach(response.transaction_id)),
+            Self::AttachExt(_)
+            | Self::DetachRequired(_)
+            | Self::At(_)
+            | Self::AtExt(_)
+            | Self::Unknown(_) => None,
+            Self::Detach(_) => Some(ResponseKey::Detach),
+            Self::PdnConnect(response) => Some(ResponseKey::PdnConnect(response.transaction_id)),
+            Self::PdnConnectExt(_) => Some(ResponseKey::PdnConnectExt),
+            Self::PdnDisconnect(response) => {
+                Some(ResponseKey::PdnDisconnect(response.transaction_id))
+            }
+            Self::PlmnSearch(_) => Some(ResponseKey::PlmnSearch),
+            Self::PlmnList(_) => Some(ResponseKey::PlmnList),
+            Self::Result { kind, .. } => Some(ResponseKey::Result(*kind)),
+            Self::Uicc(response) => Some(ResponseKey::Uicc(response.kind)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingError {
+    AlreadyPending(ResponseKey),
+}
+
+/// Conservative ledger of response identities currently in flight.
+///
+/// It never guesses when an exchange is terminal. Callers can match events and
+/// explicitly remove a key once the command-specific state machine proves the
+/// exchange complete.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct PendingRequests {
+    keys: Vec<ResponseKey>,
+}
+
+impl PendingRequests {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { keys: Vec::new() }
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    #[must_use]
+    pub fn contains(&self, key: ResponseKey) -> bool {
+        self.keys.contains(&key)
+    }
+
+    /// # Errors
+    /// Returns [`PendingError::AlreadyPending`] for an indistinguishable
+    /// request already in flight.
+    pub fn try_insert(&mut self, key: ResponseKey) -> Result<(), PendingError> {
+        if self.contains(key) {
+            return Err(PendingError::AlreadyPending(key));
+        }
+        self.keys.push(key);
+        Ok(())
+    }
+
+    pub fn remove(&mut self, key: ResponseKey) -> bool {
+        let Some(index) = self.keys.iter().position(|candidate| *candidate == key) else {
+            return false;
+        };
+        self.keys.remove(index);
+        true
+    }
+
+    #[must_use]
+    pub fn matching_event(&self, event: &ModemEvent<'_>) -> Option<ResponseKey> {
+        let key = event.response_key()?;
+        self.contains(key).then_some(key)
+    }
+
+    fn insert_unchecked(&mut self, key: ResponseKey) {
+        self.keys.push(key);
+    }
 }
 
 /// Encoding failure from one of the proven typed request families.
@@ -157,6 +307,25 @@ impl From<io::Error> for SendCommandError {
     }
 }
 
+/// Failure while checking pending identity or sending a tracked command.
+#[derive(Debug)]
+pub enum SendTrackedCommandError {
+    Pending(PendingError),
+    Send(SendCommandError),
+}
+
+impl From<PendingError> for SendTrackedCommandError {
+    fn from(value: PendingError) -> Self {
+        Self::Pending(value)
+    }
+}
+
+impl From<SendCommandError> for SendTrackedCommandError {
+    fn from(value: SendCommandError) -> Self {
+        Self::Send(value)
+    }
+}
+
 /// Encode one typed command into caller-owned storage.
 ///
 /// # Errors
@@ -181,6 +350,12 @@ pub fn encode_command(
         ModemCommand::UiccAuthenticate(request) => Ok(request.encode(output)?),
         ModemCommand::UiccPinStatus(request) => Ok(request.encode(output)?),
         ModemCommand::UiccPinCommand(request) => Ok(request.encode(output)?),
+    }
+}
+
+impl From<AttachResponseDecodeError> for EventDecodeError {
+    fn from(value: AttachResponseDecodeError) -> Self {
+        Self::Attach(value)
     }
 }
 
@@ -218,14 +393,10 @@ impl From<UiccResponseDecodeError> for EventDecodeError {
 /// the corresponding recovered response layout.
 pub fn decode_event(packet: Packet<'_>) -> Result<ModemEvent<'_>, EventDecodeError> {
     match packet.header.command {
-        recovered_opcode::ATTACH_RESPONSE => Ok(ModemEvent::Attach {
-            kind: AttachResponseKind::Normal,
-            response: AttachResponsePrefix::parse(AttachResponseKind::Normal, packet)?,
-        }),
-        recovered_opcode::ATTACH_RESPONSE_EXT => Ok(ModemEvent::Attach {
-            kind: AttachResponseKind::Extended,
-            response: AttachResponsePrefix::parse(AttachResponseKind::Extended, packet)?,
-        }),
+        recovered_opcode::ATTACH_RESPONSE => Ok(ModemEvent::Attach(AttachResponse::parse(packet)?)),
+        recovered_opcode::ATTACH_RESPONSE_EXT => Ok(ModemEvent::AttachExt(
+            AttachResponsePrefix::parse(AttachResponseKind::Extended, packet)?,
+        )),
         recovered_opcode::DETACH_RESPONSE => Ok(ModemEvent::Detach(DetachResponse::parse(packet)?)),
         recovered_opcode::DETACH_REQUIRED_INDICATION => Ok(ModemEvent::DetachRequired(
             DetachRequiredIndication::parse(packet)?,
@@ -377,6 +548,31 @@ impl<T: Write> Modem<T> {
         self.transport.write_bytes(&self.tx_buffer[..encoded])?;
         Ok(encoded)
     }
+
+    /// Send a typed command while reserving its recoverable response identity.
+    ///
+    /// Duplicate checking happens before GLIF is touched. The key is inserted
+    /// only after a successful full write.
+    ///
+    /// # Errors
+    /// Returns a pending-identity collision or the normal encode/write error.
+    pub fn send_tracked_command(
+        &mut self,
+        pending: &mut PendingRequests,
+        command: ModemCommand<'_>,
+    ) -> Result<usize, SendTrackedCommandError> {
+        let key = command.response_key();
+        if let Some(key) = key
+            && pending.contains(key)
+        {
+            return Err(PendingError::AlreadyPending(key).into());
+        }
+        let written = self.send_command(command)?;
+        if let Some(key) = key {
+            pending.insert_unchecked(key);
+        }
+        Ok(written)
+    }
 }
 
 impl<T: Read> Modem<T> {
@@ -424,13 +620,14 @@ mod tests {
     use gct_hci::{Header, Packet, public_opcode, recovered_opcode};
     use gct_lapi::{
         AtCommand, AtCommandFromDevice, EmptyRequest, PinData, ResponseDecodeError,
-        UiccPinCommandRequest,
+        ResultResponseKind, UiccPinCommandRequest,
     };
     use gct_transport::HciIo;
 
     use super::{
-        CommandEncodeError, EventDecodeError, Modem, ModemCommand, ModemEvent, PollOutcome,
-        SendCommandError, decode_event,
+        CommandEncodeError, EventDecodeError, Modem, ModemCommand, ModemEvent, PendingError,
+        PendingRequests, PollOutcome, ResponseKey, SendCommandError, SendTrackedCommandError,
+        decode_event,
     };
 
     #[test]
@@ -488,6 +685,69 @@ mod tests {
         assert_eq!(
             modem.into_transport().into_inner().into_inner(),
             Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn normal_attach_event_exposes_wire_transaction_identity() {
+        let payload = [
+            0x00, 0x01, 0x00, 0x02, 0x12, 0x34, 0x56, 0x78, 0x09, 0x0a, 1, 2, 3, 4, 5, 0x20, 0x01,
+            0x2a,
+        ];
+        let packet = Packet {
+            header: Header {
+                command: recovered_opcode::ATTACH_RESPONSE,
+                payload_len: 18,
+            },
+            payload: &payload,
+        };
+        let event = decode_event(packet);
+        let Ok(event) = event else {
+            return;
+        };
+        assert_eq!(event.response_key(), Some(ResponseKey::Attach(0x2a)));
+    }
+
+    #[test]
+    fn pending_ledger_distinguishes_exact_ids_but_rejects_family_duplicates() {
+        let mut pending = PendingRequests::new();
+        assert_eq!(pending.try_insert(ResponseKey::PdnConnect(1)), Ok(()));
+        assert_eq!(pending.try_insert(ResponseKey::PdnConnect(2)), Ok(()));
+        assert_eq!(pending.try_insert(ResponseKey::PlmnSearch), Ok(()));
+        assert_eq!(
+            pending.try_insert(ResponseKey::PlmnSearch),
+            Err(PendingError::AlreadyPending(ResponseKey::PlmnSearch))
+        );
+        assert_eq!(pending.len(), 3);
+        assert!(pending.remove(ResponseKey::PdnConnect(1)));
+        assert!(!pending.remove(ResponseKey::PdnConnect(99)));
+    }
+
+    #[test]
+    fn tracked_send_rejects_duplicate_before_writing_and_requires_explicit_completion() {
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut pending = PendingRequests::new();
+
+        assert!(matches!(
+            modem.send_tracked_command(&mut pending, ModemCommand::Empty(EmptyRequest::Online)),
+            Ok(4)
+        ));
+        assert!(matches!(
+            modem.send_tracked_command(&mut pending, ModemCommand::Empty(EmptyRequest::Online)),
+            Err(SendTrackedCommandError::Pending(
+                PendingError::AlreadyPending(ResponseKey::Result(ResultResponseKind::Online))
+            ))
+        ));
+        assert_eq!(pending.len(), 1);
+        assert!(pending.remove(ResponseKey::Result(ResultResponseKind::Online)));
+        assert!(matches!(
+            modem.send_tracked_command(&mut pending, ModemCommand::Empty(EmptyRequest::Online)),
+            Ok(4)
+        ));
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![0x31, 0x21, 0x00, 0x00, 0x31, 0x21, 0x00, 0x00,]
         );
     }
 
