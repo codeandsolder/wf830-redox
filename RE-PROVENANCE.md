@@ -462,3 +462,29 @@ requires the recovered 86-byte outer subtype size but exposes each result as a
 borrowed slice trimmed to its embedded length. Embedded lengths larger than the
 corresponding historical slot are rejected rather than allowing the OEM-style
 consumer to observe out-of-bounds logical data.
+
+## Detach-required and AT-from-device P0 indications — live P4 confirmed
+
+The detach-required indication is dispatch opcode `0xb16a`, not a guessed
+adjacent `0xb105`. In B014 the dispatch entry points to `0xbaec`; live P4 points
+the same opcode to `0xbc9c`. Both handlers allocate exactly four bytes, zero
+them, convert the incoming word with `D4H`, and invoke callback slot 5. B014
+DWARF names the callback object `_DETACH_REQ_IND_INFO` and its only member is
+`detach_type:u32`. As an independent identity check, the B014 handler's PIC
+log-string reference resolves to rodata string `hci_ind_detach_required` at
+`0x7b288`. The Rust parser therefore accepts exactly four payload bytes and
+returns one BE `u32` detach type.
+
+AT responses use the Linux-published opcodes `0xb308` (normal) and `0xb324`
+(extended), both present in the B014 and P4 SDK dispatch tables. The normal SDK
+handler does no decoding: it constructs the historical `_AT_COMMAND_DATA`
+callback object from the incoming payload pointer and HCI payload length. Thus
+the entire `0xb308` payload is raw AT bytes, including any CR/LF bytes supplied
+by the modem.
+
+The extended handler similarly performs no character decoding. Its first
+payload byte becomes `_AT_COMMAND_EXT_DATA.channel`; `cmd` points at byte 1 and
+`length` is the HCI payload length minus one. B014 and P4 have the same code
+shape. The OEM subtracts one without checking for a zero-length packet; the
+Rust parser requires the one-byte channel prefix and returns a truncation error
+for an empty `0xb324` payload instead of representing an underflowed length.

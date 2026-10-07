@@ -350,6 +350,7 @@ pub mod recovered_opcode {
     pub const ATTACH_RESPONSE: u16 = 0xb102;
     pub const ATTACH_RESPONSE_EXT: u16 = 0xb166;
     pub const DETACH_RESPONSE: u16 = 0xb104;
+    pub const DETACH_REQUIRED_INDICATION: u16 = 0xb16a;
     pub const PDN_CONNECT_RESPONSE: u16 = 0xb106;
     pub const PDN_CONNECT_RESPONSE_EXT: u16 = 0xb168;
     pub const PDN_DISCONNECT_RESPONSE: u16 = 0xb108;

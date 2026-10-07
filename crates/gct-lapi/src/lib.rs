@@ -358,6 +358,30 @@ impl DetachResponse {
     }
 }
 
+/// Network-initiated detach-required indication `0xb16a`.
+///
+/// Both B014 and live P4 allocate exactly four bytes, convert the payload with
+/// `D4H`, and pass it to the callback structure whose sole DWARF field is
+/// `detach_type: u32`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DetachRequiredIndication {
+    pub detach_type: u32,
+}
+
+impl DetachRequiredIndication {
+    /// Decode the exact four-byte detach-required indication.
+    ///
+    /// # Errors
+    /// Returns [`ResponseDecodeError`] for another opcode or any payload size
+    /// other than four bytes.
+    pub fn parse(packet: Packet<'_>) -> Result<Self, ResponseDecodeError> {
+        let payload = exact_payload(packet, recovered_opcode::DETACH_REQUIRED_INDICATION, 4)?;
+        Ok(Self {
+            detach_type: be_u32(payload, 0),
+        })
+    }
+}
+
 /// Five one-byte LTE network capability flags recovered from `NET_FEATURE_INFO`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NetworkFeatureInfo {
@@ -2672,6 +2696,53 @@ impl<'a> AtCommand<'a> {
     }
 }
 
+/// Raw AT bytes delivered by modem HCI event `0xb308`.
+///
+/// The SDK constructs its historical `{cmd pointer, length}` callback object
+/// directly from the HCI payload pointer and payload length. No prefix,
+/// terminator stripping or character conversion occurs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AtCommandFromDevice<'a> {
+    pub command: &'a [u8],
+}
+
+impl<'a> AtCommandFromDevice<'a> {
+    /// Borrow the complete AT payload exactly as delivered by the modem.
+    ///
+    /// # Errors
+    /// Returns [`ResponseDecodeError`] when the packet opcode is not `0xb308`.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, ResponseDecodeError> {
+        let command = response_payload(packet, public_opcode::LTE_AT_CMD_FROM_DEVICE)?;
+        Ok(Self { command })
+    }
+}
+
+/// Extended AT bytes delivered by modem HCI event `0xb324`.
+///
+/// The first payload byte is the channel. The remaining bytes are exposed as
+/// the AT command. The OEM subtracts one from the packet length without first
+/// checking for an empty payload; the Rust parser rejects that underflow shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AtCommandFromDeviceExt<'a> {
+    pub channel: u8,
+    pub command: &'a [u8],
+}
+
+impl<'a> AtCommandFromDeviceExt<'a> {
+    /// Decode the one-byte channel prefix and borrow the remaining AT bytes.
+    ///
+    /// # Errors
+    /// Returns [`ResponseDecodeError`] for another opcode or a payload shorter
+    /// than the recovered one-byte channel prefix.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, ResponseDecodeError> {
+        let payload = prefix_payload(packet, public_opcode::LTE_AT_CMD_FROM_DEVICE_EXT, 1)?;
+        Ok(Self {
+            channel: payload[0],
+            command: &payload[1..],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3958,6 +4029,55 @@ mod tests {
                 field: super::UiccAuthenticateField::Sres,
                 maximum: 4,
                 actual: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn detach_required_indication_is_one_big_endian_word() {
+        assert_eq!(
+            super::DetachRequiredIndication::parse(packet(0xb16a, &[0x01, 0x23, 0x45, 0x67])),
+            Ok(super::DetachRequiredIndication {
+                detach_type: 0x0123_4567,
+            })
+        );
+        assert_eq!(
+            super::DetachRequiredIndication::parse(packet(0xb16a, &[0, 0, 1])),
+            Err(super::ResponseDecodeError::UnexpectedLength {
+                expected: 4,
+                actual: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn at_from_device_borrows_the_entire_raw_payload() {
+        assert_eq!(
+            super::AtCommandFromDevice::parse(packet(0xb308, b"\r\nOK\r\n")),
+            Ok(super::AtCommandFromDevice {
+                command: b"\r\nOK\r\n",
+            })
+        );
+        assert_eq!(
+            super::AtCommandFromDevice::parse(packet(0xb308, &[])),
+            Ok(super::AtCommandFromDevice { command: &[] })
+        );
+    }
+
+    #[test]
+    fn extended_at_from_device_splits_channel_from_raw_command() {
+        assert_eq!(
+            super::AtCommandFromDeviceExt::parse(packet(0xb324, &[7, b'O', b'K'])),
+            Ok(super::AtCommandFromDeviceExt {
+                channel: 7,
+                command: b"OK",
+            })
+        );
+        assert_eq!(
+            super::AtCommandFromDeviceExt::parse(packet(0xb324, &[])),
+            Err(super::ResponseDecodeError::TruncatedPrefix {
+                minimum: 1,
+                actual: 0,
             })
         );
     }
