@@ -30,5 +30,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "libc"
+version = "0.2.190"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+
+[[package]]
+name = "lted-bridge"
+version = "0.1.0"
+dependencies = [
+ "gct-lapi",
+ "gct-runtime",
+ "gct-transport",
+ "lted-compat",
+ "lted-proto",
+]
+
+[[package]]
+name = "lted-compat"
+version = "0.1.0"
+dependencies = [
+ "lted-proto",
+ "lted-sysv",
+]
+
+[[package]]
 name = "lted-proto"
 version = "0.1.0"
+
+[[package]]
+name = "lted-sysv"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "lted-proto",
+]

@@ -6,6 +6,9 @@ members = [
     "crates/gct-lapi",
     "crates/gct-runtime",
     "crates/lted-proto",
+    "crates/lted-sysv",
+    "crates/lted-compat",
+    "crates/lted-bridge",
 ]
 
 [workspace.package]

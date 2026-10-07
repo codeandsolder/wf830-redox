@@ -1,0 +1,18 @@
+[package]
+name = "lted-bridge"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gct-lapi = { path = "../gct-lapi" }
+gct-runtime = { path = "../gct-runtime" }
+lted-compat = { path = "../lted-compat" }
+lted-proto = { path = "../lted-proto" }
+
+[dev-dependencies]
+gct-transport = { path = "../gct-transport" }
+
+[lints]
+workspace = true
