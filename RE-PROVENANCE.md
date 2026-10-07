@@ -661,3 +661,35 @@ requests with different TIDs. It intentionally does not auto-remove a key when
 an event arrives: some families (notably PLMN search/list) can be multipart, so
 terminal-response policy belongs in the command-specific state machine once
 that behavior is proven.
+
+## Extended AT and PLMN-search-stop
+
+Two request families previously omitted from the typed runtime now have direct
+live-P4 evidence rather than opcode inference.
+
+`LAPI_ATCommandToDeviceEXT` is exported at live P4 `0x4d0d0` (B014
+`0x4a0f4`). B014 DWARF defines its nine-byte historical input object as
+`channel:u8` at offset 0, `cmd:*const u8` at offset 1 and `length:u32` at offset
+5. The P4 function loads that 32-bit length from offsets 5..8, allocates
+`length + 6`, writes HCI opcode `0x3323`, sets the HCI payload length to
+`length + 2`, copies channel to payload byte 0, copies exactly `length` command
+bytes after it and appends `0x0a`. `AtCommandExt` models precisely
+`[channel, command..., LF]` without preserving the unaligned pointer-bearing C
+object.
+
+`LAPI_PLMNSearchStopRequest` is exported at live P4 `0x495d4` (B014
+`0x46344`). It allocates five bytes, writes HCI `0x3127` with payload length
+one and copies exactly one request byte. B014 DWARF names the one-byte request
+`_PLMN_SEARCH_STOP_REQ_PARAM { search_type:u8 }`.
+
+The live P4 HCI dispatch table maps response `0xb128` to handler `0x12228`.
+That handler leaves payload byte 0 untouched, converts bytes 1..4 through
+`D4H`, then invokes callback slot 20. B014 DWARF independently describes the
+five-byte `_PLMN_SEARCH_STOP_RSP_INFO` as `search_type:u8` at offset 0 followed
+by `result:u32` at offset 1. The clean response parser therefore requires
+exactly five payload bytes and decodes the result as one big-endian word.
+
+Because both request and response carry `search_type`, runtime correlation uses
+`ResponseKey::PlmnSearchStop(search_type)`. Extended AT remains deliberately
+untracked: like normal AT, its inbound channel/raw-byte stream has no recovered
+one-request completion identity.

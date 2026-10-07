@@ -340,6 +340,7 @@ pub mod recovered_opcode {
     pub const PDN_DISCONNECT_REQUEST: u16 = 0x3107;
     pub const PLMN_SEARCH_REQUEST: u16 = 0x3109;
     pub const PLMN_LIST_REQUEST: u16 = 0x310b;
+    pub const PLMN_SEARCH_STOP_REQUEST: u16 = 0x3127;
     pub const ONLINE_REQUEST: u16 = 0x3121;
     pub const OFFLINE_REQUEST: u16 = 0x3123;
     pub const PS_INIT_REQUEST: u16 = 0x312e;
@@ -358,6 +359,7 @@ pub mod recovered_opcode {
     pub const PDN_DISCONNECT_RESPONSE: u16 = 0xb108;
     pub const PLMN_SEARCH_RESPONSE: u16 = 0xb10a;
     pub const PLMN_LIST_RESPONSE: u16 = 0xb10c;
+    pub const PLMN_SEARCH_STOP_RESPONSE: u16 = 0xb128;
     pub const ONLINE_RESPONSE: u16 = 0xb122;
     pub const OFFLINE_RESPONSE: u16 = 0xb124;
     pub const PS_INIT_RESPONSE: u16 = 0xb12f;

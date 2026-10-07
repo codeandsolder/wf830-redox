@@ -13,13 +13,14 @@ use std::{
 
 use gct_hci::{EncodeError, Header, Packet, public_opcode, recovered_opcode};
 use gct_lapi::{
-    AtCommand, AtCommandFromDevice, AtCommandFromDeviceExt, AttachEncodeError, AttachRequest,
-    AttachResponse, AttachResponseDecodeError, AttachResponseKind, AttachResponsePrefix,
-    DetachRequest, DetachRequiredIndication, DetachResponse, EmptyRequest, PdnConnectExtRequest,
-    PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse, PdnDisconnectRequest,
-    PdnDisconnectResponse, PdnEncodeError, PdnResponseDecodeError, PlmnListResponse,
-    PlmnSearchDecodeError, PlmnSearchRequest, PlmnSearchResponse, ResponseDecodeError,
-    ResultResponse, ResultResponseKind, UiccAuthenticateEncodeError, UiccAuthenticateRequest,
+    AtCommand, AtCommandExt, AtCommandFromDevice, AtCommandFromDeviceExt, AttachEncodeError,
+    AttachRequest, AttachResponse, AttachResponseDecodeError, AttachResponseKind,
+    AttachResponsePrefix, DetachRequest, DetachRequiredIndication, DetachResponse, EmptyRequest,
+    PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse,
+    PdnDisconnectRequest, PdnDisconnectResponse, PdnEncodeError, PdnResponseDecodeError,
+    PlmnListResponse, PlmnSearchDecodeError, PlmnSearchRequest, PlmnSearchResponse,
+    PlmnSearchStopRequest, PlmnSearchStopResponse, ResponseDecodeError, ResultResponse,
+    ResultResponseKind, UiccAuthenticateEncodeError, UiccAuthenticateRequest,
     UiccPinCommandRequest, UiccPinEncodeError, UiccPinStatusRequest, UiccReadBinaryRequest,
     UiccReadRecordRequest, UiccResponse, UiccResponseDecodeError, UiccStatusRequest, uicc_control,
 };
@@ -52,6 +53,7 @@ pub enum ModemEvent<'a> {
     PdnConnectExt(PdnConnectExtResponse<'a>),
     PdnDisconnect(PdnDisconnectResponse<'a>),
     PlmnSearch(PlmnSearchResponse<'a>),
+    PlmnSearchStop(PlmnSearchStopResponse),
     PlmnList(PlmnListResponse<'a>),
     Result {
         kind: ResultResponseKind,
@@ -77,8 +79,8 @@ pub enum EventDecodeError {
 /// Typed outbound commands with fully recovered request encoders.
 ///
 /// Known-but-not-yet-recovered request families are deliberately absent. In
-/// particular, this does not invent encoders for extended attach, extended AT
-/// or PLMN-search-stop merely because their opcodes are known.
+/// particular, extended attach remains absent until its large request grammar
+/// is fully recovered rather than inferred from its known opcode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModemCommand<'a> {
     Attach(AttachRequest<'a>),
@@ -87,8 +89,10 @@ pub enum ModemCommand<'a> {
     PdnConnectExt(PdnConnectExtRequest<'a>),
     PdnDisconnect(PdnDisconnectRequest<'a>),
     PlmnSearch(PlmnSearchRequest),
+    PlmnSearchStop(PlmnSearchStopRequest),
     Empty(EmptyRequest),
     At(AtCommand<'a>),
+    AtExt(AtCommandExt<'a>),
     UiccStatus(UiccStatusRequest),
     UiccReadBinary(UiccReadBinaryRequest),
     UiccReadRecord(UiccReadRecordRequest),
@@ -111,6 +115,7 @@ pub enum ResponseKey {
     PdnConnectExt,
     PdnDisconnect(u8),
     PlmnSearch,
+    PlmnSearchStop(u8),
     PlmnList,
     Result(ResultResponseKind),
     Uicc(u16),
@@ -133,6 +138,7 @@ impl ModemCommand<'_> {
                 Some(ResponseKey::PdnDisconnect(request.transaction_id))
             }
             Self::PlmnSearch(_) => Some(ResponseKey::PlmnSearch),
+            Self::PlmnSearchStop(request) => Some(ResponseKey::PlmnSearchStop(request.search_type)),
             Self::Empty(EmptyRequest::PlmnList) => Some(ResponseKey::PlmnList),
             Self::Empty(EmptyRequest::Online) => {
                 Some(ResponseKey::Result(ResultResponseKind::Online))
@@ -143,7 +149,7 @@ impl ModemCommand<'_> {
             Self::Empty(EmptyRequest::PsInit) => {
                 Some(ResponseKey::Result(ResultResponseKind::PsInit))
             }
-            Self::At(_) => None,
+            Self::At(_) | Self::AtExt(_) => None,
             Self::UiccStatus(_) => Some(ResponseKey::Uicc(uicc_control::STATUS)),
             Self::UiccReadBinary(_) => Some(ResponseKey::Uicc(uicc_control::READ_BINARY)),
             Self::UiccReadRecord(_) => Some(ResponseKey::Uicc(uicc_control::READ_RECORD)),
@@ -175,6 +181,9 @@ impl ModemEvent<'_> {
                 Some(ResponseKey::PdnDisconnect(response.transaction_id))
             }
             Self::PlmnSearch(_) => Some(ResponseKey::PlmnSearch),
+            Self::PlmnSearchStop(response) => {
+                Some(ResponseKey::PlmnSearchStop(response.search_type))
+            }
             Self::PlmnList(_) => Some(ResponseKey::PlmnList),
             Self::Result { kind, .. } => Some(ResponseKey::Result(*kind)),
             Self::Uicc(response) => Some(ResponseKey::Uicc(response.kind)),
@@ -342,8 +351,10 @@ pub fn encode_command(
         ModemCommand::PdnConnectExt(request) => Ok(request.encode(output)?),
         ModemCommand::PdnDisconnect(request) => Ok(request.encode(output)?),
         ModemCommand::PlmnSearch(request) => Ok(request.encode(output)?),
+        ModemCommand::PlmnSearchStop(request) => Ok(request.encode(output)?),
         ModemCommand::Empty(request) => Ok(request.encode(output)?),
         ModemCommand::At(request) => Ok(request.encode(output)?),
+        ModemCommand::AtExt(request) => Ok(request.encode(output)?),
         ModemCommand::UiccStatus(request) => Ok(request.encode(output)?),
         ModemCommand::UiccReadBinary(request) => Ok(request.encode(output)?),
         ModemCommand::UiccReadRecord(request) => Ok(request.encode(output)?),
@@ -413,6 +424,9 @@ pub fn decode_event(packet: Packet<'_>) -> Result<ModemEvent<'_>, EventDecodeErr
         recovered_opcode::PLMN_SEARCH_RESPONSE => {
             Ok(ModemEvent::PlmnSearch(PlmnSearchResponse::parse(packet)?))
         }
+        recovered_opcode::PLMN_SEARCH_STOP_RESPONSE => Ok(ModemEvent::PlmnSearchStop(
+            PlmnSearchStopResponse::parse(packet)?,
+        )),
         recovered_opcode::PLMN_LIST_RESPONSE => {
             Ok(ModemEvent::PlmnList(PlmnListResponse::parse(packet)?))
         }
@@ -619,8 +633,8 @@ mod tests {
 
     use gct_hci::{Header, Packet, public_opcode, recovered_opcode};
     use gct_lapi::{
-        AtCommand, AtCommandFromDevice, EmptyRequest, PinData, ResponseDecodeError,
-        ResultResponseKind, UiccPinCommandRequest,
+        AtCommand, AtCommandExt, AtCommandFromDevice, EmptyRequest, PinData, PlmnSearchStopRequest,
+        ResponseDecodeError, ResultResponseKind, UiccPinCommandRequest,
     };
     use gct_transport::HciIo;
 
@@ -662,6 +676,50 @@ mod tests {
                 0x33, 0x07, 0x00, 0x03, b'A', b'T', b'\n', // AT
             ]
         );
+    }
+
+    #[test]
+    fn runtime_routes_extended_at_and_tracks_search_stop_by_type() {
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut pending = PendingRequests::new();
+
+        assert!(matches!(
+            modem.send_command(ModemCommand::AtExt(AtCommandExt::new(4, b"ATI"))),
+            Ok(9)
+        ));
+        assert!(matches!(
+            modem.send_tracked_command(
+                &mut pending,
+                ModemCommand::PlmnSearchStop(PlmnSearchStopRequest { search_type: 2 }),
+            ),
+            Ok(5)
+        ));
+        assert!(pending.contains(ResponseKey::PlmnSearchStop(2)));
+
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![
+                0x33, 0x23, 0x00, 0x05, 4, b'A', b'T', b'I', b'\n', 0x31, 0x27, 0x00, 0x01, 2,
+            ]
+        );
+    }
+
+    #[test]
+    fn stop_response_matches_tracked_search_type() {
+        let payload = [2, 0, 0, 0, 0];
+        let packet = Packet {
+            header: Header {
+                command: recovered_opcode::PLMN_SEARCH_STOP_RESPONSE,
+                payload_len: 5,
+            },
+            payload: &payload,
+        };
+        let event = decode_event(packet);
+        let Ok(event) = event else {
+            return;
+        };
+        assert_eq!(event.response_key(), Some(ResponseKey::PlmnSearchStop(2)));
     }
 
     #[test]

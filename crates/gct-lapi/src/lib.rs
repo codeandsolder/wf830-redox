@@ -1491,6 +1491,57 @@ impl PlmnSearchRequest {
     }
 }
 
+/// PLMN-search-stop request `0x3127`.
+///
+/// B014 DWARF describes `_PLMN_SEARCH_STOP_REQ_PARAM` as one byte named
+/// `search_type`; live P4 `LAPI_PLMNSearchStopRequest` allocates a five-byte
+/// HCI frame and copies exactly that byte into the payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlmnSearchStopRequest {
+    pub search_type: u8,
+}
+
+impl PlmnSearchStopRequest {
+    /// Encode the exact one-byte stop-search payload.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than five
+    /// bytes.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        encode_packet(
+            recovered_opcode::PLMN_SEARCH_STOP_REQUEST,
+            &[self.search_type],
+            output,
+        )
+    }
+}
+
+/// PLMN-search-stop response `0xb128`.
+///
+/// Live P4 handler `0x12228` copies payload byte 0 unchanged and converts bytes
+/// 1..5 with `D4H`; B014 DWARF names those fields `search_type:u8` and
+/// `result:u32` in a five-byte callback object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlmnSearchStopResponse {
+    pub search_type: u8,
+    pub result: u32,
+}
+
+impl PlmnSearchStopResponse {
+    /// Decode the exact five-byte stop-search response.
+    ///
+    /// # Errors
+    /// Returns [`ResponseDecodeError`] for another opcode or a payload whose
+    /// length is not exactly five bytes.
+    pub fn parse(packet: Packet<'_>) -> Result<Self, ResponseDecodeError> {
+        let payload = exact_payload(packet, recovered_opcode::PLMN_SEARCH_STOP_RESPONSE, 5)?;
+        Ok(Self {
+            search_type: payload[0],
+            result: be_u32(payload, 1),
+        })
+    }
+}
+
 /// Recovered UICC control subtypes carried inside HCI request `0x3504` and
 /// response `0xb505`.
 pub mod uicc_control {
@@ -2786,6 +2837,61 @@ impl<'a> AtCommand<'a> {
     }
 }
 
+/// Extended AT command sent through HCI `0x3323`.
+///
+/// B014 DWARF describes the historical input as
+/// `{channel:u8, cmd:*const u8, length:u32}`. Live P4 copies `channel` first,
+/// then exactly `length` command bytes, then appends one line-feed byte.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AtCommandExt<'a> {
+    pub channel: u8,
+    command: &'a [u8],
+}
+
+impl<'a> AtCommandExt<'a> {
+    /// Construct an extended AT command for one recovered channel byte.
+    #[must_use]
+    pub const fn new(channel: u8, command: &'a [u8]) -> Self {
+        Self { channel, command }
+    }
+
+    /// Encode `[channel, command..., LF]` under HCI `0x3323`.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::PayloadTooLong`] when channel + command + LF
+    /// exceeds the 16-bit HCI payload length, or [`EncodeError::NoSpace`] when
+    /// `output` is too small.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        let payload_len = self
+            .command
+            .len()
+            .checked_add(2)
+            .ok_or(EncodeError::PayloadTooLong)?;
+        let payload_len_u16 =
+            u16::try_from(payload_len).map_err(|_| EncodeError::PayloadTooLong)?;
+        let total = HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or(EncodeError::PayloadTooLong)?;
+        let Some(dst) = output.get_mut(..total) else {
+            return Err(EncodeError::NoSpace);
+        };
+
+        dst[..HEADER_LEN].copy_from_slice(
+            &Header {
+                command: public_opcode::LTE_AT_CMD_TO_DEVICE_EXT,
+                payload_len: payload_len_u16,
+            }
+            .encode(),
+        );
+        dst[HEADER_LEN] = self.channel;
+        let command_start = HEADER_LEN + 1;
+        let command_end = command_start + self.command.len();
+        dst[command_start..command_end].copy_from_slice(self.command);
+        dst[command_end] = b'\n';
+        Ok(total)
+    }
+}
+
 /// Raw AT bytes delivered by modem HCI event `0xb308`.
 ///
 /// The SDK constructs its historical `{cmd pointer, length}` callback object
@@ -3756,6 +3862,37 @@ mod tests {
     }
 
     #[test]
+    fn plmn_search_stop_matches_live_request_and_response_layouts() {
+        let mut request = [0_u8; 5];
+        assert_eq!(
+            super::PlmnSearchStopRequest { search_type: 3 }.encode(&mut request),
+            Ok(5)
+        );
+        assert_eq!(request, [0x31, 0x27, 0x00, 0x01, 0x03]);
+
+        assert_eq!(
+            super::PlmnSearchStopResponse::parse(packet(
+                super::recovered_opcode::PLMN_SEARCH_STOP_RESPONSE,
+                &[3, 0x12, 0x34, 0x56, 0x78],
+            )),
+            Ok(super::PlmnSearchStopResponse {
+                search_type: 3,
+                result: 0x1234_5678,
+            })
+        );
+        assert_eq!(
+            super::PlmnSearchStopResponse::parse(packet(
+                super::recovered_opcode::PLMN_SEARCH_STOP_RESPONSE,
+                &[3, 0, 0, 0],
+            )),
+            Err(super::ResponseDecodeError::UnexpectedLength {
+                expected: 5,
+                actual: 4,
+            })
+        );
+    }
+
+    #[test]
     fn plmn_list_response_assembles_three_tlvs_per_record() {
         let payload = [
             0x01, 0x12, 0x03, 0x62, 0xf0, 0x10, 0x13, 0x04, 0, 0, 0, 7, 0x14, 0x04, 0, 0, 0, 9,
@@ -4206,6 +4343,21 @@ mod tests {
         assert_eq!(
             super::AtCommandFromDevice::parse(packet(0xb308, &[])),
             Ok(super::AtCommandFromDevice { command: &[] })
+        );
+    }
+
+    #[test]
+    fn extended_at_to_device_matches_live_channel_command_lf_layout() {
+        static OVERSIZED: [u8; 65_534] = [0; 65_534];
+
+        let command = super::AtCommandExt::new(7, b"AT");
+        let mut output = [0_u8; 8];
+        assert_eq!(command.encode(&mut output), Ok(8));
+        assert_eq!(output, [0x33, 0x23, 0x00, 0x04, 7, b'A', b'T', b'\n']);
+
+        assert_eq!(
+            super::AtCommandExt::new(1, &OVERSIZED).encode(&mut []),
+            Err(gct_hci::EncodeError::PayloadTooLong)
         );
     }
 
