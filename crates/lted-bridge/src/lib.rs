@@ -221,6 +221,15 @@ pub fn broadcast_plmn_list_callback(
     Ok(report)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupPhase {
+    Idle,
+    AwaitingPsInit,
+    NeedOnline,
+    AwaitingOnline,
+    Complete,
+}
+
 /// Per-physical-modem compatibility state.
 ///
 /// The stock SDK resolves every request through `device_find(handle, device_id)`
@@ -231,7 +240,7 @@ pub fn broadcast_plmn_list_callback(
 pub struct DeviceBridge {
     device_id: u32,
     pending: PendingRequests,
-    init_complete: bool,
+    startup_phase: StartupPhase,
 }
 
 impl DeviceBridge {
@@ -240,7 +249,7 @@ impl DeviceBridge {
         Self {
             device_id,
             pending: PendingRequests::new(),
-            init_complete: false,
+            startup_phase: StartupPhase::Idle,
         }
     }
 
@@ -256,7 +265,38 @@ impl DeviceBridge {
 
     #[must_use]
     pub const fn init_complete(&self) -> bool {
-        self.init_complete
+        matches!(self.startup_phase, StartupPhase::Complete)
+    }
+
+    #[must_use]
+    pub const fn startup_phase(&self) -> StartupPhase {
+        self.startup_phase
+    }
+
+    /// Advance the proven daemon-owned `PSInit` -> `Online` startup sequence.
+    ///
+    /// Stock `lted` starts PS initialization for a newly inserted device and,
+    /// after its first `PSInit` response, issues `Online` from a helper thread. The
+    /// clean daemon preserves those modem-visible transitions without copying
+    /// unrelated legacy side effects.
+    ///
+    /// # Errors
+    /// Returns [`HandleError::Tracked`] or [`HandleError::Send`] if the next
+    /// startup request cannot be encoded/tracked/written.
+    pub fn drive_initialization<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+    ) -> Result<Option<usize>, HandleError> {
+        let (request, next) = match self.startup_phase {
+            StartupPhase::Idle => (EmptyRequest::PsInit, StartupPhase::AwaitingPsInit),
+            StartupPhase::NeedOnline => (EmptyRequest::Online, StartupPhase::AwaitingOnline),
+            StartupPhase::AwaitingPsInit
+            | StartupPhase::AwaitingOnline
+            | StartupPhase::Complete => return Ok(None),
+        };
+        let bytes = modem.send_tracked_command(&mut self.pending, ModemCommand::Empty(request))?;
+        self.startup_phase = next;
+        Ok(Some(bytes))
     }
 
     /// Execute one stock SDK request and complete the OEM semaphore/shm
@@ -291,7 +331,8 @@ impl DeviceBridge {
             match request.known_command() {
                 Ok(SdkCommand::GetPsInitComplete) => {
                     if request.params.is_empty() {
-                        context.write(PS_INIT_COMPLETE_OFFSET, &[u8::from(self.init_complete)])?;
+                        context
+                            .write(PS_INIT_COMPLETE_OFFSET, &[u8::from(self.init_complete())])?;
                         Ok(HandledCall {
                             command: SdkCommand::GetPsInitComplete,
                             device_id: request.device_id,
@@ -343,6 +384,15 @@ impl DeviceBridge {
                 if !self.pending.remove(key) {
                     return Ok(None);
                 }
+                match (*kind, self.startup_phase) {
+                    (ResultResponseKind::PsInit, StartupPhase::AwaitingPsInit) => {
+                        self.startup_phase = StartupPhase::NeedOnline;
+                    }
+                    (ResultResponseKind::Online, StartupPhase::AwaitingOnline) => {
+                        self.startup_phase = StartupPhase::Complete;
+                    }
+                    _ => {}
+                }
                 broadcast_result_callback(server, *kind, self.device_id, *response).map(Some)
             }
             ModemEvent::PlmnList(response) => {
@@ -386,6 +436,9 @@ impl DeviceBridge {
         }
         let modem_command = ModemCommand::Empty(empty);
         let bytes_written = modem.send_tracked_command(&mut self.pending, modem_command)?;
+        if empty == EmptyRequest::PsInit && self.startup_phase == StartupPhase::Idle {
+            self.startup_phase = StartupPhase::AwaitingPsInit;
+        }
         Ok(HandledCall {
             command,
             device_id: request.device_id,
@@ -416,7 +469,7 @@ mod tests {
 
     use super::{
         BroadcastReport, DeviceBridge, HandleError, LTE_API_RET_OFFSET, PS_INIT_COMPLETE_OFFSET,
-        broadcast_result_callback,
+        StartupPhase, broadcast_result_callback,
     };
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -510,6 +563,75 @@ mod tests {
             })
             .unwrap_or_else(|_| std::process::abort());
         routed
+    }
+
+    #[test]
+    fn daemon_startup_drives_ps_init_then_online_before_reporting_complete() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        assert_eq!(bridge.startup_phase(), StartupPhase::Idle);
+        assert!(matches!(
+            bridge.drive_initialization(&mut modem),
+            Ok(Some(4))
+        ));
+        assert_eq!(bridge.startup_phase(), StartupPhase::AwaitingPsInit);
+        assert_eq!(bridge.pending_count(), 1);
+
+        let ps_init = ModemEvent::Result {
+            kind: ResultResponseKind::PsInit,
+            response: ResultResponse { result: 0 },
+        };
+        bridge
+            .handle_modem_event(&mut server, &ps_init)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.startup_phase(), StartupPhase::NeedOnline);
+        assert_eq!(bridge.pending_count(), 0);
+
+        assert!(matches!(
+            bridge.drive_initialization(&mut modem),
+            Ok(Some(4))
+        ));
+        assert_eq!(bridge.startup_phase(), StartupPhase::AwaitingOnline);
+        assert_eq!(bridge.pending_count(), 1);
+
+        let online = ModemEvent::Result {
+            kind: ResultResponseKind::Online,
+            response: ResultResponse { result: 0 },
+        };
+        bridge
+            .handle_modem_event(&mut server, &online)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.startup_phase(), StartupPhase::Complete);
+        assert!(bridge.init_complete());
+        assert_eq!(bridge.pending_count(), 0);
+        assert!(matches!(bridge.drive_initialization(&mut modem), Ok(None)));
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![0x31, 0x2e, 0x00, 0x00, 0x31, 0x21, 0x00, 0x00]
+        );
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let request = SdkApiRequest {
+            command: SdkCommand::GetPsInitComplete as u16,
+            device_id: 1,
+            params: &[],
+        };
+        bridge
+            .handle_sdk_api(&mut server, &mut modem, id, request)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut value = [0_u8; 1];
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .read(PS_INIT_COMPLETE_OFFSET, &mut value)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(value, [1]);
     }
 
     #[test]

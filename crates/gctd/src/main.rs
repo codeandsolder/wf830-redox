@@ -105,6 +105,12 @@ fn run() -> io::Result<()> {
     let (glif_rx, glif_tx) = UnixDatagram::pair()?;
     let _reader = spawn_glif_reader(reader_file, glif_tx)?;
     let mut bridge = DeviceBridge::new(device_id);
+    if let Some(bytes) = bridge
+        .drive_initialization(&mut modem)
+        .map_err(|error| io::Error::other(error.to_string()))?
+    {
+        eprintln!("gctd: automatic modem initialization started ({bytes} HCI bytes)");
+    }
     daemon_loop(&mut modem, &mut server, &mut bridge, &glif_rx)
 }
 
@@ -251,7 +257,14 @@ fn daemon_loop(
         }
 
         if ready.glif {
-            handle_glif_message(glif_rx, &mut glif_message, &mut decoder, server, bridge)?;
+            handle_glif_message(
+                modem,
+                glif_rx,
+                &mut glif_message,
+                &mut decoder,
+                server,
+                bridge,
+            )?;
         }
     }
 }
@@ -307,6 +320,7 @@ fn handle_client_datagram(
 }
 
 fn handle_glif_message(
+    modem: &mut Modem<File>,
     glif_rx: &UnixDatagram,
     message: &mut [u8],
     decoder: &mut HciStreamDecoder,
@@ -334,6 +348,12 @@ fn handle_glif_message(
             });
             if let Some(error) = route_error {
                 return Err(error);
+            }
+            if let Some(bytes) = bridge
+                .drive_initialization(modem)
+                .map_err(|error| io::Error::other(error.to_string()))?
+            {
+                eprintln!("gctd: automatic modem initialization advanced ({bytes} HCI bytes)");
             }
             Ok(())
         }
