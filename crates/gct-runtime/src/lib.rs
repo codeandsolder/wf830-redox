@@ -11,15 +11,21 @@ use std::{
     path::Path,
 };
 
-use gct_hci::{Header, Packet, public_opcode, recovered_opcode};
+use gct_hci::{EncodeError, Header, Packet, public_opcode, recovered_opcode};
 use gct_lapi::{
-    AtCommandFromDevice, AtCommandFromDeviceExt, AttachResponseKind, AttachResponsePrefix,
-    DetachRequiredIndication, DetachResponse, PdnConnectExtResponse, PdnConnectResponse,
-    PdnDisconnectResponse, PdnResponseDecodeError, PlmnListResponse, PlmnSearchDecodeError,
-    PlmnSearchResponse, ResponseDecodeError, ResultResponse, ResultResponseKind, UiccResponse,
-    UiccResponseDecodeError,
+    AtCommand, AtCommandFromDevice, AtCommandFromDeviceExt, AttachEncodeError, AttachRequest,
+    AttachResponseKind, AttachResponsePrefix, DetachRequest, DetachRequiredIndication,
+    DetachResponse, EmptyRequest, PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest,
+    PdnConnectResponse, PdnDisconnectRequest, PdnDisconnectResponse, PdnEncodeError,
+    PdnResponseDecodeError, PlmnListResponse, PlmnSearchDecodeError, PlmnSearchRequest,
+    PlmnSearchResponse, ResponseDecodeError, ResultResponse, ResultResponseKind,
+    UiccAuthenticateEncodeError, UiccAuthenticateRequest, UiccPinCommandRequest,
+    UiccPinEncodeError, UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest,
+    UiccResponse, UiccResponseDecodeError, UiccStatusRequest,
 };
-use gct_transport::{GlifTransport, HciIo, HciStreamDecoder, OEM_READ_BUFFER_LEN};
+use gct_transport::{
+    GlifTransport, HciIo, HciStreamDecoder, MAX_HCI_FRAME_LEN, OEM_READ_BUFFER_LEN,
+};
 
 /// Result of one blocking read/dispatch iteration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +73,115 @@ pub enum EventDecodeError {
     Pdn(PdnResponseDecodeError),
     PlmnSearch(PlmnSearchDecodeError),
     Uicc(UiccResponseDecodeError),
+}
+
+/// Typed outbound commands with fully recovered request encoders.
+///
+/// Known-but-not-yet-recovered request families are deliberately absent. In
+/// particular, this does not invent encoders for extended attach, extended AT
+/// or PLMN-search-stop merely because their opcodes are known.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModemCommand<'a> {
+    Attach(AttachRequest<'a>),
+    Detach(DetachRequest),
+    PdnConnect(PdnConnectRequest<'a>),
+    PdnConnectExt(PdnConnectExtRequest<'a>),
+    PdnDisconnect(PdnDisconnectRequest<'a>),
+    PlmnSearch(PlmnSearchRequest),
+    Empty(EmptyRequest),
+    At(AtCommand<'a>),
+    UiccStatus(UiccStatusRequest),
+    UiccReadBinary(UiccReadBinaryRequest),
+    UiccReadRecord(UiccReadRecordRequest),
+    UiccAuthenticate(UiccAuthenticateRequest<'a>),
+    UiccPinStatus(UiccPinStatusRequest),
+    UiccPinCommand(UiccPinCommandRequest<'a>),
+}
+
+/// Encoding failure from one of the proven typed request families.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandEncodeError {
+    Hci(EncodeError),
+    Attach(AttachEncodeError),
+    Pdn(PdnEncodeError),
+    UiccAuthenticate(UiccAuthenticateEncodeError),
+    UiccPin(UiccPinEncodeError),
+}
+
+impl From<EncodeError> for CommandEncodeError {
+    fn from(value: EncodeError) -> Self {
+        Self::Hci(value)
+    }
+}
+
+impl From<AttachEncodeError> for CommandEncodeError {
+    fn from(value: AttachEncodeError) -> Self {
+        Self::Attach(value)
+    }
+}
+
+impl From<PdnEncodeError> for CommandEncodeError {
+    fn from(value: PdnEncodeError) -> Self {
+        Self::Pdn(value)
+    }
+}
+
+impl From<UiccAuthenticateEncodeError> for CommandEncodeError {
+    fn from(value: UiccAuthenticateEncodeError) -> Self {
+        Self::UiccAuthenticate(value)
+    }
+}
+
+impl From<UiccPinEncodeError> for CommandEncodeError {
+    fn from(value: UiccPinEncodeError) -> Self {
+        Self::UiccPin(value)
+    }
+}
+
+/// Failure while encoding or writing a typed modem command.
+#[derive(Debug)]
+pub enum SendCommandError {
+    Encode(CommandEncodeError),
+    Io(io::Error),
+}
+
+impl From<CommandEncodeError> for SendCommandError {
+    fn from(value: CommandEncodeError) -> Self {
+        Self::Encode(value)
+    }
+}
+
+impl From<io::Error> for SendCommandError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+/// Encode one typed command into caller-owned storage.
+///
+/// # Errors
+/// Returns the command family's validated encoding error. No bytes are written
+/// beyond the returned encoded prefix.
+pub fn encode_command(
+    command: ModemCommand<'_>,
+    output: &mut [u8],
+) -> Result<usize, CommandEncodeError> {
+    match command {
+        ModemCommand::Attach(request) => Ok(request.encode(output)?),
+        ModemCommand::Detach(request) => Ok(request.encode(output)?),
+        ModemCommand::PdnConnect(request) => Ok(request.encode(output)?),
+        ModemCommand::PdnConnectExt(request) => Ok(request.encode(output)?),
+        ModemCommand::PdnDisconnect(request) => Ok(request.encode(output)?),
+        ModemCommand::PlmnSearch(request) => Ok(request.encode(output)?),
+        ModemCommand::Empty(request) => Ok(request.encode(output)?),
+        ModemCommand::At(request) => Ok(request.encode(output)?),
+        ModemCommand::UiccStatus(request) => Ok(request.encode(output)?),
+        ModemCommand::UiccReadBinary(request) => Ok(request.encode(output)?),
+        ModemCommand::UiccReadRecord(request) => Ok(request.encode(output)?),
+        ModemCommand::UiccAuthenticate(request) => Ok(request.encode(output)?),
+        ModemCommand::UiccPinStatus(request) => Ok(request.encode(output)?),
+        ModemCommand::UiccPinCommand(request) => Ok(request.encode(output)?),
+    }
 }
 
 impl From<ResponseDecodeError> for EventDecodeError {
@@ -158,6 +273,7 @@ pub struct Modem<T> {
     transport: HciIo<T>,
     decoder: HciStreamDecoder,
     read_buffer: Vec<u8>,
+    tx_buffer: Vec<u8>,
 }
 
 impl<T> Modem<T> {
@@ -168,6 +284,7 @@ impl<T> Modem<T> {
             transport,
             decoder: HciStreamDecoder::new(),
             read_buffer: vec![0_u8; OEM_READ_BUFFER_LEN],
+            tx_buffer: vec![0_u8; MAX_HCI_FRAME_LEN],
         }
     }
 
@@ -245,6 +362,21 @@ impl<T: Write> Modem<T> {
     pub fn send_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.transport.write_bytes(bytes)
     }
+
+    /// Encode and write one proven typed modem command using the runtime's
+    /// reusable maximum-size HCI frame buffer.
+    ///
+    /// Encoding completes before the transport is touched, so validation
+    /// failures cannot result in partial command writes.
+    ///
+    /// # Errors
+    /// Returns [`SendCommandError::Encode`] for a rejected request shape or
+    /// [`SendCommandError::Io`] if the encoded frame cannot be written fully.
+    pub fn send_command(&mut self, command: ModemCommand<'_>) -> Result<usize, SendCommandError> {
+        let encoded = encode_command(command, &mut self.tx_buffer)?;
+        self.transport.write_bytes(&self.tx_buffer[..encoded])?;
+        Ok(encoded)
+    }
 }
 
 impl<T: Read> Modem<T> {
@@ -290,10 +422,16 @@ mod tests {
     use std::io::Cursor;
 
     use gct_hci::{Header, Packet, public_opcode, recovered_opcode};
-    use gct_lapi::{AtCommandFromDevice, ResponseDecodeError};
+    use gct_lapi::{
+        AtCommand, AtCommandFromDevice, EmptyRequest, PinData, ResponseDecodeError,
+        UiccPinCommandRequest,
+    };
     use gct_transport::HciIo;
 
-    use super::{EventDecodeError, Modem, ModemEvent, PollOutcome, decode_event};
+    use super::{
+        CommandEncodeError, EventDecodeError, Modem, ModemCommand, ModemEvent, PollOutcome,
+        SendCommandError, decode_event,
+    };
 
     #[test]
     fn startup_handshake_matches_live_p4_bytes() {
@@ -303,6 +441,53 @@ mod tests {
         assert_eq!(
             modem.into_transport().into_inner().into_inner(),
             vec![0x33, 0x37, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn typed_send_encodes_multiple_command_families_into_one_reused_buffer() {
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+
+        assert!(matches!(
+            modem.send_command(ModemCommand::Empty(EmptyRequest::Online)),
+            Ok(4)
+        ));
+        assert!(matches!(
+            modem.send_command(ModemCommand::At(AtCommand::new(b"AT"))),
+            Ok(7)
+        ));
+
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![
+                0x31, 0x21, 0x00, 0x00, // ONLINE
+                0x33, 0x07, 0x00, 0x03, b'A', b'T', b'\n', // AT
+            ]
+        );
+    }
+
+    #[test]
+    fn typed_send_validates_before_touching_transport() {
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let oversized_pin = [b'1'; 9];
+        let request = UiccPinCommandRequest {
+            pin_type: 1,
+            pin_command: 2,
+            old_pin: PinData {
+                code: &oversized_pin,
+            },
+            new_pin: PinData { code: b"" },
+        };
+
+        assert!(matches!(
+            modem.send_command(ModemCommand::UiccPinCommand(request)),
+            Err(SendCommandError::Encode(CommandEncodeError::UiccPin(_)))
+        ));
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
         );
     }
 

@@ -602,3 +602,24 @@ implement the OEM `lted` UNIX-datagram + SysV shared-memory/semaphore ABI, and
 it does not claim to reproduce the packet-socket `0x8d10/7` readiness probe.
 Those are adapter/startup-policy layers above the proven safe GLIF transport,
 not prerequisites for keeping the core HCI parser correct.
+
+## Typed outbound command routing
+
+The modem core now has a symmetric typed TX surface. `ModemCommand` contains
+only request families whose executable wire encoders have already been proven
+in `gct-lapi`: normal attach/detach, normal and extended PDN connect, PDN
+disconnect, PLMN search, the recovered zero-payload online/offline/PS-init and
+PLMN-list requests, normal AT, plus status/read-binary/read-record/authenticate/
+PIN-status/PIN-command UICC requests.
+
+Known SDK operations without a recovered encoder are intentionally absent.
+Specifically, the runtime does not synthesize extended-attach, extended-AT or
+PLMN-search-stop frames from opcode adjacency alone. Callers that truly need an
+untyped experimental frame still have the explicit low-level `send_bytes`
+escape hatch, but it is not part of the typed request API.
+
+`Modem::send_command` encodes into one reusable `MAX_HCI_FRAME_LEN` scratch
+buffer (4 + 65535 bytes) and only touches the GLIF writer after validation and
+encoding succeed. This preserves the `u16` HCI maximum without per-request heap
+allocation and guarantees that local validation failures cannot produce a
+partial modem command.
