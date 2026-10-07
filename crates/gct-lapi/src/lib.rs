@@ -1677,6 +1677,171 @@ impl<'a> UiccReadRecordResponse<'a> {
     }
 }
 
+/// Error while encoding UICC authentication input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiccAuthenticateEncodeError {
+    FieldTooLong {
+        field: UiccAuthenticateField,
+        maximum: usize,
+        actual: usize,
+    },
+    Hci(EncodeError),
+}
+
+impl From<EncodeError> for UiccAuthenticateEncodeError {
+    fn from(value: EncodeError) -> Self {
+        Self::Hci(value)
+    }
+}
+
+/// Variable-length fields in the recovered authentication request/response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiccAuthenticateField {
+    Rand,
+    Auth,
+    Res,
+    Ck,
+    Ik,
+    Auts,
+    Sres,
+    Kc,
+}
+
+/// UICC AUTHENTICATE request (`type 5`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UiccAuthenticateRequest<'a> {
+    pub app_type: u8,
+    pub rand: &'a [u8],
+    pub auth: &'a [u8],
+    pub gsm_auth_selection: u8,
+}
+
+impl UiccAuthenticateRequest<'_> {
+    /// Encode the exact 36-byte subtype object copied raw by B014 and live P4.
+    /// `rand` and `auth` occupy fixed 16-byte slots preceded by one-byte
+    /// lengths; unused bytes are zero-filled.
+    ///
+    /// # Errors
+    /// Returns [`UiccAuthenticateEncodeError::FieldTooLong`] when RAND or AUTH
+    /// exceed the recovered 16-byte capacity, or the wrapped HCI error if the
+    /// caller's output buffer is too short.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, UiccAuthenticateEncodeError> {
+        if self.rand.len() > 16 {
+            return Err(UiccAuthenticateEncodeError::FieldTooLong {
+                field: UiccAuthenticateField::Rand,
+                maximum: 16,
+                actual: self.rand.len(),
+            });
+        }
+        if self.auth.len() > 16 {
+            return Err(UiccAuthenticateEncodeError::FieldTooLong {
+                field: UiccAuthenticateField::Auth,
+                maximum: 16,
+                actual: self.auth.len(),
+            });
+        }
+
+        let mut data = [0_u8; 36];
+        data[0] = self.app_type;
+        data[1] = u8::try_from(self.rand.len()).map_err(|_| {
+            UiccAuthenticateEncodeError::FieldTooLong {
+                field: UiccAuthenticateField::Rand,
+                maximum: 16,
+                actual: self.rand.len(),
+            }
+        })?;
+        data[2..2 + self.rand.len()].copy_from_slice(self.rand);
+        data[18] = u8::try_from(self.auth.len()).map_err(|_| {
+            UiccAuthenticateEncodeError::FieldTooLong {
+                field: UiccAuthenticateField::Auth,
+                maximum: 16,
+                actual: self.auth.len(),
+            }
+        })?;
+        data[19..19 + self.auth.len()].copy_from_slice(self.auth);
+        data[35] = self.gsm_auth_selection;
+        Ok(encode_uicc_request(
+            uicc_control::AUTHENTICATE,
+            &data,
+            output,
+        )?)
+    }
+}
+
+/// Error while decoding the fixed 86-byte UICC authentication result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiccAuthenticateDecodeError {
+    Typed(UiccTypedDecodeError),
+    FieldTooLong {
+        field: UiccAuthenticateField,
+        maximum: usize,
+        actual: usize,
+    },
+}
+
+impl From<UiccTypedDecodeError> for UiccAuthenticateDecodeError {
+    fn from(value: UiccTypedDecodeError) -> Self {
+        Self::Typed(value)
+    }
+}
+
+fn bounded_auth_field(
+    data: &[u8],
+    field: UiccAuthenticateField,
+    length_offset: usize,
+    data_offset: usize,
+    maximum: usize,
+) -> Result<&[u8], UiccAuthenticateDecodeError> {
+    let actual = usize::from(data[length_offset]);
+    if actual > maximum {
+        return Err(UiccAuthenticateDecodeError::FieldTooLong {
+            field,
+            maximum,
+            actual,
+        });
+    }
+    Ok(&data[data_offset..data_offset + actual])
+}
+
+/// Borrowed successful UICC AUTHENTICATE response (`type 5`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UiccAuthenticateResponse<'a> {
+    pub uicc_return: u8,
+    pub app_type: u8,
+    pub auth_return: u8,
+    pub res: &'a [u8],
+    pub ck: &'a [u8],
+    pub ik: &'a [u8],
+    pub auts: &'a [u8],
+    pub sres: &'a [u8],
+    pub kc: &'a [u8],
+    pub gsm_auth_result: u8,
+}
+
+impl<'a> UiccAuthenticateResponse<'a> {
+    /// Decode the raw 86-byte type-5 result while exposing only the declared
+    /// bytes from each fixed-capacity authentication slot.
+    ///
+    /// # Errors
+    /// Returns [`UiccAuthenticateDecodeError`] for outer UICC failure/wrong
+    /// subtype/size or an embedded length larger than its recovered buffer.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, UiccAuthenticateDecodeError> {
+        let data = successful_uicc_data(packet, uicc_control::AUTHENTICATE, 86)?;
+        Ok(Self {
+            uicc_return: data[0],
+            app_type: data[1],
+            auth_return: data[2],
+            res: bounded_auth_field(data, UiccAuthenticateField::Res, 3, 4, 16)?,
+            ck: bounded_auth_field(data, UiccAuthenticateField::Ck, 20, 21, 16)?,
+            ik: bounded_auth_field(data, UiccAuthenticateField::Ik, 37, 38, 16)?,
+            auts: bounded_auth_field(data, UiccAuthenticateField::Auts, 54, 55, 16)?,
+            sres: bounded_auth_field(data, UiccAuthenticateField::Sres, 71, 72, 4)?,
+            kc: bounded_auth_field(data, UiccAuthenticateField::Kc, 76, 77, 8)?,
+            gsm_auth_result: data[85],
+        })
+    }
+}
+
 /// UICC-status request (`type 0`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UiccStatusRequest {
@@ -3699,6 +3864,100 @@ mod tests {
                 length: 5,
                 record_count: 2,
                 data: &[1, 2, 3, 4, 5],
+            })
+        );
+    }
+
+    #[test]
+    fn uicc_authenticate_request_zero_pads_fixed_slots_and_bounds_inputs() {
+        let request = super::UiccAuthenticateRequest {
+            app_type: 2,
+            rand: &[1, 2, 3],
+            auth: &[0xaa, 0xbb],
+            gsm_auth_selection: 1,
+        };
+        let mut wire = [0_u8; 44];
+        assert_eq!(request.encode(&mut wire), Ok(44));
+        assert_eq!(
+            &wire[..8],
+            &[0x35, 0x04, 0x00, 0x28, 0x00, 0x05, 0x00, 0x24]
+        );
+        assert_eq!(wire[8], 2);
+        assert_eq!(wire[9], 3);
+        assert_eq!(&wire[10..13], &[1, 2, 3]);
+        assert!(wire[13..26].iter().all(|&byte| byte == 0));
+        assert_eq!(wire[26], 2);
+        assert_eq!(&wire[27..29], &[0xaa, 0xbb]);
+        assert!(wire[29..43].iter().all(|&byte| byte == 0));
+        assert_eq!(wire[43], 1);
+
+        let too_long = [0_u8; 17];
+        assert_eq!(
+            super::UiccAuthenticateRequest {
+                app_type: 2,
+                rand: &too_long,
+                auth: &[],
+                gsm_auth_selection: 0,
+            }
+            .encode(&mut wire),
+            Err(super::UiccAuthenticateEncodeError::FieldTooLong {
+                field: super::UiccAuthenticateField::Rand,
+                maximum: 16,
+                actual: 17,
+            })
+        );
+    }
+
+    #[test]
+    fn uicc_authenticate_response_exposes_declared_authentication_material() {
+        let mut payload = [0_u8; 92];
+        payload[..6].copy_from_slice(&[0x00, 0x00, 0x00, 0x05, 0x00, 0x56]);
+        let data = &mut payload[6..];
+        data[0] = 1;
+        data[1] = 2;
+        data[2] = 3;
+        data[3] = 2;
+        data[4..6].copy_from_slice(&[0x10, 0x11]);
+        data[20] = 1;
+        data[21] = 0x20;
+        data[37] = 2;
+        data[38..40].copy_from_slice(&[0x30, 0x31]);
+        data[54] = 1;
+        data[55] = 0x40;
+        data[71] = 4;
+        data[72..76].copy_from_slice(&[0x50, 0x51, 0x52, 0x53]);
+        data[76] = 3;
+        data[77..80].copy_from_slice(&[0x60, 0x61, 0x62]);
+        data[85] = 7;
+
+        assert_eq!(
+            super::UiccAuthenticateResponse::parse(packet(0xb505, &payload)),
+            Ok(super::UiccAuthenticateResponse {
+                uicc_return: 1,
+                app_type: 2,
+                auth_return: 3,
+                res: &[0x10, 0x11],
+                ck: &[0x20],
+                ik: &[0x30, 0x31],
+                auts: &[0x40],
+                sres: &[0x50, 0x51, 0x52, 0x53],
+                kc: &[0x60, 0x61, 0x62],
+                gsm_auth_result: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn uicc_authenticate_response_rejects_embedded_lengths_beyond_slots() {
+        let mut payload = [0_u8; 92];
+        payload[..6].copy_from_slice(&[0x00, 0x00, 0x00, 0x05, 0x00, 0x56]);
+        payload[6 + 71] = 5;
+        assert_eq!(
+            super::UiccAuthenticateResponse::parse(packet(0xb505, &payload)),
+            Err(super::UiccAuthenticateDecodeError::FieldTooLong {
+                field: super::UiccAuthenticateField::Sres,
+                maximum: 4,
+                actual: 5,
             })
         );
     }

@@ -443,3 +443,22 @@ bytes; it is not multiplied by `record_num`.
 Both response types remain allocation-free borrowed views and reject truncated
 fixed prefixes or disagreement between their embedded length and the common
 UICC envelope payload.
+
+## UICC AUTHENTICATE — live P4 confirmed
+
+B014 DWARF names `_UICC_AUTHENTICATE_REQ` as a fixed 36-byte subtype object:
+`app_type`, `rand_len`, a 16-byte RAND slot, `auth_len`, a 16-byte AUTH slot,
+and `gsm_auth_sel`. `lted`'s request builder bounds each hex input to 16 bytes.
+Both B014 and live P4 `LAPI_UICCRequest` type-5 branches copy those 36 bytes
+raw after writing the common UICC envelope; there are no subtype endian fixups.
+The Rust encoder accepts borrowed RAND/AUTH slices up to 16 bytes, writes their
+one-byte lengths, and zero-fills unused fixed-slot bytes.
+
+The type-5 response branch is likewise a raw copy in B014 and live P4. B014
+DWARF gives the fixed 86-byte subtype layout: `uicc_ret`, `app_type`,
+`auth_ret`, then length + fixed-capacity slots for RES(16), CK(16), IK(16),
+AUTS(16), SRES(4), Kc(8), followed by `result_gsm_auth`. The clean parser
+requires the recovered 86-byte outer subtype size but exposes each result as a
+borrowed slice trimmed to its embedded length. Embedded lengths larger than the
+corresponding historical slot are rejected rather than allowing the OEM-style
+consumer to observe out-of-bounds logical data.
