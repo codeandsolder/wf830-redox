@@ -21,6 +21,8 @@ use lted_proto::{SdkApiRequest, SdkCallback, SdkCallbackKind, SdkCommand};
 /// Offset of `lte_api_ret` inside the recovered 38,784-byte
 /// `lted_client_context`.
 pub const LTE_API_RET_OFFSET: usize = 0x524;
+/// One-byte `LTED_GetPSInitComplete` return slot in the stock shared context.
+pub const PS_INIT_COMPLETE_OFFSET: usize = 0x528;
 
 #[derive(Debug)]
 pub enum HandleError {
@@ -229,6 +231,7 @@ pub fn broadcast_plmn_list_callback(
 pub struct DeviceBridge {
     device_id: u32,
     pending: PendingRequests,
+    init_complete: bool,
 }
 
 impl DeviceBridge {
@@ -237,6 +240,7 @@ impl DeviceBridge {
         Self {
             device_id,
             pending: PendingRequests::new(),
+            init_complete: false,
         }
     }
 
@@ -248,6 +252,11 @@ impl DeviceBridge {
     #[must_use]
     pub const fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    #[must_use]
+    pub const fn init_complete(&self) -> bool {
+        self.init_complete
     }
 
     /// Execute one stock SDK request and complete the OEM semaphore/shm
@@ -279,7 +288,25 @@ impl DeviceBridge {
         }
 
         let dispatch = if request.device_id == self.device_id {
-            self.dispatch_zero_parameter(modem, request)
+            match request.known_command() {
+                Ok(SdkCommand::GetPsInitComplete) => {
+                    if request.params.is_empty() {
+                        context.write(PS_INIT_COMPLETE_OFFSET, &[u8::from(self.init_complete)])?;
+                        Ok(HandledCall {
+                            command: SdkCommand::GetPsInitComplete,
+                            device_id: request.device_id,
+                            bytes_written: 0,
+                        })
+                    } else {
+                        Err(HandleError::UnexpectedParameters {
+                            command: request.command,
+                            actual: request.params.len(),
+                        })
+                    }
+                }
+                Ok(_) => self.dispatch_zero_parameter(modem, request),
+                Err(_) => Err(HandleError::UnsupportedCommand(request.command)),
+            }
         } else {
             Err(HandleError::UnknownDevice {
                 requested: request.device_id,
@@ -346,6 +373,9 @@ impl DeviceBridge {
             SdkCommand::Online => EmptyRequest::Online,
             SdkCommand::Offline => EmptyRequest::Offline,
             SdkCommand::PlmnList => EmptyRequest::PlmnList,
+            SdkCommand::GetPsInitComplete => {
+                return Err(HandleError::UnsupportedCommand(request.command));
+            }
             _ => return Err(HandleError::UnsupportedCommand(request.command)),
         };
         if !request.params.is_empty() {
@@ -385,7 +415,8 @@ mod tests {
     };
 
     use super::{
-        BroadcastReport, DeviceBridge, HandleError, LTE_API_RET_OFFSET, broadcast_result_callback,
+        BroadcastReport, DeviceBridge, HandleError, LTE_API_RET_OFFSET, PS_INIT_COMPLETE_OFFSET,
+        broadcast_result_callback,
     };
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -479,6 +510,40 @@ mod tests {
             })
             .unwrap_or_else(|_| std::process::abort());
         routed
+    }
+
+    #[test]
+    fn get_ps_init_complete_is_local_and_uses_recovered_shared_byte() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let request = SdkApiRequest {
+            command: SdkCommand::GetPsInitComplete as u16,
+            device_id: 1,
+            params: &[],
+        };
+
+        let handled = bridge
+            .handle_sdk_api(&mut server, &mut modem, id, request)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(handled.command, SdkCommand::GetPsInitComplete);
+        assert_eq!(handled.bytes_written, 0);
+        assert_eq!(read_api_ret(&mut server, id), 0);
+        let mut value = [0xff_u8; 1];
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .read(PS_INIT_COMPLETE_OFFSET, &mut value)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(value, [0]);
+        assert!(!bridge.init_complete());
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]

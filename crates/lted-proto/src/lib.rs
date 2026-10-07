@@ -94,6 +94,7 @@ pub struct UnknownEvent(pub u16);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
 pub enum SdkCommand {
+    GetPsInitComplete = 0,
     Attach = 25,
     AttachExt = 27,
     Detach = 29,
@@ -116,6 +117,7 @@ impl TryFrom<u16> for SdkCommand {
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
+            0 => Ok(Self::GetPsInitComplete),
             25 => Ok(Self::Attach),
             27 => Ok(Self::AttachExt),
             29 => Ok(Self::Detach),
@@ -627,6 +629,30 @@ mod tests {
         };
         assert_eq!(parsed, request);
         assert_eq!(parsed.known_command(), Ok(SdkCommand::PsInit));
+    }
+
+    #[test]
+    fn get_ps_init_complete_matches_stock_local_query_frame() {
+        let request = SdkApiRequest {
+            command: SdkCommand::GetPsInitComplete as u16,
+            device_id: 1,
+            params: &[],
+        };
+        let mut frame = [0_u8; 12];
+        assert_eq!(request.encode(&mut frame), Ok(12));
+        assert_eq!(
+            frame,
+            [
+                0x01, 0x06, 0x00, 0x08, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01,
+            ]
+        );
+        let Ok(packet) = Packet::parse(&frame) else {
+            return;
+        };
+        let Ok(parsed) = SdkApiRequest::parse(packet) else {
+            return;
+        };
+        assert_eq!(parsed.known_command(), Ok(SdkCommand::GetPsInitComplete));
     }
 
     #[test]
