@@ -343,6 +343,8 @@ pub mod recovered_opcode {
     pub const ONLINE_REQUEST: u16 = 0x3121;
     pub const OFFLINE_REQUEST: u16 = 0x3123;
     pub const PS_INIT_REQUEST: u16 = 0x312e;
+    /// Zero-payload command sent by the live P4 SDK after GLIF readiness.
+    pub const SDK_STARTUP_HANDSHAKE: u16 = 0x3337;
     pub const UICC_REQUEST: u16 = 0x3504;
 
     // Response values below are proven by the `decode_hci_packet` dispatch

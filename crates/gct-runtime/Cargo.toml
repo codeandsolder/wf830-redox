@@ -1,0 +1,13 @@
+[package]
+name = "gct-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gct-hci = { path = "../gct-hci" }
+gct-transport = { path = "../gct-transport" }
+
+[lints]
+workspace = true

@@ -556,3 +556,24 @@ suffix across reads and dispatches all complete borrowed HCI packets. The
 observed 32768-byte SDK read buffer is exposed only as an informational
 constant, not as a protocol maximum; the actual HCI framing limit remains a
 four-byte header plus the `u16` payload length.
+
+## Minimal runtime bootstrap
+
+Live P4 helper `0x71800` constructs one exact four-byte HCI frame: command
+`0x3337`, payload length zero, then passes it to `io_send_data`. Its only live
+caller is `io_recv_thread`: the helper runs immediately after the netdev
+`0x8d10`/subcommand-7 readiness probe returns success, before the thread enters
+its normal GLIF receive loop. The P4 response dispatch table contains no
+`0xb338` entry and no other direct response handler corresponding to `0x3337`.
+The clean runtime therefore names the value neutrally as
+`SDK_STARTUP_HANDSHAKE` and models it as the observed fire-and-forget startup
+command, not as a request with an invented response contract.
+
+`gct-runtime::Modem` now owns the three pieces that are genuinely shared by any
+higher-level daemon: `HciIo`, `HciStreamDecoder`, and a 32768-byte read buffer
+matching the live SDK choice. `send_startup_handshake` emits exactly
+`33 37 00 00`; `poll_once` performs one blocking read and dispatches all
+complete packets produced from that read plus any suffix retained from the
+previous iteration. This core deliberately contains no OEM UNIX-socket/shared-
+memory compatibility state. That compatibility layer can sit above the modem
+core instead of contaminating the proven HCI transport with historical IPC ABI.

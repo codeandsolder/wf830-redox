@@ -14,6 +14,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gct-runtime"
+version = "0.1.0"
+dependencies = [
+ "gct-hci",
+ "gct-transport",
+]
+
+[[package]]
 name = "gct-transport"
 version = "0.1.0"
 dependencies = [
