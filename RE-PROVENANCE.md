@@ -536,14 +536,35 @@ transport itself.
 
 The SDK's nearby startup private ioctl is a separate netdev operation, not a
 character-device prerequisite. P4 `io_ioctl` (`0x70350`) sends outer
-`SIOCDEVPRIVATE` (`0x89f0`) through the packet socket with a 32-byte block
-containing interface name, private command, subcommand, length and user data
-pointer. Startup uses private command `0x8d10`, subcommand 7, length 2. Live
+`SIOCDEVPRIVATE` (`0x89f0`) through the packet socket with a zero-initialized
+32-byte block. Bytes 0..15 are the interface name, 16..17 are the private
+command as a device-order `u16`, 18..19 are the subcommand, 20..23 are the
+32-bit length and 24..27 are a raw 32-bit userspace data pointer. Startup uses
+private command `0x8d10`, subcommand 7, length 2. Live
 `gdmlte.ko:gdm_lte_ioctl` (`0x2658`, decoded with ARM little-endian instruction
 words) routes that exact subcommand to a path that copies two zero bytes back to
-userspace and returns; it does not configure GLIF/HCI receive state. It can be
-preserved later as an OEM-compatible readiness probe, but it does not belong in
-the core `/dev/glif0` byte transport.
+userspace and returns; it does not configure GLIF/HCI receive state.
+
+The startup interface name is now independently recovered rather than inferred
+from nearby strings. Live `dev_init` (`0x77e74`) allocates the 632-byte I/O
+state and copies its second argument into the first 255 bytes. `net_open`
+(`0x6b35c`) later treats the beginning of that same object as the interface
+name, opens `AF_PACKET/SOCK_DGRAM`, performs `SIOCGIFHWADDR` (`0x8927`) on it,
+and stores the packet-socket fd at state offset `0x268`. The detector routine at
+`0x78240` opens `/proc/net/dev`, searches each line for `"lte"`, parses the
+matched substring with `sscanf("lte%dpdn%d", ...)`, requires the parsed PDN
+index to be zero, and passes that exact `lteNpdn0` substring to `dev_init`.
+Thus the first modem's normal startup interface is `lte0pdn0`; additional modem
+indices use the same grammar.
+
+The clean runtime deliberately does not reproduce the pointer-bearing private
+ioctl. The workspace forbids Rust `unsafe`, and reproducing an ABI whose live
+driver effect is only `00 00` would add architecture-specific FFI risk without
+restoring modem state. Instead `discover_startup_interface` safely scans
+`/proc/net/dev` for the recovered `lteNpdn0` grammar (or verifies an explicit
+caller-selected interface) before sending the separately proven `0x3337`
+handshake. This preserves the meaningful readiness condition while eliding a
+proven no-op compatibility mechanism.
 
 The SDK also sends a separate zero-payload HCI command `0x3337` during startup
 from helper `0x71800`. Its semantic name is not yet proven by an authoritative
@@ -594,14 +615,14 @@ stream framer. Decode errors are delivered to the callback per complete frame,
 so one malformed known frame does not discard later complete HCI frames from
 the same character-device read.
 
-The `gctd` binary is the first executable modem-core harness. It opens
-`/dev/glif0` (or a caller-supplied path), emits the observed P4 `0x3337`
-zero-payload startup handshake unless `--no-startup-handshake` is selected,
-and continuously logs typed inbound P0 events. It intentionally does not yet
-implement the OEM `lted` UNIX-datagram + SysV shared-memory/semaphore ABI, and
-it does not claim to reproduce the packet-socket `0x8d10/7` readiness probe.
-Those are adapter/startup-policy layers above the proven safe GLIF transport,
-not prerequisites for keeping the core HCI parser correct.
+The `gctd` binary is the first executable modem-core harness. Before opening
+`/dev/glif0` (or a caller-supplied path) for normal startup, it discovers the
+first `lteNpdn0` primary interface in `/proc/net/dev`; `--interface IFACE`
+selects and verifies one explicitly. It then emits the observed P4 `0x3337`
+zero-payload startup handshake and continuously logs typed inbound P0 events.
+`--no-startup-handshake` remains an explicit low-level mode that skips both the
+netdev readiness gate and the handshake. The executable intentionally does not
+yet implement the OEM `lted` UNIX-datagram + SysV shared-memory/semaphore ABI.
 
 ## Typed outbound command routing
 

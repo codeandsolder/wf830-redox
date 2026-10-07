@@ -6,7 +6,7 @@
 //! correlation and client APIs without duplicating transport state.
 
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{self, Read, Write},
     path::Path,
 };
@@ -28,6 +28,100 @@ use gct_lapi::{
 use gct_transport::{
     GlifTransport, HciIo, HciStreamDecoder, MAX_HCI_FRAME_LEN, OEM_READ_BUFFER_LEN,
 };
+
+/// Linux interface selected by the OEM startup detector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartupInterface {
+    pub name: String,
+    pub modem_index: u32,
+}
+
+/// Parse one interface name accepted by the clean form of the OEM detector.
+///
+/// Live P4 scans `/proc/net/dev` for `lte%dpdn%d` and only initializes entries
+/// whose PDN index is zero. The clean parser deliberately requires the whole
+/// interface name to match instead of accepting trailing garbage after the
+/// second decimal number as `sscanf` would.
+#[must_use]
+pub fn parse_startup_interface_name(name: &str) -> Option<StartupInterface> {
+    let rest = name.strip_prefix("lte")?;
+    let (modem, pdn) = rest.split_once("pdn")?;
+    if modem.is_empty() || pdn.is_empty() || !modem.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if !pdn.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let modem_index = modem.parse::<u32>().ok()?;
+    let pdn_index = pdn.parse::<u32>().ok()?;
+    if pdn_index != 0 {
+        return None;
+    }
+    Some(StartupInterface {
+        name: name.to_owned(),
+        modem_index,
+    })
+}
+
+/// Find the first OEM primary LTE interface in already-read `/proc/net/dev`
+/// text, preserving kernel listing order.
+#[must_use]
+pub fn find_startup_interface(net_dev: &str) -> Option<StartupInterface> {
+    net_dev.lines().find_map(|line| {
+        let (name, _) = line.split_once(':')?;
+        parse_startup_interface_name(name.trim())
+    })
+}
+
+/// Discover the first `lteNpdn0` interface exactly as required before the OEM
+/// SDK starts its modem receive thread.
+///
+/// The historical SDK then issues private ioctl `0x8d10/7` on this interface.
+/// The recovered live driver implementation only copies two zero bytes back and
+/// returns success, so the clean safe runtime treats successful interface
+/// discovery as the meaningful readiness condition and does not reproduce that
+/// no-op pointer-bearing ioctl.
+///
+/// # Errors
+/// Returns an I/O error when `/proc/net/dev` cannot be read, or `NotFound` when
+/// no primary LTE interface is present.
+pub fn discover_startup_interface() -> io::Result<StartupInterface> {
+    let net_dev = fs::read_to_string("/proc/net/dev")?;
+    find_startup_interface(&net_dev).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no OEM LTE primary interface matching lteNpdn0",
+        )
+    })
+}
+
+/// Verify a caller-selected startup interface against the live kernel table and
+/// the recovered OEM `lteNpdn0` naming grammar.
+///
+/// # Errors
+/// Returns `InvalidInput` for a non-primary/non-OEM name, an I/O error if the
+/// kernel interface table cannot be read, or `NotFound` if the named interface
+/// is not currently present.
+pub fn verify_startup_interface(name: &str) -> io::Result<StartupInterface> {
+    let parsed = parse_startup_interface_name(name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "startup interface must match lteNpdn0",
+        )
+    })?;
+    let net_dev = fs::read_to_string("/proc/net/dev")?;
+    let present = net_dev.lines().any(|line| {
+        line.split_once(':')
+            .is_some_and(|(candidate, _)| candidate.trim() == name)
+    });
+    if !present {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("startup interface {name} is not present"),
+        ));
+    }
+    Ok(parsed)
+}
 
 /// Result of one blocking read/dispatch iteration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -652,6 +746,53 @@ mod tests {
         PendingRequests, PollOutcome, ResponseKey, SendCommandError, SendTrackedCommandError,
         decode_event,
     };
+
+    #[test]
+    fn startup_interface_parser_accepts_only_primary_oem_names() {
+        assert_eq!(
+            super::parse_startup_interface_name("lte0pdn0"),
+            Some(super::StartupInterface {
+                name: "lte0pdn0".to_owned(),
+                modem_index: 0,
+            })
+        );
+        assert_eq!(
+            super::parse_startup_interface_name("lte12pdn0"),
+            Some(super::StartupInterface {
+                name: "lte12pdn0".to_owned(),
+                modem_index: 12,
+            })
+        );
+        assert_eq!(super::parse_startup_interface_name("lte0pdn1"), None);
+        assert_eq!(super::parse_startup_interface_name("ltepdn0"), None);
+        assert_eq!(super::parse_startup_interface_name("lte0pdn"), None);
+        assert_eq!(super::parse_startup_interface_name("xlte0pdn0"), None);
+        assert_eq!(super::parse_startup_interface_name("lte0pdn0junk"), None);
+    }
+
+    #[test]
+    fn startup_interface_discovery_preserves_proc_listing_order() {
+        let net_dev = "Inter-| Receive | Transmit\n\
+                        face |bytes |bytes\n\
+                         lo: 1 2\n\
+                    lte3pdn1: 3 4\n\
+                        eth0: 5 6\n\
+                    lte2pdn0: 7 8\n\
+                    lte0pdn0: 9 10\n";
+        assert_eq!(
+            super::find_startup_interface(net_dev),
+            Some(super::StartupInterface {
+                name: "lte2pdn0".to_owned(),
+                modem_index: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn startup_interface_discovery_ignores_non_interface_text() {
+        let net_dev = "header lte0pdn0 without colon\neth0: lte4pdn0 1 2\n";
+        assert_eq!(super::find_startup_interface(net_dev), None);
+    }
 
     #[test]
     fn startup_handshake_matches_live_p4_bytes() {
