@@ -577,3 +577,28 @@ complete packets produced from that read plus any suffix retained from the
 previous iteration. This core deliberately contains no OEM UNIX-socket/shared-
 memory compatibility state. That compatibility layer can sit above the modem
 core instead of contaminating the proven HCI transport with historical IPC ABI.
+
+## Typed P0 event dispatch and executable modem core
+
+The receive side now narrows the proven Stage-2/P0 opcodes before any daemon or
+client compatibility policy is applied. `gct-runtime::decode_event` maps the
+recovered attach/detach, PDN, PLMN, online/offline/PS-init, AT and UICC response
+opcodes to their existing `gct-lapi` borrowed parsers. Unknown opcodes remain
+available as `ModemEvent::Unknown(Packet)`; a malformed packet carrying a known
+opcode is instead returned as `EventDecodeError`. This distinction is
+intentional: protocol drift or corruption must not silently become an
+"unsupported event".
+
+`Modem::poll_events_once` composes that typed decoder with the proven GLIF
+stream framer. Decode errors are delivered to the callback per complete frame,
+so one malformed known frame does not discard later complete HCI frames from
+the same character-device read.
+
+The `gctd` binary is the first executable modem-core harness. It opens
+`/dev/glif0` (or a caller-supplied path), emits the observed P4 `0x3337`
+zero-payload startup handshake unless `--no-startup-handshake` is selected,
+and continuously logs typed inbound P0 events. It intentionally does not yet
+implement the OEM `lted` UNIX-datagram + SysV shared-memory/semaphore ABI, and
+it does not claim to reproduce the packet-socket `0x8d10/7` readiness probe.
+Those are adapter/startup-policy layers above the proven safe GLIF transport,
+not prerequisites for keeping the core HCI parser correct.

@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 gct-hci = { path = "../gct-hci" }
+gct-lapi = { path = "../gct-lapi" }
 gct-transport = { path = "../gct-transport" }
 
 [lints]
