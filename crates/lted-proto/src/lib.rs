@@ -21,6 +21,7 @@ pub const CALLBACK_REGISTRATION_COUNT: usize = 164;
 /// the first P0 compatibility surface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SdkCallbackKind {
+    Attach,
     PlmnList,
     Online,
     Offline,
@@ -31,6 +32,7 @@ impl SdkCallbackKind {
     #[must_use]
     pub const fn callback_id(self) -> u16 {
         match self {
+            Self::Attach => 26,
             Self::PlmnList => 45,
             Self::Online => 59,
             Self::Offline => 62,
@@ -41,6 +43,7 @@ impl SdkCallbackKind {
     #[must_use]
     pub const fn registration_index(self) -> usize {
         match self {
+            Self::Attach => 2,
             Self::PlmnList => 11,
             Self::Online => 18,
             Self::Offline => 19,
@@ -677,6 +680,8 @@ mod tests {
 
     #[test]
     fn recovered_callback_registration_slots_match_oem_jump_table() {
+        assert_eq!(SdkCallbackKind::Attach.callback_id(), 26);
+        assert_eq!(SdkCallbackKind::Attach.registration_offset(), 0x14);
         assert_eq!(SdkCallbackKind::PlmnList.callback_id(), 45);
         assert_eq!(SdkCallbackKind::PlmnList.registration_offset(), 0x5c);
         assert_eq!(SdkCallbackKind::Online.callback_id(), 59);

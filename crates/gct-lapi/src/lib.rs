@@ -434,6 +434,8 @@ pub enum AttachResponseDecodeError {
     MissingTransaction,
     UnexpectedTransactionKind { expected: u8, actual: u8 },
     UnexpectedTransactionLength { expected: usize, actual: usize },
+    MissingApnNetworkIdentifier,
+    ApnNetworkIdentifierTooLong { maximum: usize, actual: usize },
 }
 
 impl From<ResponseDecodeError> for AttachResponseDecodeError {
@@ -448,14 +450,234 @@ impl From<TlvDecodeError> for AttachResponseDecodeError {
     }
 }
 
-/// Fully split proven portion of normal attach response `0xb102`.
+/// One emergency number decoded from Attach response field `0xf4`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmergencyNumber<'a> {
+    pub category: u8,
+    pub number: &'a [u8],
+}
+
+/// Malformed packed emergency-number list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmergencyNumberDecodeError {
+    ZeroLength,
+    NumberTooLong { maximum: usize, actual: usize },
+    TruncatedRecord { expected: usize, actual: usize },
+    TooManyRecords { maximum: usize },
+}
+
+/// Borrowed emergency-number list carried by Attach response field `0xf4`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmergencyNumberList<'a> {
+    payload: &'a [u8],
+}
+
+impl<'a> EmergencyNumberList<'a> {
+    #[must_use]
+    pub const fn records(self) -> EmergencyNumberCursor<'a> {
+        EmergencyNumberCursor {
+            remaining: self.payload,
+            count: 0,
+        }
+    }
+
+    fn validate(self) -> Result<(), EmergencyNumberDecodeError> {
+        let mut records = self.records();
+        while records.next_record()?.is_some() {}
+        Ok(())
+    }
+}
+
+/// Allocation-free iterator over packed emergency-number records.
+pub struct EmergencyNumberCursor<'a> {
+    remaining: &'a [u8],
+    count: u8,
+}
+
+impl<'a> EmergencyNumberCursor<'a> {
+    /// Decode the next `[len, category, number[len-1]]` record.
+    ///
+    /// # Errors
+    /// Returns [`EmergencyNumberDecodeError`] when a record would exceed the
+    /// 92-byte historical number slot, the payload is truncated, `len` is zero,
+    /// or more than 14 records would overflow the legacy callback array.
+    pub fn next_record(
+        &mut self,
+    ) -> Result<Option<EmergencyNumber<'a>>, EmergencyNumberDecodeError> {
+        if self.remaining.is_empty() {
+            return Ok(None);
+        }
+        if self.count >= 14 {
+            return Err(EmergencyNumberDecodeError::TooManyRecords { maximum: 14 });
+        }
+        let len = usize::from(self.remaining[0]);
+        if len == 0 {
+            return Err(EmergencyNumberDecodeError::ZeroLength);
+        }
+        let number_len = len - 1;
+        if number_len > 92 {
+            return Err(EmergencyNumberDecodeError::NumberTooLong {
+                maximum: 92,
+                actual: number_len,
+            });
+        }
+        let total = 1 + len;
+        if self.remaining.len() < total {
+            return Err(EmergencyNumberDecodeError::TruncatedRecord {
+                expected: total,
+                actual: self.remaining.len(),
+            });
+        }
+        let record = EmergencyNumber {
+            category: self.remaining[1],
+            number: &self.remaining[2..total],
+        };
+        self.remaining = &self.remaining[total..];
+        self.count += 1;
+        Ok(Some(record))
+    }
+}
+
+/// Recovered semantic field in the descriptor-managed normal Attach suffix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachTailField<'a> {
+    LowerLayerReason(u8),
+    EpsAttachResult(u8),
+    EsmCause(u8),
+    Ipv4LinkMtu(u16),
+    OperatorPco(&'a [u8]),
+    T3402(u32),
+    ApnAmbr { uplink: u32, downlink: u32 },
+    EmergencyNumbers(EmergencyNumberList<'a>),
+    Msisdn(&'a [u8]),
+    Unknown(Tlv<'a>),
+}
+
+/// Malformed recognized field in the normal Attach suffix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachTailDecodeError {
+    Tlv(TlvDecodeError),
+    UnexpectedLength {
+        kind: u8,
+        expected: usize,
+        actual: usize,
+    },
+    FieldTooLong {
+        kind: u8,
+        maximum: usize,
+        actual: usize,
+    },
+    Emergency(EmergencyNumberDecodeError),
+}
+
+impl From<TlvDecodeError> for AttachTailDecodeError {
+    fn from(value: TlvDecodeError) -> Self {
+        Self::Tlv(value)
+    }
+}
+
+impl From<EmergencyNumberDecodeError> for AttachTailDecodeError {
+    fn from(value: EmergencyNumberDecodeError) -> Self {
+        Self::Emergency(value)
+    }
+}
+
+/// Cursor over the descriptor-managed normal Attach suffix.
+pub struct AttachTailCursor<'a> {
+    cursor: TlvCursor<'a>,
+}
+
+impl<'a> AttachTailCursor<'a> {
+    #[must_use]
+    pub const fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            cursor: TlvCursor::new(bytes),
+        }
+    }
+
+    /// Decode one field using the live P4 normal-Attach descriptor table.
+    ///
+    /// # Errors
+    /// Returns [`AttachTailDecodeError`] for malformed TLV framing or a known
+    /// field whose payload cannot fit its recovered legacy destination.
+    pub fn next_field(&mut self) -> Result<Option<AttachTailField<'a>>, AttachTailDecodeError> {
+        let Some(tlv) = self.cursor.next_tlv()? else {
+            return Ok(None);
+        };
+        let exact = |expected: usize| {
+            if tlv.payload.len() == expected {
+                Ok(())
+            } else {
+                Err(AttachTailDecodeError::UnexpectedLength {
+                    kind: tlv.kind,
+                    expected,
+                    actual: tlv.payload.len(),
+                })
+            }
+        };
+        let one = || -> Result<u8, AttachTailDecodeError> {
+            exact(1)?;
+            Ok(tlv.payload[0])
+        };
+        let field = match tlv.kind {
+            0x58 => AttachTailField::LowerLayerReason(one()?),
+            0x59 => AttachTailField::EpsAttachResult(one()?),
+            0x5a => AttachTailField::EsmCause(one()?),
+            0x5b => {
+                exact(2)?;
+                AttachTailField::Ipv4LinkMtu(u16::from_be_bytes([tlv.payload[0], tlv.payload[1]]))
+            }
+            0x5d => {
+                if tlv.payload.len() > 100 {
+                    return Err(AttachTailDecodeError::FieldTooLong {
+                        kind: tlv.kind,
+                        maximum: 100,
+                        actual: tlv.payload.len(),
+                    });
+                }
+                AttachTailField::OperatorPco(tlv.payload)
+            }
+            0x5e => {
+                exact(4)?;
+                AttachTailField::T3402(be_u32(tlv.payload, 0))
+            }
+            0xf3 => {
+                exact(8)?;
+                AttachTailField::ApnAmbr {
+                    uplink: be_u32(tlv.payload, 0),
+                    downlink: be_u32(tlv.payload, 4),
+                }
+            }
+            0xf4 => {
+                let list = EmergencyNumberList {
+                    payload: tlv.payload,
+                };
+                list.validate()?;
+                AttachTailField::EmergencyNumbers(list)
+            }
+            0xf8 => {
+                if tlv.payload.len() > 21 {
+                    return Err(AttachTailDecodeError::FieldTooLong {
+                        kind: tlv.kind,
+                        maximum: 21,
+                        actual: tlv.payload.len(),
+                    });
+                }
+                AttachTailField::Msisdn(tlv.payload)
+            }
+            _ => AttachTailField::Unknown(tlv),
+        };
+        Ok(Some(field))
+    }
+}
+
+/// Fully split normal Attach response `0xb102`.
 ///
-/// Live P4 consumes the common 15-byte prefix and then calls a dedicated
-/// helper whose first operation requires tag `0x20`; it copies the first
-/// payload byte into `_ATTACH_RSP_INFO.transaction_id`. The clean parser also
-/// validates the recovered TLV length rather than reproducing the OEM helper's
-/// unchecked byte access. The remaining response fields stay borrowed until
-/// their descriptor grammar is independently recovered.
+/// Live P4 consumes the common 15-byte prefix, mandatory transaction TLV, one
+/// APN TLV by position, at most two contiguous `0xf0`/`0xf2` PDN-info
+/// containers, then a descriptor-driven tail. The APN helper does not inspect
+/// its tag, so the clean parser intentionally preserves that positional
+/// behavior while bounding the historical 64-byte destination.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AttachResponse<'a> {
     pub register_result1: u16,
@@ -466,16 +688,18 @@ pub struct AttachResponse<'a> {
     pub ip_alloc: u8,
     pub network_features: NetworkFeatureInfo,
     pub transaction_id: u8,
+    pub apn_ni: OrderedPdnTlv<'a>,
+    initial_pdn_info: &'a [u8],
     trailing_fields: &'a [u8],
 }
 
 impl<'a> AttachResponse<'a> {
-    /// Decode the common prefix plus mandatory normal-attach transaction TLV.
+    /// Decode the complete recovered normal-Attach response layout.
     ///
     /// # Errors
-    /// Returns [`AttachResponseDecodeError`] for the wrong opcode, a truncated
-    /// fixed prefix/TLV, a missing transaction field, any first suffix tag
-    /// other than `0x20`, or a transaction payload whose length is not one.
+    /// Returns [`AttachResponseDecodeError`] for the wrong opcode, malformed
+    /// fixed prefix/transaction/APN TLV, an APN longer than 64 bytes, or broken
+    /// framing in one of the initial PDN containers.
     pub fn parse(packet: Packet<'a>) -> Result<Self, AttachResponseDecodeError> {
         let prefix = AttachResponsePrefix::parse(AttachResponseKind::Normal, packet)?;
         let mut cursor = TlvCursor::new(prefix.optional_fields);
@@ -494,6 +718,16 @@ impl<'a> AttachResponse<'a> {
                 actual: transaction.payload.len(),
             });
         }
+        let apn = cursor
+            .next_tlv()?
+            .ok_or(AttachResponseDecodeError::MissingApnNetworkIdentifier)?;
+        if apn.payload.len() > 64 {
+            return Err(AttachResponseDecodeError::ApnNetworkIdentifierTooLong {
+                maximum: 64,
+                actual: apn.payload.len(),
+            });
+        }
+        let (initial_pdn_info, trailing_fields) = split_initial_pdn_info(cursor.remaining())?;
 
         Ok(Self {
             register_result1: prefix.register_result1,
@@ -504,14 +738,23 @@ impl<'a> AttachResponse<'a> {
             ip_alloc: prefix.ip_alloc,
             network_features: prefix.network_features,
             transaction_id: transaction.payload[0],
-            trailing_fields: cursor.remaining(),
+            apn_ni: OrderedPdnTlv {
+                kind: apn.kind,
+                payload: apn.payload,
+            },
+            initial_pdn_info,
+            trailing_fields,
         })
     }
 
-    /// Remaining descriptor-managed fields after the transaction TLV.
     #[must_use]
-    pub const fn trailing_tlvs(&self) -> TlvCursor<'a> {
-        TlvCursor::new(self.trailing_fields)
+    pub const fn pdn_info_containers(&self) -> PdnInfoContainers<'a> {
+        PdnInfoContainers::new(self.initial_pdn_info)
+    }
+
+    #[must_use]
+    pub const fn trailing_fields(&self) -> AttachTailCursor<'a> {
+        AttachTailCursor::new(self.trailing_fields)
     }
 }
 
@@ -3082,12 +3325,13 @@ impl<'a> AtCommandFromDeviceExt<'a> {
 mod tests {
     use super::{
         ApnType, AtCommand, AttachEncodeError, AttachField, AttachRequest, AttachResponse,
-        AttachResponseDecodeError, AttachResponseKind, AttachResponsePrefix, DetachRequest,
-        DetachResponse, EmptyRequest, NetworkFeatureInfo, PcoInfo, PdnConnectExtRequest,
-        PdnConnectExtResponsePrefix, PdnConnectRequest, PdnConnectResponsePrefix,
-        PdnConnectionControl, PdnDisconnectRequest, PdnDisconnectResponsePrefix, PdnEncodeError,
-        PdnField, PdnInfoContainerKind, PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError,
-        Positioning, QosField, ResponseDecodeError, ResultResponse, ResultResponseKind,
+        AttachResponseDecodeError, AttachResponseKind, AttachResponsePrefix, AttachTailField,
+        DetachRequest, DetachResponse, EmptyRequest, NetworkFeatureInfo, PcoInfo,
+        PdnConnectExtRequest, PdnConnectExtResponsePrefix, PdnConnectRequest,
+        PdnConnectResponsePrefix, PdnConnectionControl, PdnDisconnectRequest,
+        PdnDisconnectResponsePrefix, PdnEncodeError, PdnField, PdnInfoContainerKind,
+        PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, Positioning, QosField,
+        ResponseDecodeError, ResultResponse, ResultResponseKind,
     };
     use gct_hci::{Header, Packet, Tlv};
 
@@ -3253,10 +3497,13 @@ mod tests {
     }
 
     #[test]
-    fn normal_attach_response_requires_exact_transaction_tlv() {
+    fn normal_attach_response_splits_ordered_apn_and_typed_tail() {
         let payload = [
             0x00, 0x01, 0x00, 0x02, 0x12, 0x34, 0x56, 0x78, 0x09, 0x0a, 1, 2, 3, 4, 5, 0x20, 0x01,
-            0x7f, 0x5d, 0x00,
+            0x7f, // transaction
+            0x04, 0x02, b'a', b'p', // positional APN helper
+            0x58, 0x01, 0x21, // lower-layer reason
+            0x5d, 0x02, 0xaa, 0xbb, // operator PCO
         ];
         let response = AttachResponse::parse(packet(0xb102, &payload));
         let Ok(response) = response else {
@@ -3265,15 +3512,47 @@ mod tests {
         assert_eq!(response.transaction_id, 0x7f);
         assert_eq!(response.register_result1, 1);
         assert_eq!(response.default_eps_id, 0x1234);
-        let mut trailing = response.trailing_tlvs();
+        assert_eq!(response.apn_ni.kind, 0x04);
+        assert_eq!(response.apn_ni.payload, b"ap");
+        let mut trailing = response.trailing_fields();
         assert_eq!(
-            trailing.next_tlv(),
-            Ok(Some(Tlv {
-                kind: 0x5d,
-                payload: &[],
-            }))
+            trailing.next_field(),
+            Ok(Some(AttachTailField::LowerLayerReason(0x21)))
         );
-        assert_eq!(trailing.next_tlv(), Ok(None));
+        assert_eq!(
+            trailing.next_field(),
+            Ok(Some(AttachTailField::OperatorPco(&[0xaa, 0xbb])))
+        );
+        assert_eq!(trailing.next_field(), Ok(None));
+    }
+
+    #[test]
+    fn normal_attach_emergency_list_preserves_packed_record_grammar() {
+        let payload = [
+            0, 1, 0, 2, 0, 3, 0, 4, 5, 6, 7, 8, 9, 10, 11, 0x20, 1, 9, 0x04, 0, 0xf4,
+            0x07, // seven packed bytes follow
+            0x03, 0x01, b'1', b'1', // len=3: category + two number bytes
+            0x02, 0x02, b'9', // len=2: category + one number byte
+        ];
+        let Ok(response) = AttachResponse::parse(packet(0xb102, &payload)) else {
+            return;
+        };
+        let mut tail = response.trailing_fields();
+        let Ok(Some(AttachTailField::EmergencyNumbers(list))) = tail.next_field() else {
+            return;
+        };
+        let mut records = list.records();
+        let Ok(Some(first)) = records.next_record() else {
+            return;
+        };
+        assert_eq!(first.category, 1);
+        assert_eq!(first.number, b"11");
+        let Ok(Some(second)) = records.next_record() else {
+            return;
+        };
+        assert_eq!(second.category, 2);
+        assert_eq!(second.number, b"9");
+        assert_eq!(records.next_record(), Ok(None));
     }
 
     #[test]
@@ -3303,6 +3582,24 @@ mod tests {
             Err(AttachResponseDecodeError::UnexpectedTransactionLength {
                 expected: 1,
                 actual: 2,
+            })
+        );
+
+        let mut missing_apn = prefix.to_vec();
+        missing_apn.extend_from_slice(&[0x20, 0x01, 0x07]);
+        assert_eq!(
+            AttachResponse::parse(packet(0xb102, &missing_apn)),
+            Err(AttachResponseDecodeError::MissingApnNetworkIdentifier)
+        );
+
+        let mut oversized_apn = prefix.to_vec();
+        oversized_apn.extend_from_slice(&[0x20, 0x01, 0x07, 0x04, 65]);
+        oversized_apn.extend_from_slice(&[0xaa; 65]);
+        assert_eq!(
+            AttachResponse::parse(packet(0xb102, &oversized_apn)),
+            Err(AttachResponseDecodeError::ApnNetworkIdentifierTooLong {
+                maximum: 64,
+                actual: 65,
             })
         );
     }

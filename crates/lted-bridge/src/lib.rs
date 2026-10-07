@@ -9,8 +9,10 @@
 use std::{io, io::Write};
 
 use gct_lapi::{
-    ApnType, AttachRequest, EmptyRequest, PdnConnectionControl, PlmnInfoDecodeError,
-    PlmnListResponse, Positioning, ResultResponse, ResultResponseKind,
+    ApnType, AttachRequest, AttachResponse, AttachTailDecodeError, AttachTailField,
+    EmergencyNumberDecodeError, EmptyRequest, PdnConnectionControl, PdnInfoField,
+    PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse, Positioning, QosField,
+    ResultResponse, ResultResponseKind,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -32,6 +34,7 @@ pub enum HandleError {
     UnexpectedParameters { command: u16, actual: usize },
     UnknownDevice { requested: u32, expected: u32 },
     LegacyAttach(LegacyAttachDecodeError),
+    AttachCallback(AttachCallbackError),
     PlmnList(PlmnInfoDecodeError),
     Send(SendCommandError),
     Tracked(SendTrackedCommandError),
@@ -56,6 +59,7 @@ impl std::fmt::Display for HandleError {
                 "lted SDK request addressed device {requested}, expected {expected}"
             ),
             Self::LegacyAttach(error) => write!(f, "invalid stock attach request: {error:?}"),
+            Self::AttachCallback(error) => write!(f, "invalid attach callback payload: {error:?}"),
             Self::PlmnList(error) => write!(f, "invalid PLMN-list response: {error:?}"),
             Self::Send(error) => write!(f, "modem send failed: {error:?}"),
             Self::Tracked(error) => write!(f, "tracked modem send failed: {error:?}"),
@@ -71,6 +75,7 @@ impl std::error::Error for HandleError {
             | Self::UnexpectedParameters { .. }
             | Self::UnknownDevice { .. }
             | Self::LegacyAttach(_)
+            | Self::AttachCallback(_)
             | Self::PlmnList(_)
             | Self::Send(_)
             | Self::Tracked(_) => None,
@@ -231,6 +236,211 @@ pub fn decode_legacy_attach(params: &[u8]) -> Result<AttachRequest<'_>, LegacyAt
         },
         secure_pco: params[0x15f],
     })
+}
+
+const STOCK_ATTACH_CALLBACK_DATA_LEN: usize = 0x88b;
+const STOCK_ATTACH_CALLBACK_FRAME_LEN: usize = 12 + STOCK_ATTACH_CALLBACK_DATA_LEN;
+const ATTACH_PDN_OFFSET: usize = 0x04b;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachCallbackError {
+    PdnContainerTlv,
+    PdnInnerTlv,
+    PdnField(PdnInfoFieldLengthError),
+    Tail(AttachTailDecodeError),
+    Emergency(EmergencyNumberDecodeError),
+}
+
+fn materialize_attach_pdn(
+    response: AttachResponse<'_>,
+    data: &mut [u8; STOCK_ATTACH_CALLBACK_DATA_LEN],
+) -> Result<(), AttachCallbackError> {
+    let mut containers = response.pdn_info_containers();
+    let mut stop_after_unknown = false;
+    while let Some(container) = containers
+        .next_container()
+        .map_err(|_| AttachCallbackError::PdnContainerTlv)?
+    {
+        if stop_after_unknown {
+            break;
+        }
+        let mut fields = container.fields();
+        while let Some(tlv) = fields
+            .next_tlv()
+            .map_err(|_| AttachCallbackError::PdnInnerTlv)?
+        {
+            match PdnInfoField::parse(tlv).map_err(AttachCallbackError::PdnField)? {
+                PdnInfoField::AccessPointName(value) => {
+                    data[ATTACH_PDN_OFFSET..ATTACH_PDN_OFFSET + value.len()].copy_from_slice(value);
+                }
+                PdnInfoField::PdnType(value) => data[ATTACH_PDN_OFFSET + 0x080] = value,
+                PdnInfoField::PdnTypeCause(value) => data
+                    [ATTACH_PDN_OFFSET + 0x081..ATTACH_PDN_OFFSET + 0x085]
+                    .copy_from_slice(&value.to_be_bytes()),
+                PdnInfoField::Ipv4Address(value) => data
+                    [ATTACH_PDN_OFFSET + 0x085..ATTACH_PDN_OFFSET + 0x089]
+                    .copy_from_slice(&value),
+                PdnInfoField::Ipv4DnsPrimary(value) => data
+                    [ATTACH_PDN_OFFSET + 0x089..ATTACH_PDN_OFFSET + 0x08d]
+                    .copy_from_slice(&value),
+                PdnInfoField::Ipv4DnsSecondary(value) => data
+                    [ATTACH_PDN_OFFSET + 0x08d..ATTACH_PDN_OFFSET + 0x091]
+                    .copy_from_slice(&value),
+                PdnInfoField::Ipv6DnsPrimary(value) => data
+                    [ATTACH_PDN_OFFSET + 0x091..ATTACH_PDN_OFFSET + 0x0a1]
+                    .copy_from_slice(&value),
+                PdnInfoField::Ipv6DnsSecondary(value) => data
+                    [ATTACH_PDN_OFFSET + 0x0a1..ATTACH_PDN_OFFSET + 0x0b1]
+                    .copy_from_slice(&value),
+                PdnInfoField::Ipv6InterfaceId(value) => data
+                    [ATTACH_PDN_OFFSET + 0x0b1..ATTACH_PDN_OFFSET + 0x0b9]
+                    .copy_from_slice(&value),
+                PdnInfoField::PcscfIpv6 { index, address } => {
+                    let offset = ATTACH_PDN_OFFSET + 0x0b9 + usize::from(index - 1) * 16;
+                    data[offset..offset + 16].copy_from_slice(&address);
+                }
+                PdnInfoField::PcscfIpv4 { index, address } => {
+                    let offset = ATTACH_PDN_OFFSET + 0x109 + usize::from(index - 1) * 4;
+                    data[offset..offset + 4].copy_from_slice(&address);
+                }
+                PdnInfoField::Qos { field, value } => {
+                    let word = match field {
+                        QosField::Qci => 0,
+                        QosField::MaxBitRateUl => 1,
+                        QosField::MaxBitRateDl => 2,
+                        QosField::GuaranteedBitRateUl => 3,
+                        QosField::GuaranteedBitRateDl => 4,
+                    };
+                    let offset = ATTACH_PDN_OFFSET + 0x216 + word * 4;
+                    data[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+                }
+                PdnInfoField::Unknown(_) => {
+                    stop_after_unknown = true;
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn materialize_attach_callback(
+    response: AttachResponse<'_>,
+    data: &mut [u8; STOCK_ATTACH_CALLBACK_DATA_LEN],
+) -> Result<(), AttachCallbackError> {
+    data.fill(0);
+    data[0x000..0x002].copy_from_slice(&response.register_result1.to_be_bytes());
+    data[0x002..0x004].copy_from_slice(&response.register_result2.to_be_bytes());
+    data[0x004..0x006].copy_from_slice(&response.default_eps_id.to_be_bytes());
+    data[0x006..0x008].copy_from_slice(&response.eps_id.to_be_bytes());
+    data[0x008] = response.data_path;
+    data[0x009] = response.ip_alloc;
+    data[0x00a] = u8::try_from(response.apn_ni.payload.len()).unwrap_or(0);
+    data[0x00b..0x00b + response.apn_ni.payload.len()].copy_from_slice(response.apn_ni.payload);
+    data[0x275] = response.network_features.ims_voice_over_ps;
+    data[0x276] = response.network_features.emc_bc;
+    data[0x277] = response.network_features.epc_lcs;
+    data[0x278] = response.network_features.sc_lcs;
+    data[0x279] = response.network_features.ext_sr;
+    data[0x27a] = response.transaction_id;
+
+    materialize_attach_pdn(response, data)?;
+
+    let mut tail = response.trailing_fields();
+    while let Some(field) = tail.next_field().map_err(AttachCallbackError::Tail)? {
+        match field {
+            AttachTailField::LowerLayerReason(value) => data[0x27b] = value,
+            AttachTailField::EpsAttachResult(value) => data[0x27c] = value,
+            AttachTailField::EsmCause(value) => data[0x27d] = value,
+            AttachTailField::Ipv4LinkMtu(value) => {
+                data[0x27e..0x280].copy_from_slice(&value.to_be_bytes());
+            }
+            AttachTailField::OperatorPco(value) => {
+                if !value.is_empty() {
+                    data[0x280] = 1;
+                    data[0x281] = u8::try_from(value.len()).unwrap_or(0);
+                    data[0x282..0x282 + value.len()].copy_from_slice(value);
+                }
+            }
+            AttachTailField::T3402(value) => {
+                data[0x2e6..0x2ea].copy_from_slice(&value.to_be_bytes());
+            }
+            AttachTailField::ApnAmbr { uplink, downlink } => {
+                data[0x2ea..0x2ee].copy_from_slice(&uplink.to_be_bytes());
+                data[0x2ee..0x2f2].copy_from_slice(&downlink.to_be_bytes());
+            }
+            AttachTailField::EmergencyNumbers(list) => {
+                let mut count = 0_u8;
+                let mut records = list.records();
+                while let Some(record) = records
+                    .next_record()
+                    .map_err(AttachCallbackError::Emergency)?
+                {
+                    let offset = 0x2f3 + usize::from(count) * 94;
+                    data[offset] = u8::try_from(record.number.len() + 1).unwrap_or(0);
+                    data[offset + 1] = record.category;
+                    data[offset + 2..offset + 2 + record.number.len()]
+                        .copy_from_slice(record.number);
+                    count += 1;
+                }
+                data[0x2f2] = count;
+            }
+            AttachTailField::Msisdn(value) => {
+                data[0x875] = u8::try_from(value.len()).unwrap_or(0);
+                data[0x876..0x876 + value.len()].copy_from_slice(value);
+            }
+            AttachTailField::Unknown(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Materialize and broadcast stock callback 26 (`Attach`).
+///
+/// The live daemon sends the complete 2,187-byte `_ATTACH_RSP_INFO` memory
+/// image rather than the modem's `0xb102` payload. This function reproduces
+/// that big-endian packed image from the clean typed response without defining
+/// or exposing the historical C structure.
+///
+/// # Errors
+/// Returns [`HandleError::AttachCallback`] for malformed proven response
+/// fields or [`HandleError::Ipc`] for callback/shared-context/socket failures.
+pub fn broadcast_attach_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: AttachResponse<'_>,
+) -> Result<BroadcastReport, HandleError> {
+    let mut data = [0_u8; STOCK_ATTACH_CALLBACK_DATA_LEN];
+    materialize_attach_callback(response, &mut data).map_err(HandleError::AttachCallback)?;
+    let callback_kind = SdkCallbackKind::Attach;
+    let mut frame = [0_u8; STOCK_ATTACH_CALLBACK_FRAME_LEN];
+    let frame_len = SdkCallback {
+        callback_id: callback_kind.callback_id(),
+        device_id,
+        data: &data,
+    }
+    .encode(&mut frame)
+    .map_err(|_| {
+        HandleError::Ipc(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fixed-size Attach callback failed to encode",
+        ))
+    })?;
+
+    let mut report = BroadcastReport::default();
+    for client_id in server.client_ids() {
+        let registered = server
+            .client_context(client_id)?
+            .read_u32_be(callback_kind.registration_offset())?
+            != 0;
+        if !registered {
+            continue;
+        }
+        report.registered_clients += 1;
+        server.send_to_client(client_id, &frame[..frame_len])?;
+        report.sent_clients += 1;
+    }
+    Ok(report)
 }
 
 const MAX_PLMN_RECORDS: usize = 32;
@@ -521,6 +731,13 @@ impl DeviceBridge {
         event: &ModemEvent<'_>,
     ) -> Result<Option<BroadcastReport>, HandleError> {
         match event {
+            ModemEvent::Attach(response) => {
+                let key = ResponseKey::Attach(response.transaction_id);
+                if !self.pending.remove(key) {
+                    return Ok(None);
+                }
+                broadcast_attach_callback(server, self.device_id, *response).map(Some)
+            }
             ModemEvent::Result { kind, response } => {
                 let key = ResponseKey::Result(*kind);
                 if !self.pending.remove(key) {
@@ -1277,6 +1494,111 @@ mod tests {
                 0x01,
             ]
         );
+    }
+
+    #[test]
+    fn attach_response_materializes_exact_stock_callback_and_subscription_gate() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, subscribed_id) = open_client(&mut server, &dir, 0);
+        let (unsubscribed, _unsubscribed_id) = open_client(&mut server, &dir, 1);
+        server
+            .client_context(subscribed_id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::Attach.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        let mut params = [0_u8; 352];
+        params[0] = 1;
+        params[1] = 7;
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                subscribed_id,
+                SdkApiRequest {
+                    command: SdkCommand::Attach as u16,
+                    device_id: 0x1122_3344,
+                    params: &params,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.pending_count(), 1);
+
+        let payload = [
+            0x00, 0x01, 0x00, 0x02, 0x12, 0x34, 0x56, 0x78, 0x09, 0x0a, 1, 2, 3, 4, 5, 0x20, 0x01,
+            0x07, 0x99, 0x03, b'i', b'm', b's', 0xf0, 0x1a, 0x04, 0x03, b'p', b'd', b'n', 0x05,
+            0x01, 0x02, 0x06, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x07, 0x04, 192, 168, 1, 2, 0x40, 0x04,
+            0x00, 0x00, 0x00, 0x09, 0x58, 0x01, 0xaa, 0x59, 0x01, 0xbb, 0x5a, 0x01, 0xcc, 0x5b,
+            0x02, 0x05, 0xdc, 0x5d, 0x03, 0x11, 0x22, 0x33, 0x5e, 0x04, 0x01, 0x02, 0x03, 0x04,
+            0xf3, 0x08, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0xc8, 0xf4, 0x05, 0x04, 0x09,
+            b'1', b'1', b'2', 0xf8, 0x05, b'1', b'2', b'3', b'4', b'5',
+        ];
+        let mut hci = Vec::with_capacity(payload.len() + 4);
+        hci.extend_from_slice(&[0xb1, 0x02]);
+        hci.extend_from_slice(
+            &u16::try_from(payload.len())
+                .unwrap_or_else(|_| std::process::abort())
+                .to_be_bytes(),
+        );
+        hci.extend_from_slice(&payload);
+
+        assert_eq!(
+            route_one_hci(&mut bridge, &mut server, hci),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 2200];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(len, 12 + 0x88b);
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 26);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(callback.data.len(), 0x88b);
+        let data = callback.data;
+        assert_eq!(
+            &data[0x000..0x00a],
+            &[0, 1, 0, 2, 0x12, 0x34, 0x56, 0x78, 9, 10]
+        );
+        assert_eq!(data[0x00a], 3);
+        assert_eq!(&data[0x00b..0x00e], b"ims");
+        assert_eq!(&data[0x04b..0x04e], b"pdn");
+        assert_eq!(data[0x0cb], 2);
+        assert_eq!(&data[0x0cc..0x0d0], &0xdead_beef_u32.to_be_bytes());
+        assert_eq!(&data[0x0d0..0x0d4], &[192, 168, 1, 2]);
+        assert_eq!(&data[0x261..0x265], &9_u32.to_be_bytes());
+        assert_eq!(&data[0x275..0x27a], &[1, 2, 3, 4, 5]);
+        assert_eq!(data[0x27a], 7);
+        assert_eq!(&data[0x27b..0x27e], &[0xaa, 0xbb, 0xcc]);
+        assert_eq!(&data[0x27e..0x280], &1500_u16.to_be_bytes());
+        assert_eq!(&data[0x280..0x285], &[1, 3, 0x11, 0x22, 0x33]);
+        assert_eq!(&data[0x2e6..0x2ea], &0x0102_0304_u32.to_be_bytes());
+        assert_eq!(&data[0x2ea..0x2ee], &100_u32.to_be_bytes());
+        assert_eq!(&data[0x2ee..0x2f2], &200_u32.to_be_bytes());
+        assert_eq!(data[0x2f2], 1);
+        assert_eq!(&data[0x2f3..0x2f8], &[4, 9, b'1', b'1', b'2']);
+        assert_eq!(data[0x875], 5);
+        assert_eq!(&data[0x876..0x87b], b"12345");
+        assert!(data[0x87b..].iter().all(|&byte| byte == 0));
+
+        unsubscribed
+            .set_nonblocking(true)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut no_frame = [0_u8; 1];
+        let Err(error) = unsubscribed.recv(&mut no_frame) else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     }
 
     #[test]
