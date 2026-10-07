@@ -13,6 +13,46 @@ pub const COMMON_SOCKET_PATH: &str = "/var/tmp/lted-daemon";
 pub const PRIVATE_SOCKET_PREFIX: &str = "/var/tmp/lted-client-";
 pub const SHARED_CONTEXT_LEN: usize = 0x9780;
 pub const MAX_CLIENTS: usize = 15;
+pub const CALLBACK_REGISTRATION_BASE: usize = 4;
+pub const CALLBACK_REGISTRATION_STRIDE: usize = 8;
+pub const CALLBACK_REGISTRATION_COUNT: usize = 164;
+
+/// Callback IDs and their recovered `lted_client_context.cb_rsp[]` slots for
+/// the first P0 compatibility surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SdkCallbackKind {
+    PlmnList,
+    Online,
+    Offline,
+    PsInit,
+}
+
+impl SdkCallbackKind {
+    #[must_use]
+    pub const fn callback_id(self) -> u16 {
+        match self {
+            Self::PlmnList => 45,
+            Self::Online => 59,
+            Self::Offline => 62,
+            Self::PsInit => 68,
+        }
+    }
+
+    #[must_use]
+    pub const fn registration_index(self) -> usize {
+        match self {
+            Self::PlmnList => 11,
+            Self::Online => 18,
+            Self::Offline => 19,
+            Self::PsInit => 22,
+        }
+    }
+
+    #[must_use]
+    pub const fn registration_offset(self) -> usize {
+        CALLBACK_REGISTRATION_BASE + self.registration_index() * CALLBACK_REGISTRATION_STRIDE
+    }
+}
 
 /// Top-level `lted` client/server event identifiers proven from the live P4
 /// daemon and stock `liblted.so`.
@@ -453,7 +493,8 @@ impl<'a> SdkCallback<'a> {
 mod tests {
     use super::{
         ApiOpenRequest, ApiOpenResponse, Event, Header, MessageDecodeError, Packet,
-        PacketDecodeError, SdkApiRequest, SdkCallback, SdkCommand, parse_api_close,
+        PacketDecodeError, SdkApiRequest, SdkCallback, SdkCallbackKind, SdkCommand,
+        parse_api_close,
     };
 
     #[test]
@@ -606,6 +647,18 @@ mod tests {
             return;
         };
         assert_eq!(SdkApiRequest::parse(packet), Ok(request));
+    }
+
+    #[test]
+    fn recovered_callback_registration_slots_match_oem_jump_table() {
+        assert_eq!(SdkCallbackKind::PlmnList.callback_id(), 45);
+        assert_eq!(SdkCallbackKind::PlmnList.registration_offset(), 0x5c);
+        assert_eq!(SdkCallbackKind::Online.callback_id(), 59);
+        assert_eq!(SdkCallbackKind::Online.registration_offset(), 0x94);
+        assert_eq!(SdkCallbackKind::Offline.callback_id(), 62);
+        assert_eq!(SdkCallbackKind::Offline.registration_offset(), 0x9c);
+        assert_eq!(SdkCallbackKind::PsInit.callback_id(), 68);
+        assert_eq!(SdkCallbackKind::PsInit.registration_offset(), 0xb4);
     }
 
     #[test]

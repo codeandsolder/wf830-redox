@@ -117,6 +117,19 @@ impl Server {
         self.clients.iter().flatten().count()
     }
 
+    /// Snapshot the currently allocated client IDs in ascending slot order.
+    #[must_use]
+    pub fn client_ids(&self) -> Vec<u8> {
+        self.clients
+            .iter()
+            .enumerate()
+            .filter_map(|(index, client)| {
+                client.as_ref()?;
+                u8::try_from(index).ok()
+            })
+            .collect()
+    }
+
     #[must_use]
     pub fn client_identity(&self, id: u8) -> Option<Option<u16>> {
         self.clients

@@ -151,6 +151,24 @@ impl ClientContext {
         self.write(offset, &value.to_be_bytes())
     }
 
+    /// Read one big-endian 32-bit value from the shared context.
+    ///
+    /// # Errors
+    /// Returns the same bounds error as [`Self::read`].
+    pub fn read_u32_be(&self, offset: usize) -> io::Result<u32> {
+        let mut bytes = [0_u8; 4];
+        self.read(offset, &mut bytes)?;
+        Ok(u32::from_be_bytes(bytes))
+    }
+
+    /// Write one big-endian 32-bit value to the shared context.
+    ///
+    /// # Errors
+    /// Returns the same bounds error as [`Self::write`].
+    pub fn write_u32_be(&mut self, offset: usize, value: u32) -> io::Result<()> {
+        self.write(offset, &value.to_be_bytes())
+    }
+
     fn set_all_zero(&self) -> io::Result<()> {
         let mut values = [0_u16; 2];
         let arg = Semun {

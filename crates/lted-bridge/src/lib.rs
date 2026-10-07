@@ -8,10 +8,10 @@
 
 use std::{io, io::Write};
 
-use gct_lapi::EmptyRequest;
+use gct_lapi::{EmptyRequest, ResultResponse, ResultResponseKind};
 use gct_runtime::{Modem, ModemCommand, SendCommandError};
 use lted_compat::Server;
-use lted_proto::{SdkApiRequest, SdkCommand};
+use lted_proto::{SdkApiRequest, SdkCallback, SdkCallbackKind, SdkCommand};
 
 /// Offset of `lte_api_ret` inside the recovered 38,784-byte
 /// `lted_client_context`.
@@ -67,6 +67,62 @@ pub struct HandledCall {
     pub command: SdkCommand,
     pub device_id: u32,
     pub bytes_written: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BroadcastReport {
+    pub registered_clients: usize,
+    pub sent_clients: usize,
+}
+
+/// Broadcast one of the three proven four-byte result callbacks to every stock
+/// client that has the corresponding `cb_rsp[]` function slot registered.
+///
+/// The callback payload is the original big-endian four-byte modem result, and
+/// the local `0x8107` envelope carries the supplied OEM device ID.
+///
+/// # Errors
+/// Returns [`HandleError::Ipc`] for shared-context or UNIX-datagram failures.
+pub fn broadcast_result_callback(
+    server: &mut Server,
+    kind: ResultResponseKind,
+    device_id: u32,
+    response: ResultResponse,
+) -> Result<BroadcastReport, HandleError> {
+    let callback_kind = match kind {
+        ResultResponseKind::Online => SdkCallbackKind::Online,
+        ResultResponseKind::Offline => SdkCallbackKind::Offline,
+        ResultResponseKind::PsInit => SdkCallbackKind::PsInit,
+    };
+    let mut frame = [0_u8; 16];
+    let data = response.result.to_be_bytes();
+    let frame_len = SdkCallback {
+        callback_id: callback_kind.callback_id(),
+        device_id,
+        data: &data,
+    }
+    .encode(&mut frame)
+    .map_err(|_| {
+        HandleError::Ipc(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fixed-size result callback failed to encode",
+        ))
+    })?;
+
+    let mut report = BroadcastReport::default();
+    for client_id in server.client_ids() {
+        let registered = server
+            .client_context(client_id)?
+            .read_u32_be(callback_kind.registration_offset())?
+            != 0;
+        if !registered {
+            continue;
+        }
+        report.registered_clients += 1;
+        server.send_to_client(client_id, &frame[..frame_len])?;
+        report.sent_clients += 1;
+    }
+    Ok(report)
 }
 
 /// Execute one stock SDK request and complete the OEM semaphore/shm synchronous
@@ -144,12 +200,18 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    use gct_lapi::{ResultResponse, ResultResponseKind};
     use gct_runtime::Modem;
     use gct_transport::HciIo;
     use lted_compat::Server;
-    use lted_proto::{ApiOpenRequest, ApiOpenResponse, Packet, SdkApiRequest, SdkCommand};
+    use lted_proto::{
+        ApiOpenRequest, ApiOpenResponse, Packet, SdkApiRequest, SdkCallback, SdkCallbackKind,
+        SdkCommand,
+    };
 
-    use super::{HandleError, LTE_API_RET_OFFSET, handle_sdk_api};
+    use super::{
+        BroadcastReport, HandleError, LTE_API_RET_OFFSET, broadcast_result_callback, handle_sdk_api,
+    };
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -176,8 +238,8 @@ mod tests {
         }
     }
 
-    fn open_client(server: &mut Server, dir: &TestDir) -> (UnixDatagram, u8) {
-        let peer_path = dir.join("peer");
+    fn open_client(server: &mut Server, dir: &TestDir, number: usize) -> (UnixDatagram, u8) {
+        let peer_path = dir.join(&format!("peer-{number}"));
         let client = UnixDatagram::bind(&peer_path).unwrap_or_else(|_| std::process::abort());
         let mut open = [0_u8; 8];
         let len = (ApiOpenRequest {
@@ -227,7 +289,7 @@ mod tests {
     fn stock_style_ps_init_reaches_modem_and_completes_shm_return() {
         let dir = TestDir::new();
         let mut server = bind_server(&dir);
-        let (client, id) = open_client(&mut server, &dir);
+        let (client, id) = open_client(&mut server, &dir, 0);
         let request = SdkApiRequest {
             command: SdkCommand::PsInit as u16,
             device_id: 0x1122_3344,
@@ -273,7 +335,7 @@ mod tests {
         for (index, (command, expected)) in cases.into_iter().enumerate() {
             let dir = TestDir::new();
             let mut server = bind_server(&dir);
-            let (_client, id) = open_client(&mut server, &dir);
+            let (_client, id) = open_client(&mut server, &dir, 0);
             let transport = HciIo::new(Cursor::new(Vec::new()));
             let mut modem = Modem::new(transport);
             let request = SdkApiRequest {
@@ -285,6 +347,89 @@ mod tests {
                 .unwrap_or_else(|_| std::process::abort());
             assert_eq!(read_api_ret(&mut server, id), 0);
             assert_eq!(modem.into_transport().into_inner().into_inner(), expected);
+        }
+    }
+
+    #[test]
+    fn result_callback_reaches_only_registered_stock_clients() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (registered_client, registered_id) = open_client(&mut server, &dir, 0);
+        let (unregistered_client, _unregistered_id) = open_client(&mut server, &dir, 1);
+        server
+            .client_context(registered_id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::Online.registration_offset(), 0x1234_5678)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let report = broadcast_result_callback(
+            &mut server,
+            ResultResponseKind::Online,
+            0x1122_3344,
+            ResultResponse {
+                result: 0xaabb_ccdd,
+            },
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            report,
+            BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            }
+        );
+
+        let mut frame = [0_u8; 16];
+        let len = registered_client
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            SdkCallback::parse(packet),
+            Ok(SdkCallback {
+                callback_id: 59,
+                device_id: 0x1122_3344,
+                data: &[0xaa, 0xbb, 0xcc, 0xdd],
+            })
+        );
+
+        unregistered_client
+            .set_nonblocking(true)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut nothing = [0_u8; 16];
+        let Err(error) = unregistered_client.recv(&mut nothing) else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn each_result_kind_uses_its_recovered_callback_id_and_slot() {
+        let cases = [
+            (ResultResponseKind::Online, SdkCallbackKind::Online, 59),
+            (ResultResponseKind::Offline, SdkCallbackKind::Offline, 62),
+            (ResultResponseKind::PsInit, SdkCallbackKind::PsInit, 68),
+        ];
+        for (number, (kind, callback_kind, callback_id)) in cases.into_iter().enumerate() {
+            let dir = TestDir::new();
+            let mut server = bind_server(&dir);
+            let (client, id) = open_client(&mut server, &dir, number);
+            server
+                .client_context(id)
+                .unwrap_or_else(|_| std::process::abort())
+                .write_u32_be(callback_kind.registration_offset(), 1)
+                .unwrap_or_else(|_| std::process::abort());
+            broadcast_result_callback(&mut server, kind, 7, ResultResponse { result: 9 })
+                .unwrap_or_else(|_| std::process::abort());
+            let mut frame = [0_u8; 16];
+            let len = client
+                .recv(&mut frame)
+                .unwrap_or_else(|_| std::process::abort());
+            let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+            let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+            assert_eq!(callback.callback_id, callback_id);
+            assert_eq!(callback.device_id, 7);
+            assert_eq!(callback.data, 9_u32.to_be_bytes());
         }
     }
 
@@ -304,7 +449,7 @@ mod tests {
     fn failed_modem_write_returns_one_to_stock_client() {
         let dir = TestDir::new();
         let mut server = bind_server(&dir);
-        let (_client, id) = open_client(&mut server, &dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
         let mut modem = Modem::new(HciIo::new(FailingWriter));
         let request = SdkApiRequest {
             command: SdkCommand::Online as u16,
@@ -322,7 +467,7 @@ mod tests {
     fn unsupported_call_is_released_with_failure_status() {
         let dir = TestDir::new();
         let mut server = bind_server(&dir);
-        let (_client, id) = open_client(&mut server, &dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
         let transport = HciIo::new(Cursor::new(Vec::new()));
         let mut modem = Modem::new(transport);
         let params = [0_u8; 352];
@@ -346,7 +491,7 @@ mod tests {
     fn unexpected_legacy_payload_is_rejected_before_modem_write() {
         let dir = TestDir::new();
         let mut server = bind_server(&dir);
-        let (_client, id) = open_client(&mut server, &dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
         let transport = HciIo::new(Cursor::new(Vec::new()));
         let mut modem = Modem::new(transport);
         let request = SdkApiRequest {
