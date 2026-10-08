@@ -308,6 +308,32 @@ views. It is intentionally stricter than the old C on malformed input: exact
 one-byte transaction/apn-class fields, exact MTU/AMBR widths, APN/PCO destination
 bounds, truncation errors, and preservation of unknown or OEM-ignored bytes.
 
+### Stock normal-PDN bridge ABI
+
+`lted-bridge` now carries the normal PDN-connect path through the unchanged stock
+SDK ABI as well as the clean modem wire codec. Stock SDK command 32 supplies the
+exact 420-byte `_PDN_CONNECTIVITY_REQ_PARAM` image recovered from B014 DWARF.
+The bridge decodes only fields the live P4 `LAPI_PDNConnRequest` actually
+consumes, rejects malformed fixed strings and PCO lengths before touching GLIF,
+and deliberately ignores the historical `transaction_id@0x1a3`: live P4 calls
+`tid_list_add()` and allocates the first free transaction ID in `1..=253`, so
+the Rust bridge does the same against its pending-request ledger.
+
+The reverse path is callback 33 (`PDNConn`). B014 DWARF gives the exact
+742-byte `_PDN_CONNECTIVITY_RSP_INFO` image: transaction ID at `0x00a`,
+65-byte APN-NI at `0x00b`, `PDN` at `0x04c`, IPv4 link MTU at `0x276`,
+operator PCO at `0x278`, and APN-AMBR at `0x2de`. Live P4 callback dispatch
+uses `cb_rsp[6]`; in the recovered shared client context that is registration
+offset `0x34`. The bridge parses modem response `0xb106` semantically,
+re-materializes this packed legacy image, correlates by transaction ID, and
+emits callback 33 only to clients registered in that slot.
+
+The end-to-end bridge tests cover first-free TID allocation, exact `0x3105`
+wire bytes, malformed legacy input rejected before modem I/O, complete callback
+materialization across initial and trailing PDN fields, subscription gating,
+and pending-request release. The workspace gate is Rust 1.99
+`cargo test --workspace` plus strict all-target Clippy with warnings denied.
+
 ## PLMN search/list wire grammar — live P4 confirmed
 
 B014 DWARF names `_PLMN_SEARCH_REQ_PARAM` as a nine-byte host structure

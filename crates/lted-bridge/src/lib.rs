@@ -10,9 +10,10 @@ use std::{io, io::Write};
 
 use gct_lapi::{
     ApnType, AttachRequest, AttachResponse, AttachTailDecodeError, AttachTailField,
-    EmergencyNumberDecodeError, EmptyRequest, PdnConnectionControl, PdnInfoField,
-    PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse, Positioning, QosField,
-    ResultResponse, ResultResponseKind,
+    EmergencyNumberDecodeError, EmptyRequest, PdnConnectRequest, PdnConnectResponse,
+    PdnConnectTailDecodeError, PdnConnectTailField, PdnConnectionControl, PdnInfoContainers,
+    PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse, Positioning,
+    QosField, ResultResponse, ResultResponseKind,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -34,7 +35,10 @@ pub enum HandleError {
     UnexpectedParameters { command: u16, actual: usize },
     UnknownDevice { requested: u32, expected: u32 },
     LegacyAttach(LegacyAttachDecodeError),
+    LegacyPdnConnect(LegacyPdnConnectDecodeError),
     AttachCallback(AttachCallbackError),
+    PdnConnectCallback(PdnConnectCallbackError),
+    TransactionIdsExhausted,
     PlmnList(PlmnInfoDecodeError),
     Send(SendCommandError),
     Tracked(SendTrackedCommandError),
@@ -59,7 +63,14 @@ impl std::fmt::Display for HandleError {
                 "lted SDK request addressed device {requested}, expected {expected}"
             ),
             Self::LegacyAttach(error) => write!(f, "invalid stock attach request: {error:?}"),
+            Self::LegacyPdnConnect(error) => {
+                write!(f, "invalid stock PDN-connect request: {error:?}")
+            }
             Self::AttachCallback(error) => write!(f, "invalid attach callback payload: {error:?}"),
+            Self::PdnConnectCallback(error) => {
+                write!(f, "invalid PDN-connect callback payload: {error:?}")
+            }
+            Self::TransactionIdsExhausted => write!(f, "no free OEM transaction ID in 1..=253"),
             Self::PlmnList(error) => write!(f, "invalid PLMN-list response: {error:?}"),
             Self::Send(error) => write!(f, "modem send failed: {error:?}"),
             Self::Tracked(error) => write!(f, "tracked modem send failed: {error:?}"),
@@ -75,7 +86,10 @@ impl std::error::Error for HandleError {
             | Self::UnexpectedParameters { .. }
             | Self::UnknownDevice { .. }
             | Self::LegacyAttach(_)
+            | Self::LegacyPdnConnect(_)
             | Self::AttachCallback(_)
+            | Self::PdnConnectCallback(_)
+            | Self::TransactionIdsExhausted
             | Self::PlmnList(_)
             | Self::Send(_)
             | Self::Tracked(_) => None,
@@ -102,6 +116,7 @@ impl From<SendTrackedCommandError> for HandleError {
 }
 
 pub const LEGACY_ATTACH_PARAMS_LEN: usize = 0x160;
+pub const LEGACY_PDN_CONNECT_PARAMS_LEN: usize = 0x1a4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LegacyAttachStringField {
@@ -123,6 +138,30 @@ fn legacy_c_string(
 ) -> Result<&[u8], LegacyAttachDecodeError> {
     let Some(end) = bytes.iter().position(|&byte| byte == 0) else {
         return Err(LegacyAttachDecodeError::MissingTerminator(field));
+    };
+    Ok(&bytes[..end])
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyPdnConnectStringField {
+    Apn,
+    Username,
+    Password,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyPdnConnectDecodeError {
+    UnexpectedLength { expected: usize, actual: usize },
+    MissingTerminator(LegacyPdnConnectStringField),
+    OperatorPcoTooLong { maximum: usize, actual: usize },
+}
+
+fn legacy_pdn_c_string(
+    bytes: &[u8],
+    field: LegacyPdnConnectStringField,
+) -> Result<&[u8], LegacyPdnConnectDecodeError> {
+    let Some(end) = bytes.iter().position(|&byte| byte == 0) else {
+        return Err(LegacyPdnConnectDecodeError::MissingTerminator(field));
     };
     Ok(&bytes[..end])
 }
@@ -238,6 +277,93 @@ pub fn decode_legacy_attach(params: &[u8]) -> Result<AttachRequest<'_>, LegacyAt
     })
 }
 
+/// Decode the exact 420-byte stock `_PDN_CONNECTIVITY_REQ_PARAM`.
+///
+/// Live P4 `LAPI_PDNConnRequest` does not trust the structure's historical
+/// `transaction_id@0x1a3`: it allocates the first free transaction ID from
+/// `1..=253` with `tid_list_add()` and writes that value back into its local
+/// structure before encoding. The caller therefore supplies the already
+/// allocated ID explicitly here.
+///
+/// `apn_name` is always consumed, even when `optional_info == 0`; username,
+/// password, PCO and connection-control fields are dead in that minimal shape
+/// and are deliberately not validated.
+///
+/// # Errors
+/// Returns [`LegacyPdnConnectDecodeError`] for a wrong structure size,
+/// unterminated consumed C string, or operator PCO length beyond its 100-byte
+/// recovered destination.
+pub fn decode_legacy_pdn_connect(
+    params: &[u8],
+    transaction_id: u8,
+) -> Result<PdnConnectRequest<'_>, LegacyPdnConnectDecodeError> {
+    if params.len() != LEGACY_PDN_CONNECT_PARAMS_LEN {
+        return Err(LegacyPdnConnectDecodeError::UnexpectedLength {
+            expected: LEGACY_PDN_CONNECT_PARAMS_LEN,
+            actual: params.len(),
+        });
+    }
+
+    let optional_info = params[0x001];
+    let apn = legacy_pdn_c_string(&params[0x002..0x066], LegacyPdnConnectStringField::Apn)?;
+
+    let mut request = PdnConnectRequest {
+        request_type: params[0x000],
+        optional_info,
+        transaction_id,
+        apn,
+        pdn_type: 0,
+        ip_alloc: 0,
+        username: &[],
+        password: &[],
+        auth_flag: 0,
+        general_pco: None,
+        operator_pco: None,
+        req_apn_type: legacy_apn_type(params[0x19a]),
+        nas_sig_low_priority_ind: 0,
+        pdn_control: PdnConnectionControl {
+            max_conn: 0,
+            max_conn_t: 0,
+            wait_time: 0,
+        },
+        secure_pco: 0,
+    };
+
+    if optional_info == 0 {
+        return Ok(request);
+    }
+
+    request.pdn_type = params[0x066];
+    request.ip_alloc = params[0x067];
+    request.username =
+        legacy_pdn_c_string(&params[0x068..0x0cc], LegacyPdnConnectStringField::Username)?;
+    request.password =
+        legacy_pdn_c_string(&params[0x0cc..0x130], LegacyPdnConnectStringField::Password)?;
+    request.auth_flag = params[0x130];
+    request.general_pco =
+        (params[0x131] != 0).then(|| u16::from_be_bytes([params[0x132], params[0x133]]));
+    request.operator_pco = if params[0x134] == 0 {
+        None
+    } else {
+        let len = usize::from(params[0x135]);
+        if len > 100 {
+            return Err(LegacyPdnConnectDecodeError::OperatorPcoTooLong {
+                maximum: 100,
+                actual: len,
+            });
+        }
+        Some(&params[0x136..0x136 + len])
+    };
+    request.nas_sig_low_priority_ind = params[0x19b];
+    request.pdn_control = PdnConnectionControl {
+        max_conn: u16::from_be_bytes([params[0x19c], params[0x19d]]),
+        max_conn_t: u16::from_be_bytes([params[0x19e], params[0x19f]]),
+        wait_time: u16::from_be_bytes([params[0x1a0], params[0x1a1]]),
+    };
+    request.secure_pco = params[0x1a2];
+    Ok(request)
+}
+
 const STOCK_ATTACH_CALLBACK_DATA_LEN: usize = 0x88b;
 const STOCK_ATTACH_CALLBACK_FRAME_LEN: usize = 12 + STOCK_ATTACH_CALLBACK_DATA_LEN;
 const ATTACH_PDN_OFFSET: usize = 0x04b;
@@ -251,15 +377,73 @@ pub enum AttachCallbackError {
     Emergency(EmergencyNumberDecodeError),
 }
 
-fn materialize_attach_pdn(
-    response: AttachResponse<'_>,
-    data: &mut [u8; STOCK_ATTACH_CALLBACK_DATA_LEN],
-) -> Result<(), AttachCallbackError> {
-    let mut containers = response.pdn_info_containers();
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PdnInfoMaterializeError {
+    ContainerTlv,
+    InnerTlv,
+    Field(PdnInfoFieldLengthError),
+}
+
+fn materialize_pdn_info_field(data: &mut [u8], base: usize, field: PdnInfoField<'_>) -> bool {
+    match field {
+        PdnInfoField::AccessPointName(value) => {
+            data[base..base + value.len()].copy_from_slice(value);
+        }
+        PdnInfoField::PdnType(value) => data[base + 0x080] = value,
+        PdnInfoField::PdnTypeCause(value) => {
+            data[base + 0x081..base + 0x085].copy_from_slice(&value.to_be_bytes());
+        }
+        PdnInfoField::Ipv4Address(value) => {
+            data[base + 0x085..base + 0x089].copy_from_slice(&value);
+        }
+        PdnInfoField::Ipv4DnsPrimary(value) => {
+            data[base + 0x089..base + 0x08d].copy_from_slice(&value);
+        }
+        PdnInfoField::Ipv4DnsSecondary(value) => {
+            data[base + 0x08d..base + 0x091].copy_from_slice(&value);
+        }
+        PdnInfoField::Ipv6DnsPrimary(value) => {
+            data[base + 0x091..base + 0x0a1].copy_from_slice(&value);
+        }
+        PdnInfoField::Ipv6DnsSecondary(value) => {
+            data[base + 0x0a1..base + 0x0b1].copy_from_slice(&value);
+        }
+        PdnInfoField::Ipv6InterfaceId(value) => {
+            data[base + 0x0b1..base + 0x0b9].copy_from_slice(&value);
+        }
+        PdnInfoField::PcscfIpv6 { index, address } => {
+            let offset = base + 0x0b9 + usize::from(index - 1) * 16;
+            data[offset..offset + 16].copy_from_slice(&address);
+        }
+        PdnInfoField::PcscfIpv4 { index, address } => {
+            let offset = base + 0x109 + usize::from(index - 1) * 4;
+            data[offset..offset + 4].copy_from_slice(&address);
+        }
+        PdnInfoField::Qos { field, value } => {
+            let word = match field {
+                QosField::Qci => 0,
+                QosField::MaxBitRateUl => 1,
+                QosField::MaxBitRateDl => 2,
+                QosField::GuaranteedBitRateUl => 3,
+                QosField::GuaranteedBitRateDl => 4,
+            };
+            let offset = base + 0x216 + word * 4;
+            data[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+        }
+        PdnInfoField::Unknown(_) => return false,
+    }
+    true
+}
+
+fn materialize_pdn_containers(
+    mut containers: PdnInfoContainers<'_>,
+    data: &mut [u8],
+    base: usize,
+) -> Result<(), PdnInfoMaterializeError> {
     let mut stop_after_unknown = false;
     while let Some(container) = containers
         .next_container()
-        .map_err(|_| AttachCallbackError::PdnContainerTlv)?
+        .map_err(|_| PdnInfoMaterializeError::ContainerTlv)?
     {
         if stop_after_unknown {
             break;
@@ -267,61 +451,29 @@ fn materialize_attach_pdn(
         let mut fields = container.fields();
         while let Some(tlv) = fields
             .next_tlv()
-            .map_err(|_| AttachCallbackError::PdnInnerTlv)?
+            .map_err(|_| PdnInfoMaterializeError::InnerTlv)?
         {
-            match PdnInfoField::parse(tlv).map_err(AttachCallbackError::PdnField)? {
-                PdnInfoField::AccessPointName(value) => {
-                    data[ATTACH_PDN_OFFSET..ATTACH_PDN_OFFSET + value.len()].copy_from_slice(value);
-                }
-                PdnInfoField::PdnType(value) => data[ATTACH_PDN_OFFSET + 0x080] = value,
-                PdnInfoField::PdnTypeCause(value) => data
-                    [ATTACH_PDN_OFFSET + 0x081..ATTACH_PDN_OFFSET + 0x085]
-                    .copy_from_slice(&value.to_be_bytes()),
-                PdnInfoField::Ipv4Address(value) => data
-                    [ATTACH_PDN_OFFSET + 0x085..ATTACH_PDN_OFFSET + 0x089]
-                    .copy_from_slice(&value),
-                PdnInfoField::Ipv4DnsPrimary(value) => data
-                    [ATTACH_PDN_OFFSET + 0x089..ATTACH_PDN_OFFSET + 0x08d]
-                    .copy_from_slice(&value),
-                PdnInfoField::Ipv4DnsSecondary(value) => data
-                    [ATTACH_PDN_OFFSET + 0x08d..ATTACH_PDN_OFFSET + 0x091]
-                    .copy_from_slice(&value),
-                PdnInfoField::Ipv6DnsPrimary(value) => data
-                    [ATTACH_PDN_OFFSET + 0x091..ATTACH_PDN_OFFSET + 0x0a1]
-                    .copy_from_slice(&value),
-                PdnInfoField::Ipv6DnsSecondary(value) => data
-                    [ATTACH_PDN_OFFSET + 0x0a1..ATTACH_PDN_OFFSET + 0x0b1]
-                    .copy_from_slice(&value),
-                PdnInfoField::Ipv6InterfaceId(value) => data
-                    [ATTACH_PDN_OFFSET + 0x0b1..ATTACH_PDN_OFFSET + 0x0b9]
-                    .copy_from_slice(&value),
-                PdnInfoField::PcscfIpv6 { index, address } => {
-                    let offset = ATTACH_PDN_OFFSET + 0x0b9 + usize::from(index - 1) * 16;
-                    data[offset..offset + 16].copy_from_slice(&address);
-                }
-                PdnInfoField::PcscfIpv4 { index, address } => {
-                    let offset = ATTACH_PDN_OFFSET + 0x109 + usize::from(index - 1) * 4;
-                    data[offset..offset + 4].copy_from_slice(&address);
-                }
-                PdnInfoField::Qos { field, value } => {
-                    let word = match field {
-                        QosField::Qci => 0,
-                        QosField::MaxBitRateUl => 1,
-                        QosField::MaxBitRateDl => 2,
-                        QosField::GuaranteedBitRateUl => 3,
-                        QosField::GuaranteedBitRateDl => 4,
-                    };
-                    let offset = ATTACH_PDN_OFFSET + 0x216 + word * 4;
-                    data[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
-                }
-                PdnInfoField::Unknown(_) => {
-                    stop_after_unknown = true;
-                    break;
-                }
+            let field = PdnInfoField::parse(tlv).map_err(PdnInfoMaterializeError::Field)?;
+            if !materialize_pdn_info_field(data, base, field) {
+                stop_after_unknown = true;
+                break;
             }
         }
     }
     Ok(())
+}
+
+fn materialize_attach_pdn(
+    response: AttachResponse<'_>,
+    data: &mut [u8; STOCK_ATTACH_CALLBACK_DATA_LEN],
+) -> Result<(), AttachCallbackError> {
+    materialize_pdn_containers(response.pdn_info_containers(), data, ATTACH_PDN_OFFSET).map_err(
+        |error| match error {
+            PdnInfoMaterializeError::ContainerTlv => AttachCallbackError::PdnContainerTlv,
+            PdnInfoMaterializeError::InnerTlv => AttachCallbackError::PdnInnerTlv,
+            PdnInfoMaterializeError::Field(error) => AttachCallbackError::PdnField(error),
+        },
+    )
 }
 
 fn materialize_attach_callback(
@@ -424,6 +576,131 @@ pub fn broadcast_attach_callback(
         HandleError::Ipc(io::Error::new(
             io::ErrorKind::InvalidData,
             "fixed-size Attach callback failed to encode",
+        ))
+    })?;
+
+    let mut report = BroadcastReport::default();
+    for client_id in server.client_ids() {
+        let registered = server
+            .client_context(client_id)?
+            .read_u32_be(callback_kind.registration_offset())?
+            != 0;
+        if !registered {
+            continue;
+        }
+        report.registered_clients += 1;
+        server.send_to_client(client_id, &frame[..frame_len])?;
+        report.sent_clients += 1;
+    }
+    Ok(report)
+}
+
+const STOCK_PDN_CONNECT_CALLBACK_DATA_LEN: usize = 0x2e6;
+const STOCK_PDN_CONNECT_CALLBACK_FRAME_LEN: usize = 12 + STOCK_PDN_CONNECT_CALLBACK_DATA_LEN;
+const PDN_CONNECT_PDN_OFFSET: usize = 0x04c;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdnConnectCallbackError {
+    PdnContainerTlv,
+    PdnInnerTlv,
+    PdnField(PdnInfoFieldLengthError),
+    Tail(PdnConnectTailDecodeError),
+}
+
+fn map_pdn_connect_materialize_error(error: PdnInfoMaterializeError) -> PdnConnectCallbackError {
+    match error {
+        PdnInfoMaterializeError::ContainerTlv => PdnConnectCallbackError::PdnContainerTlv,
+        PdnInfoMaterializeError::InnerTlv => PdnConnectCallbackError::PdnInnerTlv,
+        PdnInfoMaterializeError::Field(error) => PdnConnectCallbackError::PdnField(error),
+    }
+}
+
+fn materialize_pdn_connect_callback(
+    response: PdnConnectResponse<'_>,
+    data: &mut [u8; STOCK_PDN_CONNECT_CALLBACK_DATA_LEN],
+) -> Result<(), PdnConnectCallbackError> {
+    data.fill(0);
+    data[0x000..0x002].copy_from_slice(&response.result.to_be_bytes());
+    data[0x002..0x004].copy_from_slice(&response.reject_cause1.to_be_bytes());
+    data[0x004..0x006].copy_from_slice(&response.reject_cause2.to_be_bytes());
+    data[0x006..0x008].copy_from_slice(&response.default_eps_id.to_be_bytes());
+    data[0x008] = response.data_path;
+    data[0x009] = response.ip_alloc;
+    data[0x00a] = response.transaction_id;
+    data[0x00b] = u8::try_from(response.apn_ni.payload.len()).unwrap_or(0);
+    data[0x00c..0x00c + response.apn_ni.payload.len()].copy_from_slice(response.apn_ni.payload);
+
+    materialize_pdn_containers(response.pdn_info_containers(), data, PDN_CONNECT_PDN_OFFSET)
+        .map_err(map_pdn_connect_materialize_error)?;
+
+    let mut tail = response.trailing_fields();
+    while let Some(field) = tail.next_field().map_err(PdnConnectCallbackError::Tail)? {
+        match field {
+            PdnConnectTailField::Ipv4LinkMtu(value) => {
+                data[0x276..0x278].copy_from_slice(&value.to_be_bytes());
+            }
+            PdnConnectTailField::OperatorPco(value) => {
+                if !value.is_empty() {
+                    data[0x278] = 1;
+                    data[0x279] = u8::try_from(value.len()).unwrap_or(0);
+                    data[0x27a..0x27a + value.len()].copy_from_slice(value);
+                }
+            }
+            PdnConnectTailField::PdnInfo(_) => {
+                let Some(mut fields) = field.pdn_info_fields() else {
+                    continue;
+                };
+                while let Some(tlv) = fields
+                    .next_tlv()
+                    .map_err(|_| PdnConnectCallbackError::PdnInnerTlv)?
+                {
+                    let parsed =
+                        PdnInfoField::parse(tlv).map_err(PdnConnectCallbackError::PdnField)?;
+                    if !materialize_pdn_info_field(data, PDN_CONNECT_PDN_OFFSET, parsed) {
+                        break;
+                    }
+                }
+            }
+            PdnConnectTailField::ApnAmbr { uplink, downlink } => {
+                data[0x2de..0x2e2].copy_from_slice(&uplink.to_be_bytes());
+                data[0x2e2..0x2e6].copy_from_slice(&downlink.to_be_bytes());
+            }
+            PdnConnectTailField::Unknown(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Materialize and broadcast stock callback 33 (`PDNConn`).
+///
+/// B014 DWARF gives an exact 742-byte `_PDN_CONNECTIVITY_RSP_INFO`. Live P4
+/// callback dispatch uses callback ID 33 / `cb_rsp[6]`. The modem's typed
+/// `0xb106` response is converted into that historical byte image before the
+/// standard local `0x8107` envelope is emitted.
+///
+/// # Errors
+/// Returns [`HandleError::PdnConnectCallback`] for malformed proven response
+/// fields or [`HandleError::Ipc`] for callback/shared-context/socket failures.
+pub fn broadcast_pdn_connect_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: PdnConnectResponse<'_>,
+) -> Result<BroadcastReport, HandleError> {
+    let mut data = [0_u8; STOCK_PDN_CONNECT_CALLBACK_DATA_LEN];
+    materialize_pdn_connect_callback(response, &mut data)
+        .map_err(HandleError::PdnConnectCallback)?;
+    let callback_kind = SdkCallbackKind::PdnConnect;
+    let mut frame = [0_u8; STOCK_PDN_CONNECT_CALLBACK_FRAME_LEN];
+    let frame_len = SdkCallback {
+        callback_id: callback_kind.callback_id(),
+        device_id,
+        data: &data,
+    }
+    .encode(&mut frame)
+    .map_err(|_| {
+        HandleError::Ipc(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fixed-size PDN-connect callback failed to encode",
         ))
     })?;
 
@@ -697,6 +974,7 @@ impl DeviceBridge {
                     }
                 }
                 Ok(SdkCommand::Attach) => self.dispatch_attach(modem, request),
+                Ok(SdkCommand::PdnConnect) => self.dispatch_pdn_connect(modem, request),
                 Ok(_) => self.dispatch_zero_parameter(modem, request),
                 Err(_) => Err(HandleError::UnsupportedCommand(request.command)),
             }
@@ -738,6 +1016,13 @@ impl DeviceBridge {
                 }
                 broadcast_attach_callback(server, self.device_id, *response).map(Some)
             }
+            ModemEvent::PdnConnect(response) => {
+                let key = ResponseKey::PdnConnect(response.transaction_id);
+                if !self.pending.remove(key) {
+                    return Ok(None);
+                }
+                broadcast_pdn_connect_callback(server, self.device_id, *response).map(Some)
+            }
             ModemEvent::Result { kind, response } => {
                 let key = ResponseKey::Result(*kind);
                 if !self.pending.remove(key) {
@@ -767,6 +1052,39 @@ impl DeviceBridge {
             }
             _ => Ok(None),
         }
+    }
+
+    fn allocate_transaction_id(&self) -> Result<u8, HandleError> {
+        for transaction_id in 1_u8..=253 {
+            let used = self.pending.contains(ResponseKey::Attach(transaction_id))
+                || self
+                    .pending
+                    .contains(ResponseKey::PdnConnect(transaction_id))
+                || self
+                    .pending
+                    .contains(ResponseKey::PdnDisconnect(transaction_id));
+            if !used {
+                return Ok(transaction_id);
+            }
+        }
+        Err(HandleError::TransactionIdsExhausted)
+    }
+
+    fn dispatch_pdn_connect<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let transaction_id = self.allocate_transaction_id()?;
+        let pdn = decode_legacy_pdn_connect(request.params, transaction_id)
+            .map_err(HandleError::LegacyPdnConnect)?;
+        let bytes_written =
+            modem.send_tracked_command(&mut self.pending, ModemCommand::PdnConnect(pdn))?;
+        Ok(HandledCall {
+            command: SdkCommand::PdnConnect,
+            device_id: request.device_id,
+            bytes_written,
+        })
     }
 
     fn dispatch_attach<T: Write>(
@@ -843,8 +1161,8 @@ mod tests {
 
     use super::{
         BroadcastReport, DeviceBridge, HandleError, LTE_API_RET_OFFSET, LegacyAttachDecodeError,
-        LegacyAttachStringField, PS_INIT_COMPLETE_OFFSET, StartupPhase, broadcast_result_callback,
-        decode_legacy_attach,
+        LegacyAttachStringField, LegacyPdnConnectDecodeError, LegacyPdnConnectStringField,
+        PS_INIT_COMPLETE_OFFSET, StartupPhase, broadcast_result_callback, decode_legacy_attach,
     };
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -1590,6 +1908,190 @@ mod tests {
         assert_eq!(data[0x875], 5);
         assert_eq!(&data[0x876..0x87b], b"12345");
         assert!(data[0x87b..].iter().all(|&byte| byte == 0));
+
+        unsubscribed
+            .set_nonblocking(true)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut no_frame = [0_u8; 1];
+        let Err(error) = unsubscribed.recv(&mut no_frame) else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn stock_pdn_connect_allocates_first_free_tid_and_matches_live_p4_hci() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        let mut params = [0_u8; 0x1a4];
+        params[0x000] = 0x11;
+        params[0x001] = 1;
+        params[0x002..0x005].copy_from_slice(b"ims");
+        params[0x066] = 2;
+        params[0x067] = 3;
+        params[0x068] = b'u';
+        params[0x0cc] = b'p';
+        params[0x130] = 4;
+        params[0x131] = 1;
+        params[0x132..0x134].copy_from_slice(&0x1234_u16.to_be_bytes());
+        params[0x134] = 1;
+        params[0x135] = 2;
+        params[0x136..0x138].copy_from_slice(&[0xaa, 0xbb]);
+        params[0x19a] = 1;
+        params[0x19b] = 5;
+        params[0x19c..0x19e].copy_from_slice(&10_u16.to_be_bytes());
+        params[0x19e..0x1a0].copy_from_slice(&20_u16.to_be_bytes());
+        params[0x1a0..0x1a2].copy_from_slice(&30_u16.to_be_bytes());
+        params[0x1a2] = 6;
+        params[0x1a3] = 0xfe;
+
+        let request = SdkApiRequest {
+            command: SdkCommand::PdnConnect as u16,
+            device_id: 1,
+            params: &params,
+        };
+        let first = bridge
+            .handle_sdk_api(&mut server, &mut modem, id, request)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(first.bytes_written, 54);
+        assert_eq!(bridge.pending_count(), 1);
+
+        let second = bridge
+            .handle_sdk_api(&mut server, &mut modem, id, request)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(second.bytes_written, 54);
+        assert_eq!(bridge.pending_count(), 2);
+
+        let mut expected = vec![
+            0x31, 0x05, 0x00, 0x32, 0x11, 0x01, 0x20, 0x01, 0x01, 0x04, 0x03, b'i', b'm', b's',
+            0x02, 0x01, b'u', 0x03, 0x01, b'p', 0x05, 0x01, 0x02, 0x1e, 0x01, 0x04, 0x01, 0x01,
+            0x03, 0x5c, 0x02, 0x12, 0x34, 0x5d, 0x02, 0xaa, 0xbb, 0xf6, 0x01, 0x05, 0x71, 0x06,
+            0x00, 0x0a, 0x00, 0x14, 0x00, 0x1e, 0xf7, 0x01, 0x06, 0x70, 0x01, 0x01,
+        ];
+        let mut expected_second = expected.clone();
+        expected_second[8] = 2;
+        expected.extend_from_slice(&expected_second);
+        assert_eq!(modem.into_transport().into_inner().into_inner(), expected);
+    }
+
+    #[test]
+    fn malformed_stock_pdn_connect_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let mut params = [0_u8; 0x1a4];
+        params[0x002..0x066].fill(0xff);
+
+        let request = SdkApiRequest {
+            command: SdkCommand::PdnConnect as u16,
+            device_id: 1,
+            params: &params,
+        };
+        assert!(matches!(
+            bridge.handle_sdk_api(&mut server, &mut modem, id, request),
+            Err(HandleError::LegacyPdnConnect(
+                LegacyPdnConnectDecodeError::MissingTerminator(LegacyPdnConnectStringField::Apn)
+            ))
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn pdn_connect_response_materializes_exact_stock_callback_and_subscription_gate() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, subscribed_id) = open_client(&mut server, &dir, 0);
+        let (unsubscribed, _unsubscribed_id) = open_client(&mut server, &dir, 1);
+        server
+            .client_context(subscribed_id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::PdnConnect.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        let mut params = [0_u8; 0x1a4];
+        params[0] = 1;
+        params[2..5].copy_from_slice(b"ims");
+        params[0x19a] = 1;
+        params[0x1a3] = 0xfe;
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                subscribed_id,
+                SdkApiRequest {
+                    command: SdkCommand::PdnConnect as u16,
+                    device_id: 0x1122_3344,
+                    params: &params,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.pending_count(), 1);
+
+        let payload = [
+            0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x12, 0x34, 0x09, 0x0a, 0x20, 0x01, 0x01, 0x99,
+            0x03, b'i', b'm', b's', 0xf0, 0x14, 0x04, 0x03, b'p', b'd', b'n', 0x05, 0x01, 0x02,
+            0x07, 0x04, 192, 168, 1, 2, 0x40, 0x04, 0x00, 0x00, 0x00, 0x09, 0x5b, 0x02, 0x05, 0xdc,
+            0x5d, 0x03, 0x11, 0x22, 0x33, 0xf0, 0x06, 0x08, 0x04, 1, 1, 1, 1, 0xf3, 0x08, 0x00,
+            0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0xc8,
+        ];
+        let mut hci = Vec::with_capacity(payload.len() + 4);
+        hci.extend_from_slice(&[0xb1, 0x06]);
+        hci.extend_from_slice(
+            &u16::try_from(payload.len())
+                .unwrap_or_else(|_| std::process::abort())
+                .to_be_bytes(),
+        );
+        hci.extend_from_slice(&payload);
+
+        assert_eq!(
+            route_one_hci(&mut bridge, &mut server, hci),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 800];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(len, 12 + 0x2e6);
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 33);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(callback.data.len(), 0x2e6);
+        let data = callback.data;
+        assert_eq!(&data[0x000..0x00a], &[0, 1, 0, 2, 0, 3, 0x12, 0x34, 9, 10]);
+        assert_eq!(data[0x00a], 1);
+        assert_eq!(data[0x00b], 3);
+        assert_eq!(&data[0x00c..0x00f], b"ims");
+        assert_eq!(&data[0x04c..0x04f], b"pdn");
+        assert_eq!(data[0x0cc], 2);
+        assert_eq!(&data[0x0d1..0x0d5], &[192, 168, 1, 2]);
+        assert_eq!(&data[0x0d5..0x0d9], &[1, 1, 1, 1]);
+        assert_eq!(&data[0x262..0x266], &9_u32.to_be_bytes());
+        assert_eq!(&data[0x276..0x278], &1500_u16.to_be_bytes());
+        assert_eq!(&data[0x278..0x27d], &[1, 3, 0x11, 0x22, 0x33]);
+        assert_eq!(&data[0x2de..0x2e2], &100_u32.to_be_bytes());
+        assert_eq!(&data[0x2e2..0x2e6], &200_u32.to_be_bytes());
 
         unsubscribed
             .set_nonblocking(true)

@@ -1096,6 +1096,21 @@ pub enum PdnConnectTailField<'a> {
     Unknown(Tlv<'a>),
 }
 
+impl<'a> PdnConnectTailField<'a> {
+    /// Return the inner TLV cursor for the descriptor-managed extra PDN-info
+    /// field. Other tail variants have no nested PDN payload.
+    #[must_use]
+    pub fn pdn_info_fields(self) -> Option<TlvCursor<'a>> {
+        match self {
+            Self::PdnInfo(bytes) => Some(TlvCursor::new(bytes)),
+            Self::Ipv4LinkMtu(_)
+            | Self::OperatorPco(_)
+            | Self::ApnAmbr { .. }
+            | Self::Unknown(_) => None,
+        }
+    }
+}
+
 /// Malformed field in the descriptor-driven normal-PDN suffix.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PdnConnectTailDecodeError {
