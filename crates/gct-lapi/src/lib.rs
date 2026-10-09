@@ -2027,6 +2027,51 @@ impl MobileIdReadRequest {
     }
 }
 
+/// MSISDN read request carried by the shared `0x3145` read-info command.
+///
+/// Live P4 `LAPI_MSISDNReadRequest` emits subtype 3 with an empty subtype body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MsisdnReadRequest;
+
+impl MsisdnReadRequest {
+    /// Encode exact live-P4 bytes `31 45 00 04 00 03 00 00`.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than eight
+    /// bytes.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        encode_packet(
+            recovered_opcode::MISC_READ_REQUEST,
+            &[0x00, 0x03, 0x00, 0x00],
+            output,
+        )
+    }
+}
+
+pub const MSISDN_RECORD_LEN: usize = 256;
+pub const MAX_MSISDN_RECORDS: usize = 3;
+
+/// Successful or subtype-local-failure MSISDN response recovered from shared
+/// response `0xb146` subtype 3.
+///
+/// `records` contains exactly `num_msisdn * 256` stock record bytes. B014 DWARF
+/// proves each record is `{alpha_id_len, alpha_id[241], bcdssc_len, ton_npi,
+/// dial_num_ssc[10], cap_cfg2, ext5}`; the raw fixed record is intentionally
+/// preserved because the live daemon forwards it byte-for-byte.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MsisdnReadResponse<'a> {
+    pub read_result: u16,
+    pub result: u8,
+    pub records: &'a [u8],
+}
+
+impl MsisdnReadResponse<'_> {
+    #[must_use]
+    pub const fn num_msisdn(self) -> usize {
+        self.records.len() / MSISDN_RECORD_LEN
+    }
+}
+
 /// One successful Mobile-ID chunk recovered from shared response `0xb146`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MobileIdReadResponse<'a> {
@@ -2046,6 +2091,7 @@ pub enum MiscReadResponse<'a> {
         read_result: u16,
     },
     MobileId(MobileIdReadResponse<'a>),
+    Msisdn(MsisdnReadResponse<'a>),
     /// Successful response containing only not-yet-modeled read subtypes.
     UnsupportedSuccess,
 }
@@ -2072,6 +2118,18 @@ pub enum MiscReadDecodeError {
         declared: usize,
         available: usize,
     },
+    MsisdnBodyTooShort {
+        minimum: usize,
+        actual: usize,
+    },
+    TooManyMsisdnRecords {
+        maximum: usize,
+        actual: usize,
+    },
+    TruncatedMsisdnRecords {
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl From<ResponseDecodeError> for MiscReadDecodeError {
@@ -2081,11 +2139,12 @@ impl From<ResponseDecodeError> for MiscReadDecodeError {
 }
 
 impl<'a> MiscReadResponse<'a> {
-    /// Decode the live-P4 shared read response and extract Mobile-ID subtype 1.
+    /// Decode the live-P4 shared read response and extract proven subtypes.
     ///
     /// Wire grammar on success is `read_result:u16 == 0`, followed by zero or
     /// more chunks `subtype:u16 | len:u16 | body[len]`. Mobile ID is subtype 1
-    /// with body `id_type:u8 | result:u8 | len:u8 | id...`. The SDK's
+    /// and MSISDN is subtype 3. Mobile ID body is
+    /// `id_type:u8 | result:u8 | len:u8 | id...`. The SDK's
     /// historical object has a 16-byte ID array; overlong or truncated bodies
     /// are rejected before they can become stock callbacks.
     ///
@@ -2142,6 +2201,48 @@ impl<'a> MiscReadResponse<'a> {
                     id_type: body[0],
                     result: body[1],
                     id: &body[3..3 + id_len],
+                }));
+            }
+            if subtype == 3 {
+                if body.is_empty() {
+                    return Err(MiscReadDecodeError::MsisdnBodyTooShort {
+                        minimum: 1,
+                        actual: 0,
+                    });
+                }
+                let result = body[0];
+                if result != 0 {
+                    return Ok(Self::Msisdn(MsisdnReadResponse {
+                        read_result,
+                        result,
+                        records: &[],
+                    }));
+                }
+                if body.len() < 2 {
+                    return Err(MiscReadDecodeError::MsisdnBodyTooShort {
+                        minimum: 2,
+                        actual: body.len(),
+                    });
+                }
+                let num_msisdn = usize::from(body[1]);
+                if num_msisdn > MAX_MSISDN_RECORDS {
+                    return Err(MiscReadDecodeError::TooManyMsisdnRecords {
+                        maximum: MAX_MSISDN_RECORDS,
+                        actual: num_msisdn,
+                    });
+                }
+                let records_len = num_msisdn * MSISDN_RECORD_LEN;
+                let expected = 2 + records_len;
+                if body.len() < expected {
+                    return Err(MiscReadDecodeError::TruncatedMsisdnRecords {
+                        expected: records_len,
+                        actual: body.len().saturating_sub(2),
+                    });
+                }
+                return Ok(Self::Msisdn(MsisdnReadResponse {
+                    read_result,
+                    result,
+                    records: &body[2..expected],
                 }));
             }
             offset = body_start + declared;
@@ -5460,6 +5561,82 @@ mod tests {
                 subtype: 1,
                 declared: 5,
                 actual: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn msisdn_read_matches_shared_live_p4_request_and_bounded_records() {
+        let mut request = [0_u8; 8];
+        assert_eq!(super::MsisdnReadRequest.encode(&mut request), Ok(8));
+        assert_eq!(request, [0x31, 0x45, 0, 4, 0, 3, 0, 0]);
+
+        let mut record = [0_u8; super::MSISDN_RECORD_LEN];
+        record[0] = 3;
+        record[1..4].copy_from_slice(b"Jan");
+        record[0xf2] = 4;
+        record[0xf3] = 0x91;
+        record[0xf4..0xf8].copy_from_slice(&[0x21, 0x43, 0x65, 0xf7]);
+        record[0xfe] = 8;
+        record[0xff] = 9;
+        let mut payload = [0_u8; 264];
+        payload[..8].copy_from_slice(&[0, 0, 0, 3, 0x01, 0x02, 0, 1]);
+        payload[8..].copy_from_slice(&record);
+        let parsed = super::MiscReadResponse::parse(packet(
+            super::recovered_opcode::MISC_READ_RESPONSE,
+            &payload,
+        ));
+        assert_eq!(
+            parsed,
+            Ok(super::MiscReadResponse::Msisdn(super::MsisdnReadResponse {
+                read_result: 0,
+                result: 0,
+                records: &record,
+            }))
+        );
+        if let Ok(super::MiscReadResponse::Msisdn(response)) = parsed {
+            assert_eq!(response.num_msisdn(), 1);
+        }
+
+        let local_failure = [0, 0, 0, 3, 0, 1, 7];
+        assert_eq!(
+            super::MiscReadResponse::parse(packet(
+                super::recovered_opcode::MISC_READ_RESPONSE,
+                &local_failure,
+            )),
+            Ok(super::MiscReadResponse::Msisdn(super::MsisdnReadResponse {
+                read_result: 0,
+                result: 7,
+                records: &[],
+            }))
+        );
+    }
+
+    #[test]
+    fn msisdn_read_rejects_record_count_overflow_and_truncation() {
+        let too_many = [0, 0, 0, 3, 0, 2, 0, 4];
+        assert_eq!(
+            super::MiscReadResponse::parse(packet(
+                super::recovered_opcode::MISC_READ_RESPONSE,
+                &too_many,
+            )),
+            Err(super::MiscReadDecodeError::TooManyMsisdnRecords {
+                maximum: 3,
+                actual: 4,
+            })
+        );
+
+        let mut truncated = [0_u8; 18];
+        truncated[..8].copy_from_slice(&[0, 0, 0, 3, 0, 12, 0, 1]);
+        truncated[8..].fill(0xaa);
+        assert_eq!(
+            super::MiscReadResponse::parse(packet(
+                super::recovered_opcode::MISC_READ_RESPONSE,
+                &truncated,
+            )),
+            Err(super::MiscReadDecodeError::TruncatedMsisdnRecords {
+                expected: 256,
+                actual: 10,
             })
         );
     }

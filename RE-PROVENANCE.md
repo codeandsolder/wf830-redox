@@ -1278,3 +1278,111 @@ to read the discriminator for unsupported families; only discriminator 11 must
 satisfy the exact NI-reattach body grammar. Tests prove command 213, the exact
 11-byte HCI frame, malformed local-length rejection before GLIF I/O, zero
 pending state, and discriminator-13 drop behavior with a non-NI body shape.
+
+## Live P4 MSISDN Read
+
+A fresh live-rootfs import inventory found one shipped importer of
+`LTED_MSISDNReadRequest` (`bin/gdmmon`). Although small in client count, this is
+a direct stock-client compatibility hole with a fully recoverable shared-read
+wire grammar.
+
+Live P4 `liblted.so::LTED_MSISDNReadRequest` at `0xd238` emits SDK command
+**80** with **zero local parameter bytes**. Live
+`libltesdk.so::LAPI_MSISDNReadRequest` at `0x4b014` then emits shared read-info
+HCI opcode **`0x3145`** with exact four-byte payload `00 03 00 00`: subtype 3,
+empty subtype request body. The response remains on the already-proven shared
+read-info opcode **`0xb146`**.
+
+The live shared response dispatcher selects subtype 3 handler `0x16568`. That
+handler obtains SDK response slot **28**, zeroes an exact **772-byte** historical
+response object, stores converted `read_result:u16@0`, copies subtype-local
+`result:u8@2`, and on `result == 0` copies `num_msisdn:u8@3` plus exactly
+`num_msisdn << 8` bytes from the modem body into the record area at offset 4.
+A subtype-local nonzero result leaves the zero-filled count at zero and copies
+no records. Top-level nonzero shared `read_result` still exits before subtype
+dispatch, matching the existing `MiscReadFailure` behavior with no subtype
+callback.
+
+B014 DWARF independently proves the historical object bounds and record layout:
+`_MSISDN_READ_RSP_INFO` is **0x304 / 772 bytes** with `read_result:u16@0`,
+`result:u8@2`, `num_msisdn:u8@3`, and three `MSISDN_STR` records from offset 4.
+Each `MSISDN_STR` is exactly **0x100 / 256 bytes**:
+`alpha_id_len:u8@0`, `alpha_id[241]@1`, `bcdssc_len:u8@0xf2`,
+`ton_npi:u8@0xf3`, `dial_num_ssc[10]@0xf4`, `cap_cfg2:u8@0xfe`, and
+`ext5:u8@0xff`. Rust therefore caps the modem-provided count at three, rejects
+truncated fixed records, and otherwise preserves each 256-byte record exactly
+rather than normalizing its internal fields.
+
+Live daemon `ind_msisdn_read_response@0x288d4` sends stock callback **81** with
+an assembled variable payload. Its final iovec length is exactly
+`4 + (num_msisdn << 8)`, so the daemon callback data is
+`read_result:u16 | result:u8 | num_msisdn:u8 | MSISDN_STR[num_msisdn]` rather
+than the full 772-byte backing object. `ind_regist` registers SDK slot 28 to
+this exact handler: the literal at `0x39b44` is `0xfffef2e4`, which resolves
+from the ARM PC at the registration site to `0x288d4`. Live stock
+`liblted.so::lted_sdk_recv_cb_handler` case at `0x6490` reads the registered
+callback pointer at **offset `0xe4`**, i.e. `cb_rsp[28]`.
+
+The Rust implementation uses the shared family-level `ResponseKey::MiscRead`
+for both Mobile ID and MSISDN, deliberately preventing concurrent requests
+whose top-level shared failure cannot identify a subtype. Tests cover exact
+command-80 local/HCI bytes, collision with Mobile ID, callback 81 and slot
+`0xe4`, one exact 256-byte record, subtype-local failure producing only the
+four-byte callback prefix, subscription gating, local input rejection before
+GLIF, count > 3 rejection, and truncated-record rejection. The callback
+builder also independently rejects raw record blocks that are not an exact
+multiple of 256 bytes or exceed the three proven slots.
+
+## Live P4 MSISDN Read
+
+A fresh live-rootfs import inventory found one shipped importer of
+`LTED_MSISDNReadRequest` (`bin/gdmmon`). Although small in client count, this is
+a direct stock-client compatibility hole with a fully recoverable shared-read
+wire grammar.
+
+Live P4 `liblted.so::LTED_MSISDNReadRequest` at `0xd238` emits SDK command
+**80** with **zero local parameter bytes**. Live
+`libltesdk.so::LAPI_MSISDNReadRequest` at `0x4b014` then emits shared read-info
+HCI opcode **`0x3145`** with exact four-byte payload `00 03 00 00`: subtype 3,
+empty subtype request body. The response remains on the already-proven shared
+read-info opcode **`0xb146`**.
+
+The live shared response dispatcher selects subtype 3 handler `0x16568`. That
+handler obtains SDK response slot **28**, zeroes an exact **772-byte** historical
+response object, stores converted `read_result:u16@0`, copies subtype-local
+`result:u8@2`, and on `result == 0` copies `num_msisdn:u8@3` plus exactly
+`num_msisdn << 8` bytes from the modem body into the record area at offset 4.
+A subtype-local nonzero result leaves the zero-filled count at zero and copies
+no records. Top-level nonzero shared `read_result` still exits before subtype
+dispatch, matching the existing `MiscReadFailure` behavior with no subtype
+callback.
+
+B014 DWARF independently proves the historical object bounds and record layout:
+`_MSISDN_READ_RSP_INFO` is **0x304 / 772 bytes** with `read_result:u16@0`,
+`result:u8@2`, `num_msisdn:u8@3`, and three `MSISDN_STR` records from offset 4.
+Each `MSISDN_STR` is exactly **0x100 / 256 bytes**:
+`alpha_id_len:u8@0`, `alpha_id[241]@1`, `bcdssc_len:u8@0xf2`,
+`ton_npi:u8@0xf3`, `dial_num_ssc[10]@0xf4`, `cap_cfg2:u8@0xfe`, and
+`ext5:u8@0xff`. Rust therefore caps the modem-provided count at three, rejects
+truncated fixed records, and otherwise preserves each 256-byte record exactly
+rather than normalizing its internal fields.
+
+Live daemon `ind_msisdn_read_response@0x288d4` sends stock callback **81** with
+an assembled variable payload. Its final iovec length is exactly
+`4 + (num_msisdn << 8)`, so the daemon callback data is
+`read_result:u16 | result:u8 | num_msisdn:u8 | MSISDN_STR[num_msisdn]` rather
+than the full 772-byte backing object. `ind_regist` registers SDK slot 28 to
+this exact handler: the literal at `0x39b44` is `0xfffef2e4`, which resolves
+from the ARM PC at the registration site to `0x288d4`. Live stock
+`liblted.so::lted_sdk_recv_cb_handler` case at `0x6490` reads the registered
+callback pointer at **offset `0xe4`**, i.e. `cb_rsp[28]`.
+
+The Rust implementation uses the shared family-level `ResponseKey::MiscRead`
+for both Mobile ID and MSISDN, deliberately preventing concurrent requests
+whose top-level shared failure cannot identify a subtype. Tests cover exact
+command-80 local/HCI bytes, collision with Mobile ID, callback 81 and slot
+`0xe4`, one exact 256-byte record, subtype-local failure producing only the
+four-byte callback prefix, subscription gating, local input rejection before
+GLIF, count > 3 rejection, and truncated-record rejection. The callback
+builder also independently rejects raw record blocks that are not an exact
+multiple of 256 bytes or exceed the three proven slots.

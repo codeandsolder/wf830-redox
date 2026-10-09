@@ -14,15 +14,15 @@ use gct_lapi::{
     DetachRequiredIndication, DetachResponse, EmergencyNumberDecodeError,
     EmmNiReattachControlRequest, EmmReattachControlReport, EmmTimerControlRequest,
     EmmTimerStartRequest, EmptyRequest, LcsControlRequest, LppControlRequest, MobileIdReadRequest,
-    MobileIdReadResponse, PcoInfo, PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest,
-    PdnConnectResponse, PdnConnectTailDecodeError, PdnConnectTailField, PdnConnectionControl,
-    PdnDisconnectField, PdnDisconnectFieldDecodeError, PdnDisconnectRequest, PdnDisconnectResponse,
-    PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError,
-    PlmnListResponse, PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchResponse,
-    PlmnSearchStopRequest, PlmnSearchStopResponse, Positioning, PsmControlRequest, QosField,
-    ResultResponse, ResultResponseKind, UeModeChangeRequest, UeModeChangeResponse,
-    UiccFixedRequest, UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest,
-    UiccResponse, UiccStatusRequest, uicc_control,
+    MobileIdReadResponse, MsisdnReadRequest, MsisdnReadResponse, PcoInfo, PdnConnectExtRequest,
+    PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse, PdnConnectTailDecodeError,
+    PdnConnectTailField, PdnConnectionControl, PdnDisconnectField, PdnDisconnectFieldDecodeError,
+    PdnDisconnectRequest, PdnDisconnectResponse, PdnInfoContainers, PdnInfoField,
+    PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse, PlmnSearchExtRequest,
+    PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
+    Positioning, PsmControlRequest, QosField, ResultResponse, ResultResponseKind,
+    UeModeChangeRequest, UeModeChangeResponse, UiccFixedRequest, UiccPinStatusRequest,
+    UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse, UiccStatusRequest, uicc_control,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -1682,6 +1682,44 @@ pub fn broadcast_mobile_id_callback(
     broadcast_variable_callback(server, device_id, SdkCallbackKind::MobileIdRead, &data)
 }
 
+/// Broadcast stock callback 81 (`MSISDN_READ_RSP`) through `cb_rsp[28]`.
+///
+/// Live P4 `lted` sends `read_result:u16 | result:u8 | num_msisdn:u8`
+/// followed by exactly `num_msisdn * 256` fixed record bytes.
+///
+/// # Errors
+/// Returns [`HandleError::Ipc`] for an unrepresentable callback length or IPC
+/// failure.
+pub fn broadcast_msisdn_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: MsisdnReadResponse<'_>,
+) -> Result<BroadcastReport, HandleError> {
+    if !response
+        .records
+        .len()
+        .is_multiple_of(gct_lapi::MSISDN_RECORD_LEN)
+        || response.records.len() > gct_lapi::MAX_MSISDN_RECORDS * gct_lapi::MSISDN_RECORD_LEN
+    {
+        return Err(HandleError::Ipc(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MSISDN callback record block violates the recovered 3 x 256-byte layout",
+        )));
+    }
+    let num_msisdn = u8::try_from(response.num_msisdn()).map_err(|_| {
+        HandleError::Ipc(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MSISDN record count exceeds stock one-byte field",
+        ))
+    })?;
+    let mut data = Vec::with_capacity(4 + response.records.len());
+    data.extend_from_slice(&response.read_result.to_be_bytes());
+    data.push(response.result);
+    data.push(num_msisdn);
+    data.extend_from_slice(response.records);
+    broadcast_variable_callback(server, device_id, SdkCallbackKind::MsisdnRead, &data)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UiccCallbackError {
     UnsupportedKind(u16),
@@ -2287,6 +2325,7 @@ impl DeviceBridge {
                 Ok(SdkCommand::PlmnSearchExt) => self.dispatch_plmn_search_ext(modem, request),
                 Ok(SdkCommand::PlmnSearchStop) => self.dispatch_plmn_search_stop(modem, request),
                 Ok(SdkCommand::MobileIdRead) => self.dispatch_mobile_id_read(modem, request),
+                Ok(SdkCommand::MsisdnRead) => self.dispatch_msisdn_read(modem, request),
                 Ok(SdkCommand::AtCommand) => Self::dispatch_at(modem, request),
                 Ok(SdkCommand::AtCommandExt) => Self::dispatch_at_ext(modem, request),
                 Ok(SdkCommand::UiccRequest) => self.dispatch_uicc(modem, request),
@@ -2342,6 +2381,14 @@ impl DeviceBridge {
                     return Ok(None);
                 }
                 broadcast_mobile_id_callback(server, self.device_id, *response).map(Some)
+            }
+            ModemEvent::MsisdnRead(response) => {
+                if !self.pending.contains(ResponseKey::MiscRead) {
+                    return Ok(None);
+                }
+                let report = broadcast_msisdn_callback(server, self.device_id, *response)?;
+                self.pending.remove(ResponseKey::MiscRead);
+                Ok(Some(report))
             }
             ModemEvent::MiscReadFailure { .. } => {
                 self.pending.remove(ResponseKey::MiscRead);
@@ -2481,9 +2528,9 @@ impl DeviceBridge {
                 }
                 broadcast_plmn_search_callback(server, self.device_id, *response).map(Some)
             }
-            ModemEvent::MobileIdRead(_) | ModemEvent::MiscReadFailure { .. } => {
-                self.handle_misc_read_event(server, event)
-            }
+            ModemEvent::MobileIdRead(_)
+            | ModemEvent::MsisdnRead(_)
+            | ModemEvent::MiscReadFailure { .. } => self.handle_misc_read_event(server, event),
             ModemEvent::PlmnList(response) => {
                 let key = ResponseKey::PlmnList;
                 if !self.pending.contains(key) {
@@ -2950,6 +2997,29 @@ impl DeviceBridge {
             modem.send_command(ModemCommand::AtExt(AtCommandExt::new(channel, command)))?;
         Ok(HandledCall {
             command: SdkCommand::AtCommandExt,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_msisdn_read<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        if !request.params.is_empty() {
+            return Err(HandleError::UnexpectedParameters {
+                command: request.command,
+                expected: 0,
+                actual: request.params.len(),
+            });
+        }
+        let bytes_written = modem.send_tracked_command(
+            &mut self.pending,
+            ModemCommand::MsisdnRead(MsisdnReadRequest),
+        )?;
+        Ok(HandledCall {
+            command: SdkCommand::MsisdnRead,
             device_id: request.device_id,
             bytes_written,
         })
@@ -4816,6 +4886,165 @@ mod tests {
             std::process::abort();
         };
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn stock_msisdn_read_matches_live_p4_hci_and_variable_callback_81() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, subscribed_id) = open_client(&mut server, &dir, 0);
+        let (unsubscribed, _unsubscribed_id) = open_client(&mut server, &dir, 1);
+        server
+            .client_context(subscribed_id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::MsisdnRead.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                subscribed_id,
+                SdkApiRequest {
+                    command: SdkCommand::MsisdnRead as u16,
+                    device_id: 0x1122_3344,
+                    params: &[],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.bytes_written, 8);
+        assert_eq!(bridge.pending_count(), 1);
+        assert!(bridge.pending.contains(ResponseKey::MiscRead));
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            [0x31, 0x45, 0, 4, 0, 3, 0, 0]
+        );
+
+        let mut record = [0_u8; 256];
+        record[0] = 3;
+        record[1..4].copy_from_slice(b"Jan");
+        record[0xf2] = 4;
+        record[0xf3] = 0x91;
+        record[0xf4..0xf8].copy_from_slice(&[0x21, 0x43, 0x65, 0xf7]);
+        record[0xfe] = 8;
+        record[0xff] = 9;
+        let mut response = vec![0xb1, 0x46, 0x01, 0x08, 0, 0, 0, 3, 0x01, 0x02, 0, 1];
+        response.extend_from_slice(&record);
+        assert_eq!(
+            route_one_hci(&mut bridge, &mut server, response),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 300];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(len, 272);
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 81);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(callback.data.len(), 260);
+        assert_eq!(&callback.data[..4], &[0, 0, 0, 1]);
+        assert_eq!(&callback.data[4..], &record);
+
+        unsubscribed
+            .set_nonblocking(true)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut no_frame = [0_u8; 1];
+        let Err(error) = unsubscribed.recv(&mut no_frame) else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn stock_msisdn_subtype_failure_emits_four_byte_callback_81() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (client, id) = open_client(&mut server, &dir, 0);
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::MsisdnRead.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::MsisdnRead as u16,
+                    device_id: 1,
+                    params: &[],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                vec![0xb1, 0x46, 0, 7, 0, 0, 0, 3, 0, 1, 7],
+            ),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        let mut frame = [0_u8; 32];
+        let len = client
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(len, 16);
+        let callback = SdkCallback::parse(
+            Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 81);
+        assert_eq!(callback.data, &[0, 0, 7, 0]);
+    }
+
+    #[test]
+    fn malformed_stock_msisdn_read_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::MsisdnRead as u16,
+                    device_id: 1,
+                    params: &[0],
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                command: 80,
+                expected: 0,
+                actual: 1,
+            })
+        ));
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]

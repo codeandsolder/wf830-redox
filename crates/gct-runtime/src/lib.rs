@@ -19,15 +19,16 @@ use gct_lapi::{
     EmmControlDecodeError, EmmControlReport, EmmControlResponse, EmmNiReattachControlRequest,
     EmmReattachControlReport, EmmTimerControlRequest, EmmTimerStartRequest, EmptyRequest,
     LcsControlRequest, LppControlRequest, MiscReadDecodeError, MiscReadResponse,
-    MobileIdReadRequest, MobileIdReadResponse, PdnConnectExtRequest, PdnConnectExtResponse,
-    PdnConnectRequest, PdnConnectResponse, PdnDisconnectRequest, PdnDisconnectResponse,
-    PdnEncodeError, PdnResponseDecodeError, PlmnListResponse, PlmnSearchDecodeError,
-    PlmnSearchExtEncodeError, PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchResponse,
-    PlmnSearchStopRequest, PlmnSearchStopResponse, PsmControlRequest, ResponseDecodeError,
-    ResultResponse, ResultResponseKind, UeModeChangeRequest, UeModeChangeResponse,
-    UiccAuthenticateEncodeError, UiccAuthenticateRequest, UiccFixedRequest, UiccFixedRequestError,
-    UiccPinCommandRequest, UiccPinEncodeError, UiccPinStatusRequest, UiccReadBinaryRequest,
-    UiccReadRecordRequest, UiccResponse, UiccResponseDecodeError, UiccStatusRequest, uicc_control,
+    MobileIdReadRequest, MobileIdReadResponse, MsisdnReadRequest, MsisdnReadResponse,
+    PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse,
+    PdnDisconnectRequest, PdnDisconnectResponse, PdnEncodeError, PdnResponseDecodeError,
+    PlmnListResponse, PlmnSearchDecodeError, PlmnSearchExtEncodeError, PlmnSearchExtRequest,
+    PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
+    PsmControlRequest, ResponseDecodeError, ResultResponse, ResultResponseKind,
+    UeModeChangeRequest, UeModeChangeResponse, UiccAuthenticateEncodeError,
+    UiccAuthenticateRequest, UiccFixedRequest, UiccFixedRequestError, UiccPinCommandRequest,
+    UiccPinEncodeError, UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest,
+    UiccResponse, UiccResponseDecodeError, UiccStatusRequest, uicc_control,
 };
 use gct_transport::{
     GlifTransport, HciIo, HciStreamDecoder, MAX_HCI_FRAME_LEN, OEM_READ_BUFFER_LEN,
@@ -155,6 +156,7 @@ pub enum ModemEvent<'a> {
     PlmnSearchStop(PlmnSearchStopResponse),
     PlmnList(PlmnListResponse<'a>),
     MobileIdRead(MobileIdReadResponse<'a>),
+    MsisdnRead(MsisdnReadResponse<'a>),
     UeModeChange(UeModeChangeResponse),
     EmmNiReattachControl {
         result: u32,
@@ -202,6 +204,7 @@ pub enum ModemCommand<'a> {
     PlmnSearchExt(PlmnSearchExtRequest<'a>),
     PlmnSearchStop(PlmnSearchStopRequest),
     MobileIdRead(MobileIdReadRequest),
+    MsisdnRead(MsisdnReadRequest),
     UeModeChange(UeModeChangeRequest),
     EmmTimerControl(EmmTimerControlRequest),
     EmmTimerStart(EmmTimerStartRequest),
@@ -264,7 +267,7 @@ impl ModemCommand<'_> {
             }
             Self::PlmnSearch(_) | Self::PlmnSearchExt(_) => Some(ResponseKey::PlmnSearch),
             Self::PlmnSearchStop(request) => Some(ResponseKey::PlmnSearchStop(request.search_type)),
-            Self::MobileIdRead(_) => Some(ResponseKey::MiscRead),
+            Self::MobileIdRead(_) | Self::MsisdnRead(_) => Some(ResponseKey::MiscRead),
             Self::UeModeChange(_) => Some(ResponseKey::UeModeChange),
             Self::EmmNiReattachControl(_) => Some(ResponseKey::EmmNiReattachControl),
             Self::Empty(EmptyRequest::PlmnList) => Some(ResponseKey::PlmnList),
@@ -321,7 +324,9 @@ impl ModemEvent<'_> {
                 Some(ResponseKey::PlmnSearchStop(response.search_type))
             }
             Self::PlmnList(_) => Some(ResponseKey::PlmnList),
-            Self::MobileIdRead(_) | Self::MiscReadFailure { .. } => Some(ResponseKey::MiscRead),
+            Self::MobileIdRead(_) | Self::MsisdnRead(_) | Self::MiscReadFailure { .. } => {
+                Some(ResponseKey::MiscRead)
+            }
             Self::UeModeChange(_) => Some(ResponseKey::UeModeChange),
             Self::EmmNiReattachControl { .. } => Some(ResponseKey::EmmNiReattachControl),
             Self::Result { kind, .. } => Some(ResponseKey::Result(*kind)),
@@ -515,6 +520,7 @@ pub fn encode_command(
         ModemCommand::PlmnSearchExt(request) => Ok(request.encode(output)?),
         ModemCommand::PlmnSearchStop(request) => Ok(request.encode(output)?),
         ModemCommand::MobileIdRead(request) => Ok(request.encode(output)?),
+        ModemCommand::MsisdnRead(request) => Ok(request.encode(output)?),
         ModemCommand::UeModeChange(request) => Ok(request.encode(output)?),
         ModemCommand::EmmTimerControl(request) => Ok(request.encode(output)?),
         ModemCommand::EmmTimerStart(request) => Ok(request.encode(output)?),
@@ -645,6 +651,7 @@ pub fn decode_event(packet: Packet<'_>) -> Result<ModemEvent<'_>, EventDecodeErr
         },
         recovered_opcode::MISC_READ_RESPONSE => match MiscReadResponse::parse(packet)? {
             MiscReadResponse::MobileId(response) => Ok(ModemEvent::MobileIdRead(response)),
+            MiscReadResponse::Msisdn(response) => Ok(ModemEvent::MsisdnRead(response)),
             MiscReadResponse::Failure { read_result } => {
                 Ok(ModemEvent::MiscReadFailure { read_result })
             }
@@ -836,8 +843,8 @@ mod tests {
     use gct_lapi::{
         AtCommand, AtCommandExt, AtCommandFromDevice, AttachExtProfile, AttachExtRequest,
         EmmNiReattachControlRequest, EmmTimerControlRequest, EmmTimerStartRequest, EmptyRequest,
-        LcsControlRequest, LppControlRequest, MobileIdReadRequest, PcoInfo, PinData,
-        PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchStopRequest, PsmControlRequest,
+        LcsControlRequest, LppControlRequest, MobileIdReadRequest, MsisdnReadRequest, PcoInfo,
+        PinData, PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchStopRequest, PsmControlRequest,
         ResponseDecodeError, ResultResponseKind, UiccPinCommandRequest,
     };
     use gct_transport::HciIo;
@@ -1332,6 +1339,49 @@ mod tests {
             };
             assert_eq!(decode_event(packet), Ok(ModemEvent::Unknown(packet)));
         }
+    }
+
+    #[test]
+    fn msisdn_read_shares_misc_family_key_and_decodes_subtype_three() {
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut pending = PendingRequests::new();
+        assert!(matches!(
+            modem.send_tracked_command(&mut pending, ModemCommand::MsisdnRead(MsisdnReadRequest),),
+            Ok(8)
+        ));
+        assert!(pending.contains(ResponseKey::MiscRead));
+        assert!(matches!(
+            modem.send_tracked_command(
+                &mut pending,
+                ModemCommand::MobileIdRead(MobileIdReadRequest { mobile_id_type: 1 }),
+            ),
+            Err(SendTrackedCommandError::Pending(
+                PendingError::AlreadyPending(ResponseKey::MiscRead)
+            ))
+        ));
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![0x31, 0x45, 0, 4, 0, 3, 0, 0]
+        );
+
+        let mut payload = vec![0, 0, 0, 3, 0x01, 0x02, 0, 1];
+        payload.extend_from_slice(&[0x5a; 256]);
+        let packet = Packet {
+            header: Header {
+                command: recovered_opcode::MISC_READ_RESPONSE,
+                payload_len: u16::try_from(payload.len()).unwrap_or_else(|_| std::process::abort()),
+            },
+            payload: &payload,
+        };
+        let Ok(ModemEvent::MsisdnRead(response)) = decode_event(packet) else {
+            std::process::abort();
+        };
+        assert_eq!(response.num_msisdn(), 1);
+        assert_eq!(
+            ModemEvent::MsisdnRead(response).response_key(),
+            Some(ResponseKey::MiscRead)
+        );
     }
 
     #[test]
