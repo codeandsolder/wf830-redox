@@ -334,6 +334,29 @@ materialization across initial and trailing PDN fields, subscription gating,
 and pending-request release. The workspace gate is Rust 1.99
 `cargo test --workspace` plus strict all-target Clippy with warnings denied.
 
+Normal PDN disconnect now crosses the stock ABI as well. B014 DWARF gives a
+68-byte in-process `_PDN_DISCONNECT_REQ_PARAM`
+(`default_eps_id:u16@0`, `transaction_id:u8@2`, APN-NI object at `0x03`), but
+live P4 `LTED_PDNDisconnRequest` does **not** copy all 68 bytes into SDK command
+36. Its wrapper reads the APN-NI length byte, sizes the local SDK envelope from
+that value, and copies exactly `4 + apn_len` request bytes. The bridge therefore
+accepts that exact variable local payload (maximum 68 bytes), rejects truncated
+or inconsistent lengths, ignores the historical transaction byte, and mirrors
+live `LAPI_PDNDisconnRequest` by allocating a fresh TID before encoding
+`0x3107`.
+
+The reverse path is callback 36 (`PDNDisconn`). B014 DWARF fixes
+`_PDN_DISCONNECT_RSP_INFO` at 176 bytes: result/reject causes/default EPS ID at
+`0x000..0x008`, transaction ID at `0x008`, 65-byte APN-NI at `0x009`, and
+102-byte operator PCO at `0x04a`. The stock `ind_pdn_disconnect_response`
+handler directly passes callback ID 36 to `lted_srv_send_sdk_cb_assemble_hci`;
+the callback jump table maps that ID to `cb_rsp[8]`, registration offset
+`0x44`. Rust parses `0xb108`, correlates by the fresh transaction ID,
+re-materializes the 176-byte legacy response, and broadcasts only to clients
+registered in that slot. End-to-end tests cover exact `0x3107` bytes,
+variable-length local request validation, callback materialization,
+subscription gating, and pending release.
+
 ## PLMN search/list wire grammar — live P4 confirmed
 
 B014 DWARF names `_PLMN_SEARCH_REQ_PARAM` as a nine-byte host structure

@@ -11,7 +11,8 @@ use std::{io, io::Write};
 use gct_lapi::{
     ApnType, AttachRequest, AttachResponse, AttachTailDecodeError, AttachTailField,
     EmergencyNumberDecodeError, EmptyRequest, PdnConnectRequest, PdnConnectResponse,
-    PdnConnectTailDecodeError, PdnConnectTailField, PdnConnectionControl, PdnInfoContainers,
+    PdnConnectTailDecodeError, PdnConnectTailField, PdnConnectionControl, PdnDisconnectField,
+    PdnDisconnectFieldDecodeError, PdnDisconnectRequest, PdnDisconnectResponse, PdnInfoContainers,
     PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse, Positioning,
     QosField, ResultResponse, ResultResponseKind,
 };
@@ -36,8 +37,10 @@ pub enum HandleError {
     UnknownDevice { requested: u32, expected: u32 },
     LegacyAttach(LegacyAttachDecodeError),
     LegacyPdnConnect(LegacyPdnConnectDecodeError),
+    LegacyPdnDisconnect(LegacyPdnDisconnectDecodeError),
     AttachCallback(AttachCallbackError),
     PdnConnectCallback(PdnConnectCallbackError),
+    PdnDisconnectCallback(PdnDisconnectCallbackError),
     TransactionIdsExhausted,
     PlmnList(PlmnInfoDecodeError),
     Send(SendCommandError),
@@ -66,9 +69,15 @@ impl std::fmt::Display for HandleError {
             Self::LegacyPdnConnect(error) => {
                 write!(f, "invalid stock PDN-connect request: {error:?}")
             }
+            Self::LegacyPdnDisconnect(error) => {
+                write!(f, "invalid stock PDN-disconnect request: {error:?}")
+            }
             Self::AttachCallback(error) => write!(f, "invalid attach callback payload: {error:?}"),
             Self::PdnConnectCallback(error) => {
                 write!(f, "invalid PDN-connect callback payload: {error:?}")
+            }
+            Self::PdnDisconnectCallback(error) => {
+                write!(f, "invalid PDN-disconnect callback payload: {error:?}")
             }
             Self::TransactionIdsExhausted => write!(f, "no free OEM transaction ID in 1..=253"),
             Self::PlmnList(error) => write!(f, "invalid PLMN-list response: {error:?}"),
@@ -87,8 +96,10 @@ impl std::error::Error for HandleError {
             | Self::UnknownDevice { .. }
             | Self::LegacyAttach(_)
             | Self::LegacyPdnConnect(_)
+            | Self::LegacyPdnDisconnect(_)
             | Self::AttachCallback(_)
             | Self::PdnConnectCallback(_)
+            | Self::PdnDisconnectCallback(_)
             | Self::TransactionIdsExhausted
             | Self::PlmnList(_)
             | Self::Send(_)
@@ -117,6 +128,8 @@ impl From<SendTrackedCommandError> for HandleError {
 
 pub const LEGACY_ATTACH_PARAMS_LEN: usize = 0x160;
 pub const LEGACY_PDN_CONNECT_PARAMS_LEN: usize = 0x1a4;
+pub const LEGACY_PDN_DISCONNECT_FIXED_LEN: usize = 4;
+pub const LEGACY_PDN_DISCONNECT_MAX_LEN: usize = 0x44;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LegacyAttachStringField {
@@ -362,6 +375,60 @@ pub fn decode_legacy_pdn_connect(
     };
     request.secure_pco = params[0x1a2];
     Ok(request)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyPdnDisconnectDecodeError {
+    Truncated { minimum: usize, actual: usize },
+    LengthMismatch { expected: usize, actual: usize },
+    ApnTooLong { maximum: usize, actual: usize },
+}
+
+/// Decode the stock socket representation of `_PDN_DISCONNECT_REQ_PARAM`.
+///
+/// B014 DWARF fixes the in-process C structure at 68 bytes, but live P4
+/// `LTED_PDNDisconnRequest` deliberately sends only the used prefix:
+/// `default_eps_id@0`, historical transaction byte at 2, `apn_ni.len@3`, then
+/// exactly `apn_ni.len` bytes from offset 4. The bridge therefore requires the
+/// stock socket payload to be exactly `4 + apn_len`, not 68 bytes.
+///
+/// `LAPI_PDNDisconnRequest` then calls
+/// `tid_list_add(0x3107, 0xff, default_eps_id, 0)` and overwrites byte 2 with
+/// the allocated transaction ID before encoding. The historical socket byte is
+/// ignored here and the caller supplies the fresh ID.
+///
+/// # Errors
+/// Returns [`LegacyPdnDisconnectDecodeError`] for a truncated/inconsistent
+/// variable stock payload or an APN beyond the recovered 64-byte destination.
+pub fn decode_legacy_pdn_disconnect(
+    params: &[u8],
+    transaction_id: u8,
+) -> Result<PdnDisconnectRequest<'_>, LegacyPdnDisconnectDecodeError> {
+    if params.len() < LEGACY_PDN_DISCONNECT_FIXED_LEN {
+        return Err(LegacyPdnDisconnectDecodeError::Truncated {
+            minimum: LEGACY_PDN_DISCONNECT_FIXED_LEN,
+            actual: params.len(),
+        });
+    }
+    let apn_len = usize::from(params[0x003]);
+    if apn_len > LEGACY_PDN_DISCONNECT_MAX_LEN - LEGACY_PDN_DISCONNECT_FIXED_LEN {
+        return Err(LegacyPdnDisconnectDecodeError::ApnTooLong {
+            maximum: LEGACY_PDN_DISCONNECT_MAX_LEN - LEGACY_PDN_DISCONNECT_FIXED_LEN,
+            actual: apn_len,
+        });
+    }
+    let expected = LEGACY_PDN_DISCONNECT_FIXED_LEN + apn_len;
+    if params.len() != expected {
+        return Err(LegacyPdnDisconnectDecodeError::LengthMismatch {
+            expected,
+            actual: params.len(),
+        });
+    }
+    Ok(PdnDisconnectRequest {
+        default_eps_id: u16::from_be_bytes([params[0x000], params[0x001]]),
+        transaction_id,
+        apn_ni: &params[0x004..],
+    })
 }
 
 const STOCK_ATTACH_CALLBACK_DATA_LEN: usize = 0x88b;
@@ -720,6 +787,99 @@ pub fn broadcast_pdn_connect_callback(
     Ok(report)
 }
 
+const STOCK_PDN_DISCONNECT_CALLBACK_DATA_LEN: usize = 0xb0;
+const STOCK_PDN_DISCONNECT_CALLBACK_FRAME_LEN: usize = 12 + STOCK_PDN_DISCONNECT_CALLBACK_DATA_LEN;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdnDisconnectCallbackError {
+    Tail(PdnDisconnectFieldDecodeError),
+}
+
+fn materialize_pdn_disconnect_callback(
+    response: PdnDisconnectResponse<'_>,
+    data: &mut [u8; STOCK_PDN_DISCONNECT_CALLBACK_DATA_LEN],
+) -> Result<(), PdnDisconnectCallbackError> {
+    data.fill(0);
+    data[0x000..0x002].copy_from_slice(&response.result.to_be_bytes());
+    data[0x002..0x004].copy_from_slice(&response.reject_cause1.to_be_bytes());
+    data[0x004..0x006].copy_from_slice(&response.reject_cause2.to_be_bytes());
+    data[0x006..0x008].copy_from_slice(&response.default_eps_id.to_be_bytes());
+    data[0x008] = response.transaction_id;
+
+    let mut tail = response.trailing_fields();
+    while let Some(field) = tail
+        .next_field()
+        .map_err(PdnDisconnectCallbackError::Tail)?
+    {
+        match field {
+            PdnDisconnectField::ApnNetworkIdentifier(value) => {
+                data[0x009] = u8::try_from(value.len()).unwrap_or(0);
+                data[0x00a..0x00a + value.len()].copy_from_slice(value);
+            }
+            PdnDisconnectField::OperatorPco(value) => {
+                if !value.is_empty() {
+                    data[0x04a] = 1;
+                    data[0x04b] = u8::try_from(value.len()).unwrap_or(0);
+                    data[0x04c..0x04c + value.len()].copy_from_slice(value);
+                }
+            }
+            PdnDisconnectField::Unknown(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Materialize and broadcast stock callback 36 (`PDNDisconn`).
+///
+/// B014 DWARF gives an exact 176-byte `_PDN_DISCONNECT_RSP_INFO`, and its
+/// callback selector maps the disconnect response to client-context offset
+/// `0x44` (`cb_rsp[8]`). The stock response handler directly passes callback
+/// ID 36 to `lted_srv_send_sdk_cb_assemble_hci`.
+/// The modem's typed `0xb108` response is converted into the historical byte
+/// image before the standard local `0x8107` envelope is emitted.
+///
+/// # Errors
+/// Returns [`HandleError::PdnDisconnectCallback`] for malformed proven response
+/// fields or [`HandleError::Ipc`] for callback/shared-context/socket failures.
+pub fn broadcast_pdn_disconnect_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: PdnDisconnectResponse<'_>,
+) -> Result<BroadcastReport, HandleError> {
+    let mut data = [0_u8; STOCK_PDN_DISCONNECT_CALLBACK_DATA_LEN];
+    materialize_pdn_disconnect_callback(response, &mut data)
+        .map_err(HandleError::PdnDisconnectCallback)?;
+    let callback_kind = SdkCallbackKind::PdnDisconnect;
+    let mut frame = [0_u8; STOCK_PDN_DISCONNECT_CALLBACK_FRAME_LEN];
+    let frame_len = SdkCallback {
+        callback_id: callback_kind.callback_id(),
+        device_id,
+        data: &data,
+    }
+    .encode(&mut frame)
+    .map_err(|_| {
+        HandleError::Ipc(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fixed-size PDN-disconnect callback failed to encode",
+        ))
+    })?;
+
+    let mut report = BroadcastReport::default();
+    for client_id in server.client_ids() {
+        let registered = server
+            .client_context(client_id)?
+            .read_u32_be(callback_kind.registration_offset())?
+            != 0;
+        if !registered {
+            continue;
+        }
+        report.registered_clients += 1;
+        server.send_to_client(client_id, &frame[..frame_len])?;
+        report.sent_clients += 1;
+    }
+    Ok(report)
+}
+
 const MAX_PLMN_RECORDS: usize = 32;
 const STOCK_PLMN_RECORD_LEN: usize = 11;
 const STOCK_PLMN_PREFIX_LEN: usize = 5;
@@ -975,6 +1135,7 @@ impl DeviceBridge {
                 }
                 Ok(SdkCommand::Attach) => self.dispatch_attach(modem, request),
                 Ok(SdkCommand::PdnConnect) => self.dispatch_pdn_connect(modem, request),
+                Ok(SdkCommand::PdnDisconnect) => self.dispatch_pdn_disconnect(modem, request),
                 Ok(_) => self.dispatch_zero_parameter(modem, request),
                 Err(_) => Err(HandleError::UnsupportedCommand(request.command)),
             }
@@ -1022,6 +1183,13 @@ impl DeviceBridge {
                     return Ok(None);
                 }
                 broadcast_pdn_connect_callback(server, self.device_id, *response).map(Some)
+            }
+            ModemEvent::PdnDisconnect(response) => {
+                let key = ResponseKey::PdnDisconnect(response.transaction_id);
+                if !self.pending.remove(key) {
+                    return Ok(None);
+                }
+                broadcast_pdn_disconnect_callback(server, self.device_id, *response).map(Some)
             }
             ModemEvent::Result { kind, response } => {
                 let key = ResponseKey::Result(*kind);
@@ -1082,6 +1250,23 @@ impl DeviceBridge {
             modem.send_tracked_command(&mut self.pending, ModemCommand::PdnConnect(pdn))?;
         Ok(HandledCall {
             command: SdkCommand::PdnConnect,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_pdn_disconnect<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let transaction_id = self.allocate_transaction_id()?;
+        let pdn = decode_legacy_pdn_disconnect(request.params, transaction_id)
+            .map_err(HandleError::LegacyPdnDisconnect)?;
+        let bytes_written =
+            modem.send_tracked_command(&mut self.pending, ModemCommand::PdnDisconnect(pdn))?;
+        Ok(HandledCall {
+            command: SdkCommand::PdnDisconnect,
             device_id: request.device_id,
             bytes_written,
         })
@@ -1162,7 +1347,8 @@ mod tests {
     use super::{
         BroadcastReport, DeviceBridge, HandleError, LTE_API_RET_OFFSET, LegacyAttachDecodeError,
         LegacyAttachStringField, LegacyPdnConnectDecodeError, LegacyPdnConnectStringField,
-        PS_INIT_COMPLETE_OFFSET, StartupPhase, broadcast_result_callback, decode_legacy_attach,
+        LegacyPdnDisconnectDecodeError, PS_INIT_COMPLETE_OFFSET, StartupPhase,
+        broadcast_result_callback, decode_legacy_attach, decode_legacy_pdn_disconnect,
     };
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -2092,6 +2278,161 @@ mod tests {
         assert_eq!(&data[0x278..0x27d], &[1, 3, 0x11, 0x22, 0x33]);
         assert_eq!(&data[0x2de..0x2e2], &100_u32.to_be_bytes());
         assert_eq!(&data[0x2e2..0x2e6], &200_u32.to_be_bytes());
+
+        unsubscribed
+            .set_nonblocking(true)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut no_frame = [0_u8; 1];
+        let Err(error) = unsubscribed.recv(&mut no_frame) else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn stock_pdn_disconnect_allocates_tid_and_matches_live_p4_hci() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        let params = [0x12, 0x34, 0xfe, 3, b'i', b'm', b's'];
+        let request = SdkApiRequest {
+            command: SdkCommand::PdnDisconnect as u16,
+            device_id: 1,
+            params: &params,
+        };
+
+        let first = bridge
+            .handle_sdk_api(&mut server, &mut modem, id, request)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(first.bytes_written, 14);
+        let second = bridge
+            .handle_sdk_api(&mut server, &mut modem, id, request)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(second.bytes_written, 14);
+        assert_eq!(bridge.pending_count(), 2);
+
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            [
+                0x31, 0x07, 0x00, 0x0a, 0x12, 0x34, 0x20, 0x01, 0x01, 0x57, 0x03, b'i', b'm', b's',
+                0x31, 0x07, 0x00, 0x0a, 0x12, 0x34, 0x20, 0x01, 0x02, 0x57, 0x03, b'i', b'm', b's',
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_stock_pdn_disconnect_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let params = [0, 0, 0xfe, 65];
+
+        let request = SdkApiRequest {
+            command: SdkCommand::PdnDisconnect as u16,
+            device_id: 1,
+            params: &params,
+        };
+        assert!(matches!(
+            bridge.handle_sdk_api(&mut server, &mut modem, id, request),
+            Err(HandleError::LegacyPdnDisconnect(
+                LegacyPdnDisconnectDecodeError::ApnTooLong {
+                    maximum: 64,
+                    actual: 65
+                }
+            ))
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
+
+        assert_eq!(
+            decode_legacy_pdn_disconnect(&[0, 1, 0xfe, 3, b'i'], 1),
+            Err(LegacyPdnDisconnectDecodeError::LengthMismatch {
+                expected: 7,
+                actual: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn pdn_disconnect_response_materializes_exact_stock_callback_and_subscription_gate() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, subscribed_id) = open_client(&mut server, &dir, 0);
+        let (unsubscribed, _unsubscribed_id) = open_client(&mut server, &dir, 1);
+        server
+            .client_context(subscribed_id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::PdnDisconnect.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        let params = [0x12, 0x34, 0xfe, 3, b'i', b'm', b's'];
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                subscribed_id,
+                SdkApiRequest {
+                    command: SdkCommand::PdnDisconnect as u16,
+                    device_id: 0x1122_3344,
+                    params: &params,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.pending_count(), 1);
+
+        let payload = [
+            0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x12, 0x34, 0x20, 0x01, 0x01, 0x57, 0x03, b'i',
+            b'm', b's', 0x5d, 0x03, 0x11, 0x22, 0x33,
+        ];
+        let mut hci = Vec::with_capacity(payload.len() + 4);
+        hci.extend_from_slice(&[0xb1, 0x08]);
+        hci.extend_from_slice(
+            &u16::try_from(payload.len())
+                .unwrap_or_else(|_| std::process::abort())
+                .to_be_bytes(),
+        );
+        hci.extend_from_slice(&payload);
+
+        assert_eq!(
+            route_one_hci(&mut bridge, &mut server, hci),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 256];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(len, 12 + 0xb0);
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 36);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(callback.data.len(), 0xb0);
+        let data = callback.data;
+        assert_eq!(&data[0x000..0x008], &[0, 1, 0, 2, 0, 3, 0x12, 0x34]);
+        assert_eq!(data[0x008], 1);
+        assert_eq!(data[0x009], 3);
+        assert_eq!(&data[0x00a..0x00d], b"ims");
+        assert_eq!(&data[0x04a..0x04f], &[1, 3, 0x11, 0x22, 0x33]);
+        assert!(data[0x04f..].iter().all(|&byte| byte == 0));
 
         unsubscribed
             .set_nonblocking(true)
