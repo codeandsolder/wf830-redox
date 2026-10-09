@@ -334,6 +334,37 @@ materialization across initial and trailing PDN fields, subscription gating,
 and pending-request release. The workspace gate is Rust 1.99
 `cargo test --workspace` plus strict all-target Clippy with warnings denied.
 
+### Stock extended-PDN bridge ABI
+
+Extended PDN connect now crosses the stock ABI independently of the normal
+transaction-ID path. Live P4 `liblted.so::LTED_PDNConnRequestEXT` at `0xaf90`
+constructs SDK command **34** and copies **exactly 244 bytes** from the caller.
+B014 DWARF fixes that `_PDN_CONNECTIVITY_REQ_EXT_PARAM` layout: `request_type@0`,
+`optional_info@1`, 100-byte APN at `2`, `ip_alloc@102`, `apn_class@103`,
+`pdn_type@104`, 64-byte username/password at `105/169`, `auth_flag@233`,
+nine-byte `PCO_INFO@234`, and `req_apn_type@243`. The last byte is SDK-local
+bookkeeping and never reaches HCI `0x3167`. The clean decoder preserves the live
+encoder's asymmetric rule that APN is always serialized, while username,
+password and the remaining optional fields are dead when `optional_info == 0`.
+Unterminated fixed strings that would actually be consumed are rejected before
+GLIF I/O.
+
+The reverse path is live-P4 callback **35**. `ind_pdn_conectivity_response_extension`
+at `0x21a9c` passes selector 35 directly to the stock callback assembler, and
+`lted_sdk_recv_cb_handler` maps that selector to `cb_rsp[7]`, registration
+offset `0x3c`. B014 DWARF fixes `_PDN_CONNECTIVITY_RSP_EXT_INFO` at exactly
+**697 bytes**: result/reject/default-EPS fields at `0..8`, data path/IP allocation
+at `8/9`, throttle time at `10`, APN class at `12`, requested/received 65-byte
+APN-NI objects at `13/78`, and the shared 554-byte `ATTACH_PDN_RSP_INFO` at
+`143`. The bridge reuses the proven PDN/QoS materializer at that exact base and
+intentionally ignores the modem suffix that live P4 also leaves unparsed.
+
+End-to-end bridge tests cover exact 40-byte `0x3167` output from the 244-byte
+stock object, malformed input rejection before GLIF, the `optional_info == 0`
+APN-only rule, exact 697-byte callback materialization, callback-35 subscription
+gating, family-level pending correlation/release, and the recovered `cb_rsp[7]`
+slot.
+
 Normal PDN disconnect now crosses the stock ABI as well. B014 DWARF gives a
 68-byte in-process `_PDN_DISCONNECT_REQ_PARAM`
 (`default_eps_id:u16@0`, `transaction_id:u8@2`, APN-NI object at `0x03`), but

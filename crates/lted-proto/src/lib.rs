@@ -25,6 +25,7 @@ pub enum SdkCallbackKind {
     AttachExt,
     Detach,
     PdnConnect,
+    PdnConnectExt,
     PdnDisconnect,
     PlmnSearch,
     PlmnSearchStop,
@@ -42,6 +43,7 @@ impl SdkCallbackKind {
             Self::AttachExt => 28,
             Self::Detach => 30,
             Self::PdnConnect => 33,
+            Self::PdnConnectExt => 35,
             Self::PdnDisconnect => 37,
             Self::PlmnSearch => 41,
             Self::PlmnSearchStop => 64,
@@ -59,6 +61,7 @@ impl SdkCallbackKind {
             Self::AttachExt => 3,
             Self::Detach => 4,
             Self::PdnConnect => 6,
+            Self::PdnConnectExt => 7,
             Self::PdnDisconnect => 8,
             Self::PlmnSearch => 9,
             Self::PlmnSearchStop => 20,
@@ -706,6 +709,8 @@ mod tests {
         assert_eq!(SdkCallbackKind::Detach.registration_offset(), 0x24);
         assert_eq!(SdkCallbackKind::PdnConnect.callback_id(), 33);
         assert_eq!(SdkCallbackKind::PdnConnect.registration_offset(), 0x34);
+        assert_eq!(SdkCallbackKind::PdnConnectExt.callback_id(), 35);
+        assert_eq!(SdkCallbackKind::PdnConnectExt.registration_offset(), 0x3c);
         assert_eq!(SdkCallbackKind::PdnDisconnect.callback_id(), 37);
         assert_eq!(SdkCallbackKind::PdnDisconnect.registration_offset(), 0x44);
         assert_eq!(SdkCallbackKind::PlmnSearch.callback_id(), 41);
