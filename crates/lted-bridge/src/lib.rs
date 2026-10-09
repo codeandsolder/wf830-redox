@@ -14,7 +14,8 @@ use gct_lapi::{
     PdnConnectResponse, PdnConnectTailDecodeError, PdnConnectTailField, PdnConnectionControl,
     PdnDisconnectField, PdnDisconnectFieldDecodeError, PdnDisconnectRequest, PdnDisconnectResponse,
     PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError,
-    PlmnListResponse, Positioning, QosField, ResultResponse, ResultResponseKind,
+    PlmnListResponse, PlmnSearchRequest, PlmnSearchResponse, Positioning, QosField, ResultResponse,
+    ResultResponseKind,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -33,8 +34,15 @@ pub const PS_INIT_COMPLETE_OFFSET: usize = 0x528;
 pub enum HandleError {
     Ipc(io::Error),
     UnsupportedCommand(u16),
-    UnexpectedParameters { command: u16, actual: usize },
-    UnknownDevice { requested: u32, expected: u32 },
+    UnexpectedParameters {
+        command: u16,
+        expected: usize,
+        actual: usize,
+    },
+    UnknownDevice {
+        requested: u32,
+        expected: u32,
+    },
     LegacyAttach(LegacyAttachDecodeError),
     LegacyPdnConnect(LegacyPdnConnectDecodeError),
     LegacyPdnDisconnect(LegacyPdnDisconnectDecodeError),
@@ -42,6 +50,7 @@ pub enum HandleError {
     PdnConnectCallback(PdnConnectCallbackError),
     PdnDisconnectCallback(PdnDisconnectCallbackError),
     TransactionIdsExhausted,
+    PlmnSearch(PlmnInfoDecodeError),
     PlmnList(PlmnInfoDecodeError),
     Send(SendCommandError),
     Tracked(SendTrackedCommandError),
@@ -54,9 +63,13 @@ impl std::fmt::Display for HandleError {
             Self::UnsupportedCommand(command) => {
                 write!(f, "unsupported recovered lted SDK command {command}")
             }
-            Self::UnexpectedParameters { command, actual } => write!(
+            Self::UnexpectedParameters {
+                command,
+                expected,
+                actual,
+            } => write!(
                 f,
-                "lted SDK command {command} expected zero parameters, got {actual} bytes"
+                "lted SDK command {command} expected {expected} parameter bytes, got {actual}"
             ),
             Self::UnknownDevice {
                 requested,
@@ -80,6 +93,7 @@ impl std::fmt::Display for HandleError {
                 write!(f, "invalid PDN-disconnect callback payload: {error:?}")
             }
             Self::TransactionIdsExhausted => write!(f, "no free OEM transaction ID in 1..=253"),
+            Self::PlmnSearch(error) => write!(f, "invalid PLMN-search response: {error:?}"),
             Self::PlmnList(error) => write!(f, "invalid PLMN-list response: {error:?}"),
             Self::Send(error) => write!(f, "modem send failed: {error:?}"),
             Self::Tracked(error) => write!(f, "tracked modem send failed: {error:?}"),
@@ -101,6 +115,7 @@ impl std::error::Error for HandleError {
             | Self::PdnConnectCallback(_)
             | Self::PdnDisconnectCallback(_)
             | Self::TransactionIdsExhausted
+            | Self::PlmnSearch(_)
             | Self::PlmnList(_)
             | Self::Send(_)
             | Self::Tracked(_) => None,
@@ -1002,6 +1017,91 @@ pub fn broadcast_result_callback(
     Ok(report)
 }
 
+const STOCK_PLMN_SEARCH_CALLBACK_DATA_LEN: usize = 436;
+const STOCK_PLMN_SEARCH_CALLBACK_FRAME_LEN: usize = 12 + STOCK_PLMN_SEARCH_CALLBACK_DATA_LEN;
+const STOCK_PLMN_SEARCH_RECORDS_OFFSET: usize = 31;
+const STOCK_PLMN_SEARCH_PRIORITY_OFFSET: usize = 383;
+const STOCK_PLMN_SEARCH_SIB1_OFFSET: usize = 387;
+
+/// Materialize and broadcast live-P4 stock callback 41 (`PLMNSearch`).
+///
+/// B014 DWARF fixes `_PLMN_SEARCH_RSP_INFO` at 436 bytes. Live P4
+/// `ind_plmn_search_response` sends callback ID 41, and its callback lookup maps
+/// that selector to `cb_rsp[9]` (registration offset `0x4c`).
+///
+/// # Errors
+/// Returns [`HandleError::PlmnSearch`] for malformed record streams or
+/// [`HandleError::Ipc`] for callback/shared-context/socket failures.
+pub fn broadcast_plmn_search_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: PlmnSearchResponse<'_>,
+) -> Result<BroadcastReport, HandleError> {
+    let mut data = [0_u8; STOCK_PLMN_SEARCH_CALLBACK_DATA_LEN];
+    data[0..4].copy_from_slice(&response.result.to_be_bytes());
+    data[4] = response.selection_mode;
+    data[5..8].copy_from_slice(&response.selected_plmn_id);
+    data[8..10].copy_from_slice(&response.next_index.to_be_bytes());
+    data[10..12].copy_from_slice(&response.network_interval.to_be_bytes());
+    data[12] = response.remaining_count.to_be_bytes()[0];
+    data[13..15].copy_from_slice(&response.band.to_be_bytes());
+    data[15..17].copy_from_slice(&response.cell_id.to_be_bytes());
+    data[17..21].copy_from_slice(&response.frequency.to_be_bytes());
+    data[21..23].copy_from_slice(&response.tac);
+    data[23..27].copy_from_slice(&response.bit28_cell_id.to_be_bytes());
+
+    let mut count = 0_u32;
+    let mut offset = STOCK_PLMN_SEARCH_RECORDS_OFFSET;
+    let mut records = response.records();
+    while let Some(record) = records.next_record().map_err(HandleError::PlmnSearch)? {
+        data[offset..offset + 3].copy_from_slice(&record.plmn_id);
+        data[offset + 3..offset + 7].copy_from_slice(&record.priority.to_be_bytes());
+        data[offset + 7..offset + 11].copy_from_slice(&record.status.to_be_bytes());
+        offset += STOCK_PLMN_RECORD_LEN;
+        count += 1;
+    }
+    data[27..31].copy_from_slice(&count.to_be_bytes());
+    if let Some(priority) = response.plmn_priority {
+        data[STOCK_PLMN_SEARCH_PRIORITY_OFFSET..STOCK_PLMN_SEARCH_PRIORITY_OFFSET + 4]
+            .copy_from_slice(&priority.to_be_bytes());
+    }
+    if let Some(sib1) = response.sib1_plmn {
+        data[STOCK_PLMN_SEARCH_SIB1_OFFSET] = sib1.count;
+        let start = STOCK_PLMN_SEARCH_SIB1_OFFSET + 1;
+        data[start..start + sib1.packed_plmn.len()].copy_from_slice(sib1.packed_plmn);
+    }
+
+    let callback_kind = SdkCallbackKind::PlmnSearch;
+    let mut frame = [0_u8; STOCK_PLMN_SEARCH_CALLBACK_FRAME_LEN];
+    let frame_len = SdkCallback {
+        callback_id: callback_kind.callback_id(),
+        device_id,
+        data: &data,
+    }
+    .encode(&mut frame)
+    .map_err(|_| {
+        HandleError::Ipc(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fixed-size PLMN-search callback failed to encode",
+        ))
+    })?;
+
+    let mut report = BroadcastReport::default();
+    for client_id in server.client_ids() {
+        let registered = server
+            .client_context(client_id)?
+            .read_u32_be(callback_kind.registration_offset())?
+            != 0;
+        if !registered {
+            continue;
+        }
+        report.registered_clients += 1;
+        server.send_to_client(client_id, &frame[..frame_len])?;
+        report.sent_clients += 1;
+    }
+    Ok(report)
+}
+
 /// Materialize and broadcast stock callback 45 (`PLMN List`).
 ///
 /// The live daemon sends exactly `5 + 11*N` callback-data bytes: one
@@ -1181,6 +1281,7 @@ impl DeviceBridge {
                     } else {
                         Err(HandleError::UnexpectedParameters {
                             command: request.command,
+                            expected: 0,
                             actual: request.params.len(),
                         })
                     }
@@ -1189,6 +1290,7 @@ impl DeviceBridge {
                 Ok(SdkCommand::Detach) => self.dispatch_detach(modem, request),
                 Ok(SdkCommand::PdnConnect) => self.dispatch_pdn_connect(modem, request),
                 Ok(SdkCommand::PdnDisconnect) => self.dispatch_pdn_disconnect(modem, request),
+                Ok(SdkCommand::PlmnSearch) => self.dispatch_plmn_search(modem, request),
                 Ok(_) => self.dispatch_zero_parameter(modem, request),
                 Err(_) => Err(HandleError::UnsupportedCommand(request.command)),
             }
@@ -1266,6 +1368,12 @@ impl DeviceBridge {
                 }
                 broadcast_result_callback(server, *kind, self.device_id, *response).map(Some)
             }
+            ModemEvent::PlmnSearch(response) => {
+                if !self.pending.remove(ResponseKey::PlmnSearch) {
+                    return Ok(None);
+                }
+                broadcast_plmn_search_callback(server, self.device_id, *response).map(Some)
+            }
             ModemEvent::PlmnList(response) => {
                 let key = ResponseKey::PlmnList;
                 if !self.pending.contains(key) {
@@ -1297,6 +1405,36 @@ impl DeviceBridge {
         Err(HandleError::TransactionIdsExhausted)
     }
 
+    fn dispatch_plmn_search<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let params: [u8; 9] =
+            request
+                .params
+                .try_into()
+                .map_err(|_| HandleError::UnexpectedParameters {
+                    command: request.command,
+                    expected: 9,
+                    actual: request.params.len(),
+                })?;
+        let search = PlmnSearchRequest {
+            search_mode: params[0],
+            mcc: [params[1], params[2], params[3]],
+            mnc: [params[4], params[5], params[6]],
+            emergency_mode: params[7],
+            roaming_option: params[8],
+        };
+        let bytes_written =
+            modem.send_tracked_command(&mut self.pending, ModemCommand::PlmnSearch(search))?;
+        Ok(HandledCall {
+            command: SdkCommand::PlmnSearch,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
     fn dispatch_detach<T: Write>(
         &mut self,
         modem: &mut Modem<T>,
@@ -1308,6 +1446,7 @@ impl DeviceBridge {
                 .try_into()
                 .map_err(|_| HandleError::UnexpectedParameters {
                     command: request.command,
+                    expected: 4,
                     actual: request.params.len(),
                 })?;
         let detach = DetachRequest::from_raw(u32::from_be_bytes(bytes));
@@ -1400,6 +1539,7 @@ impl DeviceBridge {
         if !request.params.is_empty() {
             return Err(HandleError::UnexpectedParameters {
                 command: request.command,
+                expected: 0,
                 actual: request.params.len(),
             });
         }
@@ -2382,6 +2522,159 @@ mod tests {
     }
 
     #[test]
+    fn stock_plmn_search_matches_live_p4_hci() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let params = [1, 2, 6, 0, 0, 1, 0x0f, 3, 4];
+
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::PlmnSearch as u16,
+                    device_id: 1,
+                    params: &params,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.bytes_written, 14);
+        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            [
+                0x31, 0x09, 0x00, 0x0a, 0x01, 0x62, 0xf0, 0x10, 0x62, 0x01, 0x03, 0x63, 0x01, 0x04,
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_stock_plmn_search_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let params = [0_u8; 8];
+
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::PlmnSearch as u16,
+                    device_id: 1,
+                    params: &params,
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                command: 40,
+                expected: 9,
+                actual: 8
+            })
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn plmn_search_response_materializes_exact_stock_callback_and_subscription_gate() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, subscribed_id) = open_client(&mut server, &dir, 0);
+        let (unsubscribed, _unsubscribed_id) = open_client(&mut server, &dir, 1);
+        server
+            .client_context(subscribed_id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::PlmnSearch.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        let params = [1, 2, 6, 0, 0, 1, 0x0f, 3, 4];
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                subscribed_id,
+                SdkApiRequest {
+                    command: SdkCommand::PlmnSearch as u16,
+                    device_id: 0x1122_3344,
+                    params: &params,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.pending_count(), 1);
+
+        let payload = [
+            0x00, 0x00, 0x00, 0x00, 0x02, 0x62, 0xf0, 0x10, 0x00, 0x11, 0x00, 0x1e, 0xfe, 0x00,
+            0x03, 0x12, 0x34, 0x00, 0x00, 0x18, 0x9c, 0xaa, 0xbb, 0x01, 0x23, 0x45, 0x67, 0x13,
+            0x04, 0x00, 0x00, 0x00, 0x07, 0x26, 0x04, 0x01, 0x62, 0xf0, 0x10, 0x12, 0x03, 0x62,
+            0xf0, 0x10, 0x13, 0x04, 0x00, 0x00, 0x00, 0x01, 0x14, 0x04, 0x00, 0x00, 0x00, 0x02,
+        ];
+        let mut hci = Vec::with_capacity(payload.len() + 4);
+        hci.extend_from_slice(&[0xb1, 0x0a]);
+        hci.extend_from_slice(
+            &u16::try_from(payload.len())
+                .unwrap_or_else(|_| std::process::abort())
+                .to_be_bytes(),
+        );
+        hci.extend_from_slice(&payload);
+
+        assert_eq!(
+            route_one_hci(&mut bridge, &mut server, hci),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 512];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(len, 12 + 436);
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 41);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(callback.data.len(), 436);
+        let data = callback.data;
+        assert_eq!(&data[0..27], &payload[0..27]);
+        assert_eq!(&data[27..31], &1_u32.to_be_bytes());
+        assert_eq!(&data[31..34], &[0x62, 0xf0, 0x10]);
+        assert_eq!(&data[34..38], &1_u32.to_be_bytes());
+        assert_eq!(&data[38..42], &2_u32.to_be_bytes());
+        assert!(data[42..383].iter().all(|&byte| byte == 0));
+        assert_eq!(&data[383..387], &7_u32.to_be_bytes());
+        assert_eq!(data[387], 1);
+        assert_eq!(&data[388..391], &[0x62, 0xf0, 0x10]);
+        assert!(data[391..].iter().all(|&byte| byte == 0));
+
+        unsubscribed
+            .set_nonblocking(true)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut no_frame = [0_u8; 1];
+        let Err(error) = unsubscribed.recv(&mut no_frame) else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
     fn stock_pdn_disconnect_allocates_tid_and_matches_live_p4_hci() {
         let dir = TestDir::new();
         let mut server = bind_server(&dir);
@@ -2601,6 +2894,7 @@ mod tests {
             ),
             Err(HandleError::UnexpectedParameters {
                 command: 29,
+                expected: 4,
                 actual: 3
             })
         ));
@@ -2738,6 +3032,7 @@ mod tests {
             bridge.handle_sdk_api(&mut server, &mut modem, id, request),
             Err(HandleError::UnexpectedParameters {
                 command,
+                expected: 0,
                 actual: 1,
             }) if command == SdkCommand::PsInit as u16
         ));

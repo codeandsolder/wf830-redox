@@ -386,6 +386,29 @@ callback 30 only to clients registered in that slot. Tests cover exact request
 bytes, malformed local length rejection before modem I/O, PDN-TID cleanup,
 callback materialization, subscription gating, and pending release.
 
+### Stock PLMN-search bridge ABI
+
+Stock PLMN Search now crosses the local compatibility boundary without copying
+unrelated legacy state. Live P4 `LTED_PLMNSearchRequest` allocates a local SDK
+command-40 frame and copies exactly nine caller parameter bytes. Those bytes are
+the B014-DWARF `_PLMN_SEARCH_REQ_PARAM`: `search_mode@0`, MCC digits at `1..4`,
+MNC digits at `4..7`, `emergency_mode@7`, and `roaming_option@8`. The bridge
+requires exactly that nine-byte payload and feeds the existing typed
+`PlmnSearchRequest`, which produces the independently proven `0x3109` wire
+shape.
+
+The target P4 `ind_plmn_search_response` sends a fixed 436-byte legacy response
+through callback ID 41. The live callback jump table maps 41 to `cb_rsp[9]`,
+registration offset `0x4c`. B014 DWARF fixes `_PLMN_SEARCH_RSP_INFO` at 436
+bytes: the 27-byte fixed metadata prefix is followed by `num_plmn_info:u32` at
+`0x01b`, up to 32 packed 11-byte PLMN records at `0x01f`, `plmn_priority:u32` at
+`0x17f`, and the 49-byte SIB1 PLMN list at `0x183` (`count` plus 48 bytes).
+Rust parses modem `0xb10a` semantically, reconstructs this fixed legacy image,
+releases the tracked PLMN-search family, and emits stock callback 41 only to
+clients registered in that slot. Tests cover the exact command-40-to-`0x3109`
+translation, malformed local length before modem I/O, all recovered callback
+regions, subscription gating, and pending release.
+
 ## PLMN search/list wire grammar — live P4 confirmed
 
 B014 DWARF names `_PLMN_SEARCH_REQ_PARAM` as a nine-byte host structure
