@@ -11,14 +11,15 @@ use std::{io, io::Write};
 use gct_lapi::{
     ApnType, AtCommand, AtCommandExt, AttachExtProfile, AttachExtRequest, AttachExtResponse,
     AttachRequest, AttachResponse, AttachTailDecodeError, AttachTailField, DetachRequest,
-    DetachResponse, EmergencyNumberDecodeError, EmptyRequest, PcoInfo, PdnConnectExtRequest,
-    PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse, PdnConnectTailDecodeError,
-    PdnConnectTailField, PdnConnectionControl, PdnDisconnectField, PdnDisconnectFieldDecodeError,
-    PdnDisconnectRequest, PdnDisconnectResponse, PdnInfoContainers, PdnInfoField,
-    PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse, PlmnSearchRequest,
-    PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse, Positioning, QosField,
-    ResultResponse, ResultResponseKind, UiccFixedRequest, UiccPinStatusRequest,
-    UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse, UiccStatusRequest, uicc_control,
+    DetachRequiredIndication, DetachResponse, EmergencyNumberDecodeError, EmptyRequest, PcoInfo,
+    PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse,
+    PdnConnectTailDecodeError, PdnConnectTailField, PdnConnectionControl, PdnDisconnectField,
+    PdnDisconnectFieldDecodeError, PdnDisconnectRequest, PdnDisconnectResponse, PdnInfoContainers,
+    PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse,
+    PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
+    Positioning, QosField, ResultResponse, ResultResponseKind, UiccFixedRequest,
+    UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse,
+    UiccStatusRequest, uicc_control,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -1173,6 +1174,57 @@ pub fn broadcast_detach_callback(
     Ok(report)
 }
 
+const STOCK_DETACH_REQUIRED_CALLBACK_DATA_LEN: usize = 4;
+const STOCK_DETACH_REQUIRED_CALLBACK_FRAME_LEN: usize =
+    12 + STOCK_DETACH_REQUIRED_CALLBACK_DATA_LEN;
+
+/// Broadcast live-P4 stock callback 31 (`Detach Required`).
+///
+/// The modem indication `0xb16a` carries one big-endian `detach_type:u32`.
+/// Live P4 `ind_detach_required_indication` passes selector 31 to the daemon
+/// callback assembler; the unchanged stock client dispatches it through
+/// `cb_rsp[5]` (registration offset `0x2c`). B014 DWARF independently fixes
+/// `_DETACH_REQ_IND_INFO` at exactly four bytes.
+///
+/// # Errors
+/// Returns [`HandleError::Ipc`] for callback/shared-context/socket failures.
+pub fn broadcast_detach_required_callback(
+    server: &mut Server,
+    device_id: u32,
+    indication: DetachRequiredIndication,
+) -> Result<BroadcastReport, HandleError> {
+    let data = indication.detach_type.to_be_bytes();
+    let callback_kind = SdkCallbackKind::DetachRequired;
+    let mut frame = [0_u8; STOCK_DETACH_REQUIRED_CALLBACK_FRAME_LEN];
+    let frame_len = SdkCallback {
+        callback_id: callback_kind.callback_id(),
+        device_id,
+        data: &data,
+    }
+    .encode(&mut frame)
+    .map_err(|_| {
+        HandleError::Ipc(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fixed-size Detach Required callback failed to encode",
+        ))
+    })?;
+
+    let mut report = BroadcastReport::default();
+    for client_id in server.client_ids() {
+        let registered = server
+            .client_context(client_id)?
+            .read_u32_be(callback_kind.registration_offset())?
+            != 0;
+        if !registered {
+            continue;
+        }
+        report.registered_clients += 1;
+        server.send_to_client(client_id, &frame[..frame_len])?;
+        report.sent_clients += 1;
+    }
+    Ok(report)
+}
+
 const STOCK_PDN_CONNECT_CALLBACK_DATA_LEN: usize = 0x2e6;
 const STOCK_PDN_CONNECT_CALLBACK_FRAME_LEN: usize = 12 + STOCK_PDN_CONNECT_CALLBACK_DATA_LEN;
 const PDN_CONNECT_PDN_OFFSET: usize = 0x04c;
@@ -2216,6 +2268,9 @@ impl DeviceBridge {
                 }
                 broadcast_detach_callback(server, self.device_id, *response).map(Some)
             }
+            ModemEvent::DetachRequired(indication) => {
+                broadcast_detach_required_callback(server, self.device_id, *indication).map(Some)
+            }
             ModemEvent::PdnConnect(response) => {
                 let key = ResponseKey::PdnConnect(response.transaction_id);
                 if !self.pending.remove(key) {
@@ -2287,7 +2342,7 @@ impl DeviceBridge {
                 }
                 Ok(Some(report))
             }
-            _ => Ok(None),
+            ModemEvent::Unknown(_) => Ok(None),
         }
     }
 
@@ -2579,7 +2634,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use gct_lapi::{ResultResponse, ResultResponseKind, UiccResponse};
+    use gct_lapi::{DetachRequiredIndication, ResultResponse, ResultResponseKind, UiccResponse};
     use gct_runtime::{Modem, ModemEvent, ResponseKey};
     use gct_transport::HciIo;
     use lted_compat::Server;
@@ -4789,6 +4844,58 @@ mod tests {
         assert_eq!(&data[0x00a..0x00d], b"ims");
         assert_eq!(&data[0x04a..0x04f], &[1, 3, 0x11, 0x22, 0x33]);
         assert!(data[0x04f..].iter().all(|&byte| byte == 0));
+
+        unsubscribed
+            .set_nonblocking(true)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut no_frame = [0_u8; 1];
+        let Err(error) = unsubscribed.recv(&mut no_frame) else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn detach_required_indication_broadcasts_exact_callback_31_without_pending_state() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, subscribed_id) = open_client(&mut server, &dir, 0);
+        let (unsubscribed, _unsubscribed_id) = open_client(&mut server, &dir, 1);
+        server
+            .client_context(subscribed_id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::DetachRequired.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let mut bridge = DeviceBridge::new(1);
+        assert_eq!(bridge.pending_count(), 0);
+        let report = bridge
+            .handle_modem_event(
+                &mut server,
+                &ModemEvent::DetachRequired(DetachRequiredIndication {
+                    detach_type: 0x1122_3344,
+                }),
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            report,
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 32];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(len, 16);
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 31);
+        assert_eq!(callback.device_id, 1);
+        assert_eq!(callback.data, &[0x11, 0x22, 0x33, 0x44]);
 
         unsubscribed
             .set_nonblocking(true)

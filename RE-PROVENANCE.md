@@ -673,6 +673,18 @@ log-string reference resolves to rodata string `hci_ind_detach_required` at
 `0x7b288`. The Rust parser therefore accepts exactly four payload bytes and
 returns one BE `u32` detach type.
 
+The stock compatibility selector is now independently pinned on both sides of
+the daemon boundary. Live P4 `lted::ind_detach_required_indication` calls
+`lted_srv_send_sdk_cb_assemble_hci` with selector **31** and an exact four-byte
+payload. The unchanged live P4 `liblted.so` callback dispatcher maps selector 31
+to `cb_rsp[5]`: function pointer offset `0x2c`, user pointer offset `0x30`.
+`libltesdk.so` converts the modem word with `D4H` before invoking callback slot
+5, so the daemon receives the historical four-byte host object and forwards
+that same big-endian byte image. The Rust bridge mirrors this as an unsolicited
+callback: no pending request is required or consumed. Tests verify callback 31,
+stock slot `cb_rsp[5]`, exact four-byte data, per-device ID, subscription gating,
+and unchanged zero pending state.
+
 AT responses use the Linux-published opcodes `0xb308` (normal) and `0xb324`
 (extended), both present in the B014 and P4 SDK dispatch tables. The normal SDK
 handler does no decoding: it constructs the historical `_AT_COMMAND_DATA`
