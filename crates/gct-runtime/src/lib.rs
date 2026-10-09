@@ -19,12 +19,12 @@ use gct_lapi::{
     EmptyRequest, MiscReadDecodeError, MiscReadResponse, MobileIdReadRequest, MobileIdReadResponse,
     PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse,
     PdnDisconnectRequest, PdnDisconnectResponse, PdnEncodeError, PdnResponseDecodeError,
-    PlmnListResponse, PlmnSearchDecodeError, PlmnSearchRequest, PlmnSearchResponse,
-    PlmnSearchStopRequest, PlmnSearchStopResponse, ResponseDecodeError, ResultResponse,
-    ResultResponseKind, UiccAuthenticateEncodeError, UiccAuthenticateRequest, UiccFixedRequest,
-    UiccFixedRequestError, UiccPinCommandRequest, UiccPinEncodeError, UiccPinStatusRequest,
-    UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse, UiccResponseDecodeError,
-    UiccStatusRequest, uicc_control,
+    PlmnListResponse, PlmnSearchDecodeError, PlmnSearchExtEncodeError, PlmnSearchExtRequest,
+    PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
+    ResponseDecodeError, ResultResponse, ResultResponseKind, UiccAuthenticateEncodeError,
+    UiccAuthenticateRequest, UiccFixedRequest, UiccFixedRequestError, UiccPinCommandRequest,
+    UiccPinEncodeError, UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest,
+    UiccResponse, UiccResponseDecodeError, UiccStatusRequest, uicc_control,
 };
 use gct_transport::{
     GlifTransport, HciIo, HciStreamDecoder, MAX_HCI_FRAME_LEN, OEM_READ_BUFFER_LEN,
@@ -190,6 +190,7 @@ pub enum ModemCommand<'a> {
     PdnConnectExt(PdnConnectExtRequest<'a>),
     PdnDisconnect(PdnDisconnectRequest<'a>),
     PlmnSearch(PlmnSearchRequest),
+    PlmnSearchExt(PlmnSearchExtRequest<'a>),
     PlmnSearchStop(PlmnSearchStopRequest),
     MobileIdRead(MobileIdReadRequest),
     Empty(EmptyRequest),
@@ -243,7 +244,7 @@ impl ModemCommand<'_> {
             Self::PdnDisconnect(request) => {
                 Some(ResponseKey::PdnDisconnect(request.transaction_id))
             }
-            Self::PlmnSearch(_) => Some(ResponseKey::PlmnSearch),
+            Self::PlmnSearch(_) | Self::PlmnSearchExt(_) => Some(ResponseKey::PlmnSearch),
             Self::PlmnSearchStop(request) => Some(ResponseKey::PlmnSearchStop(request.search_type)),
             Self::MobileIdRead(_) => Some(ResponseKey::MiscRead),
             Self::Empty(EmptyRequest::PlmnList) => Some(ResponseKey::PlmnList),
@@ -370,6 +371,7 @@ pub enum CommandEncodeError {
     Attach(AttachEncodeError),
     AttachExt(AttachExtEncodeError),
     Pdn(PdnEncodeError),
+    PlmnSearchExt(PlmnSearchExtEncodeError),
     UiccAuthenticate(UiccAuthenticateEncodeError),
     UiccFixed(UiccFixedRequestError),
     UiccPin(UiccPinEncodeError),
@@ -396,6 +398,12 @@ impl From<AttachExtEncodeError> for CommandEncodeError {
 impl From<PdnEncodeError> for CommandEncodeError {
     fn from(value: PdnEncodeError) -> Self {
         Self::Pdn(value)
+    }
+}
+
+impl From<PlmnSearchExtEncodeError> for CommandEncodeError {
+    fn from(value: PlmnSearchExtEncodeError) -> Self {
+        Self::PlmnSearchExt(value)
     }
 }
 
@@ -472,6 +480,7 @@ pub fn encode_command(
         ModemCommand::PdnConnectExt(request) => Ok(request.encode(output)?),
         ModemCommand::PdnDisconnect(request) => Ok(request.encode(output)?),
         ModemCommand::PlmnSearch(request) => Ok(request.encode(output)?),
+        ModemCommand::PlmnSearchExt(request) => Ok(request.encode(output)?),
         ModemCommand::PlmnSearchStop(request) => Ok(request.encode(output)?),
         ModemCommand::MobileIdRead(request) => Ok(request.encode(output)?),
         ModemCommand::Empty(request) => Ok(request.encode(output)?),
@@ -770,8 +779,9 @@ mod tests {
     use gct_hci::{Header, Packet, public_opcode, recovered_opcode};
     use gct_lapi::{
         AtCommand, AtCommandExt, AtCommandFromDevice, AttachExtProfile, AttachExtRequest,
-        EmptyRequest, MobileIdReadRequest, PcoInfo, PinData, PlmnSearchStopRequest,
-        ResponseDecodeError, ResultResponseKind, UiccPinCommandRequest,
+        EmptyRequest, MobileIdReadRequest, PcoInfo, PinData, PlmnSearchExtRequest,
+        PlmnSearchRequest, PlmnSearchStopRequest, ResponseDecodeError, ResultResponseKind,
+        UiccPinCommandRequest,
     };
     use gct_transport::HciIo;
 
@@ -950,6 +960,18 @@ mod tests {
     }
 
     #[test]
+    fn dormant_ext_search_response_is_not_promoted_without_live_product_wiring() {
+        let packet = Packet {
+            header: Header {
+                command: recovered_opcode::PLMN_SEARCH_RESPONSE_EXT_DORMANT,
+                payload_len: 0,
+            },
+            payload: &[],
+        };
+        assert_eq!(decode_event(packet), Ok(ModemEvent::Unknown(packet)));
+    }
+
+    #[test]
     fn extended_attach_response_matches_family_key() {
         let payload = [
             0, 1, 0, 2, 0x12, 0x34, 0x56, 0x78, 9, 10, 1, 2, 3, 4, 5, 0x20, 1, 7, 0x57, 0, 0x58, 0,
@@ -991,6 +1013,46 @@ mod tests {
             vec![
                 0x33, 0x23, 0x00, 0x05, 4, b'A', b'T', b'I', b'\n', 0x31, 0x27, 0x00, 0x01, 2,
             ]
+        );
+    }
+
+    #[test]
+    fn extended_plmn_search_shares_normal_search_family_key() {
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut pending = PendingRequests::new();
+        let request = PlmnSearchExtRequest {
+            selection_mode: 0,
+            operation_mode: 0,
+            mcc: [0; 3],
+            mnc: [0; 3],
+            roaming_option: 2,
+            list_count: 0,
+            list_data: &[],
+            power_scan: false,
+        };
+        assert!(matches!(
+            modem.send_tracked_command(&mut pending, ModemCommand::PlmnSearchExt(request)),
+            Ok(8)
+        ));
+        assert!(pending.contains(ResponseKey::PlmnSearch));
+
+        let normal = PlmnSearchRequest {
+            search_mode: 0,
+            mcc: [0; 3],
+            mnc: [0; 3],
+            emergency_mode: 0,
+            roaming_option: 0,
+        };
+        assert!(matches!(
+            modem.send_tracked_command(&mut pending, ModemCommand::PlmnSearch(normal)),
+            Err(SendTrackedCommandError::Pending(
+                PendingError::AlreadyPending(ResponseKey::PlmnSearch)
+            ))
+        ));
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![0x31, 0x5a, 0x00, 0x04, 0x00, 0x00, 0x63, 0x02]
         );
     }
 

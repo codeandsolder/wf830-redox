@@ -458,6 +458,42 @@ callback 64 only to clients registered in that slot. Tests cover exact local and
 modem wire bytes, malformed request length before I/O, callback materialization,
 subscription gating, search-type correlation, and pending release.
 
+## PLMN Search EXT — live P4 request path and response-wiring anomaly
+
+Live P4 `LTED_PLMNSearchExtRequest` uses stock SDK command **42** and copies the
+full **1,292-byte** `_PLMN_SEARCH_EXT_REQ_PARAM` into the daemon request. B014
+DWARF fixes the object layout as `selection_mode@0`, `operation_mode@1`,
+`MCC[3]@2`, `MNC[3]@5`, `roaming_option@8`, `list_num@9`, `list_len@10`,
+`list_data[255]@11`, `reserved[1020]@266`, `fastScanOption@1286`, `eci[4]@1287`,
+and `pwrScanOption@1291`.
+
+Live `LAPI_PLMNSearchExtRequest` emits HCI **`0x315a`**. The 1,292-byte legacy
+container is not copied wholesale: the modem payload begins with selection and
+operation mode, then uses compact tags. Selection modes 0/2 emit `0x63 |
+roaming_option`; other modes emit `0x64 | packed_plmn[3]`. A non-empty scan list
+is `0x65 | list_len | list_data`; list elements are `type:u8 | count:u8 | data`
+with proven types 2 = EARFCN list, 3 = band-byte list, 4 = EARFCN start/end
+pairs. Every shipped P4 operator profile sets `<earfcn_ext>1</earfcn_ext>`, so
+types 2/4 use the 32-bit EARFCN representation unchanged. `fastScanOption`, ECI
+and the 1,020 reserved bytes are not read by the live serializer.
+`pwrScanOption == 1` appends `0x66 | 1`. Rust validates that the declared element
+count exactly consumes the bounded `list_len` region before touching GLIF.
+
+The response side has a vendor-generation anomaly that must not be normalized by
+guesswork. `libltesdk.so` contains a distinct **`0xb15b`** EXT-response decoder
+and an internal response slot 10 / historical callback 43 path, but live P4
+`lted::ind_regist` never registers SDK slot 10, and every recovered connection
+manager subscribes to normal PLMN-search response slot 9 instead.
+`LAPI_RegisterCallbackResponse` stores callback IDs verbatim, so there is no
+hidden alias. With no recovered packet capture proving `0xb15b` is used by the
+shipping product, Rust keeps `0xb15b` explicitly **dormant/unhandled** and gives
+command 42 the same conservative `ResponseKey::PlmnSearch` as command 40. The
+live product's executable completion path is therefore the already-proven
+`0xb10a` -> stock callback **41 / `cb_rsp[9]`** path. Tests lock both decisions:
+exact `0x315a` request bytes and dead-field behavior, malformed-list rejection
+before GLIF, normal/EXT family collision, callback-41 completion, and continued
+`Unknown` treatment of dormant `0xb15b`.
+
 ## PLMN search/list wire grammar — live P4 confirmed
 
 B014 DWARF names `_PLMN_SEARCH_REQ_PARAM` as a nine-byte host structure

@@ -141,6 +141,7 @@ pub enum SdkCommand {
     PdnConnectExt = 34,
     PdnDisconnect = 36,
     PlmnSearch = 40,
+    PlmnSearchExt = 42,
     PlmnList = 44,
     Online = 58,
     Offline = 60,
@@ -165,6 +166,7 @@ impl TryFrom<u16> for SdkCommand {
             34 => Ok(Self::PdnConnectExt),
             36 => Ok(Self::PdnDisconnect),
             40 => Ok(Self::PlmnSearch),
+            42 => Ok(Self::PlmnSearchExt),
             44 => Ok(Self::PlmnList),
             58 => Ok(Self::Online),
             60 => Ok(Self::Offline),
@@ -575,6 +577,7 @@ mod tests {
     #[test]
     fn critical_sdk_commands_match_stock_wrapper_wire_values() {
         assert_eq!(SdkCommand::try_from(25), Ok(SdkCommand::Attach));
+        assert_eq!(SdkCommand::try_from(42), Ok(SdkCommand::PlmnSearchExt));
         assert_eq!(SdkCommand::try_from(67), Ok(SdkCommand::PsInit));
         assert_eq!(SdkCommand::try_from(76), Ok(SdkCommand::MobileIdRead));
         assert_eq!(SdkCommand::try_from(125), Ok(SdkCommand::AtCommand));

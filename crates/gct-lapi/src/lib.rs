@@ -1830,6 +1830,176 @@ impl PlmnSearchRequest {
     }
 }
 
+/// Live-P4 extended PLMN-search request (`0x315a`).
+///
+/// The historical stock object is 1,292 bytes, but the P4 SDK serializes only
+/// the fields represented here. Shipped P4 profiles set `earfcn_ext=1`, so
+/// list element types 2/4 carry 32-bit EARFCNs unchanged on the modem wire.
+/// `fastScanOption`, ECI and the 1,020-byte reserved area are not read by the
+/// live serializer and deliberately do not exist in this clean representation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlmnSearchExtRequest<'a> {
+    pub selection_mode: u8,
+    pub operation_mode: u8,
+    pub mcc: [u8; 3],
+    pub mnc: [u8; 3],
+    pub roaming_option: u8,
+    pub list_count: u8,
+    pub list_data: &'a [u8],
+    pub power_scan: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlmnSearchExtEncodeError {
+    ListTooLong {
+        maximum: usize,
+        actual: usize,
+    },
+    TruncatedElementHeader {
+        index: usize,
+        remaining: usize,
+    },
+    UnsupportedElementType {
+        index: usize,
+        kind: u8,
+    },
+    TruncatedElement {
+        index: usize,
+        kind: u8,
+        expected: usize,
+        remaining: usize,
+    },
+    ListLengthMismatch {
+        declared: usize,
+        consumed: usize,
+    },
+    Hci(EncodeError),
+}
+
+impl From<EncodeError> for PlmnSearchExtEncodeError {
+    fn from(value: EncodeError) -> Self {
+        Self::Hci(value)
+    }
+}
+
+impl PlmnSearchExtRequest<'_> {
+    fn validated_list_len(self) -> Result<usize, PlmnSearchExtEncodeError> {
+        if self.list_count == 0 {
+            return Ok(0);
+        }
+        if self.list_data.len() > 255 {
+            return Err(PlmnSearchExtEncodeError::ListTooLong {
+                maximum: 255,
+                actual: self.list_data.len(),
+            });
+        }
+        let mut offset = 0_usize;
+        for index in 0..usize::from(self.list_count) {
+            let remaining = self.list_data.len().saturating_sub(offset);
+            if remaining < 2 {
+                return Err(PlmnSearchExtEncodeError::TruncatedElementHeader { index, remaining });
+            }
+            let kind = self.list_data[offset];
+            let count = usize::from(self.list_data[offset + 1]);
+            let item_width = match kind {
+                2 => 4_usize, // 32-bit EARFCN (P4 earfcn_ext=1)
+                3 => 1_usize, // band byte
+                4 => 8_usize, // start/end 32-bit EARFCN pair
+                _ => {
+                    return Err(PlmnSearchExtEncodeError::UnsupportedElementType { index, kind });
+                }
+            };
+            let body_len = count.checked_mul(item_width).ok_or(
+                PlmnSearchExtEncodeError::TruncatedElement {
+                    index,
+                    kind,
+                    expected: usize::MAX,
+                    remaining: remaining.saturating_sub(2),
+                },
+            )?;
+            let element_len = 2_usize.checked_add(body_len).ok_or(
+                PlmnSearchExtEncodeError::TruncatedElement {
+                    index,
+                    kind,
+                    expected: usize::MAX,
+                    remaining,
+                },
+            )?;
+            if element_len > remaining {
+                return Err(PlmnSearchExtEncodeError::TruncatedElement {
+                    index,
+                    kind,
+                    expected: element_len,
+                    remaining,
+                });
+            }
+            offset += element_len;
+        }
+        if offset != self.list_data.len() {
+            return Err(PlmnSearchExtEncodeError::ListLengthMismatch {
+                declared: self.list_data.len(),
+                consumed: offset,
+            });
+        }
+        Ok(offset)
+    }
+
+    /// Encode exactly the fields read by live P4 `LAPI_PLMNSearchExtRequest`.
+    ///
+    /// Payload grammar is `selection_mode | operation_mode`, followed by
+    /// `0x63 | roaming` for selection modes 0/2 or `0x64 | packed_plmn[3]`
+    /// otherwise. A non-empty scan list is `0x65 | len | list_data`, and
+    /// `power_scan` appends `0x66 | 1`.
+    ///
+    /// # Errors
+    /// Returns [`PlmnSearchExtEncodeError`] for a malformed fixed-list grammar
+    /// or insufficient destination space.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, PlmnSearchExtEncodeError> {
+        let list_len = self.validated_list_len()?;
+        let mut payload = [0_u8; 265];
+        let mut used = 0_usize;
+        payload[used] = self.selection_mode;
+        payload[used + 1] = self.operation_mode;
+        used += 2;
+
+        if matches!(self.selection_mode, 0 | 2) {
+            payload[used] = 0x63;
+            payload[used + 1] = self.roaming_option;
+            used += 2;
+        } else {
+            payload[used] = 0x64;
+            payload[used + 1] = (self.mcc[1] << 4) | self.mcc[0];
+            payload[used + 2] = (self.mnc[2] << 4) | self.mcc[2];
+            payload[used + 3] = (self.mnc[1] << 4) | self.mnc[0];
+            used += 4;
+        }
+
+        if self.list_count != 0 {
+            let list_len_u8 =
+                u8::try_from(list_len).map_err(|_| PlmnSearchExtEncodeError::ListTooLong {
+                    maximum: 255,
+                    actual: list_len,
+                })?;
+            payload[used] = 0x65;
+            payload[used + 1] = list_len_u8;
+            payload[used + 2..used + 2 + list_len].copy_from_slice(self.list_data);
+            used += 2 + list_len;
+        }
+
+        if self.power_scan {
+            payload[used] = 0x66;
+            payload[used + 1] = 1;
+            used += 2;
+        }
+
+        Ok(encode_packet(
+            recovered_opcode::PLMN_SEARCH_REQUEST_EXT,
+            &payload[..used],
+            output,
+        )?)
+    }
+}
+
 /// Mobile-ID read request carried by the shared `0x3145` read-info command.
 ///
 /// Live P4 `LAPI_MobileIDReadRequest` emits a five-byte payload containing two
@@ -4817,6 +4987,84 @@ mod tests {
         assert_eq!(
             manual.encode(&mut short),
             Err(gct_hci::EncodeError::NoSpace)
+        );
+    }
+
+    #[test]
+    fn plmn_search_ext_matches_live_p4_no_list_and_extended_earfcn_list() {
+        let mut wire = [0_u8; 300];
+        let no_list = super::PlmnSearchExtRequest {
+            selection_mode: 0,
+            operation_mode: 0,
+            mcc: [0; 3],
+            mnc: [0; 3],
+            roaming_option: 2,
+            list_count: 0,
+            list_data: &[],
+            power_scan: false,
+        };
+        assert_eq!(no_list.encode(&mut wire), Ok(8));
+        assert_eq!(
+            &wire[..8],
+            &[0x31, 0x5a, 0x00, 0x04, 0x00, 0x00, 0x63, 0x02]
+        );
+
+        let list = [
+            2, 2, 0x00, 0x00, 0x0a, 0x28, 0x00, 0x00, 0x09, 0xc4, 3, 2, 3, 5, 4, 1, 0x00, 0x00,
+            0x09, 0xc4, 0x00, 0x00, 0x0a, 0x28,
+        ];
+        let manual = super::PlmnSearchExtRequest {
+            selection_mode: 1,
+            operation_mode: 1,
+            mcc: [2, 6, 0],
+            mnc: [0, 1, 0x0f],
+            roaming_option: 9,
+            list_count: 3,
+            list_data: &list,
+            power_scan: true,
+        };
+        assert_eq!(manual.encode(&mut wire), Ok(38));
+        assert_eq!(
+            &wire[..10],
+            &[0x31, 0x5a, 0x00, 0x22, 0x01, 0x01, 0x64, 0x62, 0xf0, 0x10]
+        );
+        assert_eq!(&wire[10..12], &[0x65, 24]);
+        assert_eq!(&wire[12..36], &list);
+        assert_eq!(&wire[36..38], &[0x66, 1]);
+    }
+
+    #[test]
+    fn plmn_search_ext_rejects_malformed_fixed_scan_lists() {
+        let mut wire = [0_u8; 300];
+        let bad_type = [9, 0];
+        let request = super::PlmnSearchExtRequest {
+            selection_mode: 0,
+            operation_mode: 0,
+            mcc: [0; 3],
+            mnc: [0; 3],
+            roaming_option: 0,
+            list_count: 1,
+            list_data: &bad_type,
+            power_scan: false,
+        };
+        assert_eq!(
+            request.encode(&mut wire),
+            Err(super::PlmnSearchExtEncodeError::UnsupportedElementType { index: 0, kind: 9 })
+        );
+
+        let truncated = [2, 1, 0, 0, 0];
+        let request = super::PlmnSearchExtRequest {
+            list_data: &truncated,
+            ..request
+        };
+        assert_eq!(
+            request.encode(&mut wire),
+            Err(super::PlmnSearchExtEncodeError::TruncatedElement {
+                index: 0,
+                kind: 2,
+                expected: 6,
+                remaining: 5,
+            })
         );
     }
 

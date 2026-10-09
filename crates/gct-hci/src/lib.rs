@@ -339,6 +339,8 @@ pub mod recovered_opcode {
     pub const PDN_CONNECT_REQUEST_EXT: u16 = 0x3167;
     pub const PDN_DISCONNECT_REQUEST: u16 = 0x3107;
     pub const PLMN_SEARCH_REQUEST: u16 = 0x3109;
+    /// Live-P4 extended PLMN-search request.
+    pub const PLMN_SEARCH_REQUEST_EXT: u16 = 0x315a;
     pub const PLMN_LIST_REQUEST: u16 = 0x310b;
     pub const PLMN_SEARCH_STOP_REQUEST: u16 = 0x3127;
     pub const ONLINE_REQUEST: u16 = 0x3121;
@@ -360,6 +362,8 @@ pub mod recovered_opcode {
     pub const PDN_CONNECT_RESPONSE_EXT: u16 = 0xb168;
     pub const PDN_DISCONNECT_RESPONSE: u16 = 0xb108;
     pub const PLMN_SEARCH_RESPONSE: u16 = 0xb10a;
+    /// SDK-supported EXT response; shipped P4 lted never registers its slot.
+    pub const PLMN_SEARCH_RESPONSE_EXT_DORMANT: u16 = 0xb15b;
     pub const PLMN_LIST_RESPONSE: u16 = 0xb10c;
     pub const PLMN_SEARCH_STOP_RESPONSE: u16 = 0xb128;
     pub const ONLINE_RESPONSE: u16 = 0xb122;

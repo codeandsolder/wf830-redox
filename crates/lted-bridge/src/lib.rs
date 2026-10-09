@@ -16,10 +16,11 @@ use gct_lapi::{
     PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse, PdnConnectTailDecodeError,
     PdnConnectTailField, PdnConnectionControl, PdnDisconnectField, PdnDisconnectFieldDecodeError,
     PdnDisconnectRequest, PdnDisconnectResponse, PdnInfoContainers, PdnInfoField,
-    PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse, PlmnSearchRequest,
-    PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse, Positioning, QosField,
-    ResultResponse, ResultResponseKind, UiccFixedRequest, UiccPinStatusRequest,
-    UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse, UiccStatusRequest, uicc_control,
+    PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse, PlmnSearchExtRequest,
+    PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
+    Positioning, QosField, ResultResponse, ResultResponseKind, UiccFixedRequest,
+    UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse,
+    UiccStatusRequest, uicc_control,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -2225,6 +2226,7 @@ impl DeviceBridge {
                 Ok(SdkCommand::PdnConnectExt) => self.dispatch_pdn_connect_ext(modem, request),
                 Ok(SdkCommand::PdnDisconnect) => self.dispatch_pdn_disconnect(modem, request),
                 Ok(SdkCommand::PlmnSearch) => self.dispatch_plmn_search(modem, request),
+                Ok(SdkCommand::PlmnSearchExt) => self.dispatch_plmn_search_ext(modem, request),
                 Ok(SdkCommand::PlmnSearchStop) => self.dispatch_plmn_search_stop(modem, request),
                 Ok(SdkCommand::MobileIdRead) => self.dispatch_mobile_id_read(modem, request),
                 Ok(SdkCommand::AtCommand) => Self::dispatch_at(modem, request),
@@ -2434,6 +2436,48 @@ impl DeviceBridge {
         )?;
         Ok(HandledCall {
             command: SdkCommand::PlmnSearchStop,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_plmn_search_ext<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        const STOCK_LEN: usize = 1_292;
+        let params: &[u8; STOCK_LEN] =
+            request
+                .params
+                .try_into()
+                .map_err(|_| HandleError::UnexpectedParameters {
+                    command: request.command,
+                    expected: STOCK_LEN,
+                    actual: request.params.len(),
+                })?;
+
+        let list_count = params[9];
+        let list_len = usize::from(params[10]);
+        let list_data = if list_count == 0 {
+            &[][..]
+        } else {
+            &params[11..11 + list_len]
+        };
+        let search = PlmnSearchExtRequest {
+            selection_mode: params[0],
+            operation_mode: params[1],
+            mcc: [params[2], params[3], params[4]],
+            mnc: [params[5], params[6], params[7]],
+            roaming_option: params[8],
+            list_count,
+            list_data,
+            power_scan: params[1_291] == 1,
+        };
+        let bytes_written =
+            modem.send_tracked_command(&mut self.pending, ModemCommand::PlmnSearchExt(search))?;
+        Ok(HandledCall {
+            command: SdkCommand::PlmnSearchExt,
             device_id: request.device_id,
             bytes_written,
         })
@@ -4775,6 +4819,144 @@ mod tests {
             std::process::abort();
         };
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn stock_plmn_search_ext_matches_live_p4_hci_and_ignores_dead_fields() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let mut params = [0_u8; 1_292];
+        params[0] = 1;
+        params[1] = 1;
+        params[2..5].copy_from_slice(&[2, 6, 0]);
+        params[5..8].copy_from_slice(&[0, 1, 0x0f]);
+        params[8] = 9;
+        let list = [
+            2, 2, 0x00, 0x00, 0x0a, 0x28, 0x00, 0x00, 0x09, 0xc4, 3, 2, 3, 5, 4, 1, 0x00, 0x00,
+            0x09, 0xc4, 0x00, 0x00, 0x0a, 0x28,
+        ];
+        params[9] = 3;
+        params[10] = 24;
+        params[11..35].copy_from_slice(&list);
+        params[1_286] = 0xfe;
+        params[1_287..1_291].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        params[1_291] = 1;
+
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::PlmnSearchExt as u16,
+                    device_id: 1,
+                    params: &params,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.bytes_written, 38);
+        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            [
+                0x31, 0x5a, 0x00, 0x22, 0x01, 0x01, 0x64, 0x62, 0xf0, 0x10, 0x65, 24, 2, 2, 0x00,
+                0x00, 0x0a, 0x28, 0x00, 0x00, 0x09, 0xc4, 3, 2, 3, 5, 4, 1, 0x00, 0x00, 0x09, 0xc4,
+                0x00, 0x00, 0x0a, 0x28, 0x66, 1,
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_stock_plmn_search_ext_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let mut params = [0_u8; 1_292];
+        params[9] = 1;
+        params[10] = 5;
+        params[11..16].copy_from_slice(&[2, 1, 0, 0, 0]);
+
+        assert!(
+            bridge
+                .handle_sdk_api(
+                    &mut server,
+                    &mut modem,
+                    id,
+                    SdkApiRequest {
+                        command: SdkCommand::PlmnSearchExt as u16,
+                        device_id: 1,
+                        params: &params,
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn ext_plmn_search_completes_through_live_product_callback_41_path() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, id) = open_client(&mut server, &dir, 0);
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::PlmnSearch.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let params = [0_u8; 1_292];
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::PlmnSearchExt as u16,
+                    device_id: 1,
+                    params: &params,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.pending_count(), 1);
+
+        let mut payload = [0_u8; 27];
+        payload[..4].copy_from_slice(&1_u32.to_be_bytes());
+        let mut hci = Vec::with_capacity(31);
+        hci.extend_from_slice(&[0xb1, 0x0a, 0x00, 0x1b]);
+        hci.extend_from_slice(&payload);
+        assert_eq!(
+            route_one_hci(&mut bridge, &mut server, hci),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 512];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(len, 12 + 436);
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 41);
+        assert_eq!(&callback.data[..4], &1_u32.to_be_bytes());
     }
 
     #[test]
