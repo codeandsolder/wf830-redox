@@ -9,15 +9,15 @@
 use std::{io, io::Write};
 
 use gct_lapi::{
-    ApnType, AttachExtProfile, AttachExtRequest, AttachExtResponse, AttachRequest, AttachResponse,
-    AttachTailDecodeError, AttachTailField, DetachRequest, DetachResponse,
-    EmergencyNumberDecodeError, EmptyRequest, PcoInfo, PdnConnectExtRequest, PdnConnectExtResponse,
-    PdnConnectRequest, PdnConnectResponse, PdnConnectTailDecodeError, PdnConnectTailField,
-    PdnConnectionControl, PdnDisconnectField, PdnDisconnectFieldDecodeError, PdnDisconnectRequest,
-    PdnDisconnectResponse, PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError,
-    PlmnInfoDecodeError, PlmnListResponse, PlmnSearchRequest, PlmnSearchResponse,
-    PlmnSearchStopRequest, PlmnSearchStopResponse, Positioning, QosField, ResultResponse,
-    ResultResponseKind,
+    ApnType, AtCommand, AtCommandExt, AttachExtProfile, AttachExtRequest, AttachExtResponse,
+    AttachRequest, AttachResponse, AttachTailDecodeError, AttachTailField, DetachRequest,
+    DetachResponse, EmergencyNumberDecodeError, EmptyRequest, PcoInfo, PdnConnectExtRequest,
+    PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse, PdnConnectTailDecodeError,
+    PdnConnectTailField, PdnConnectionControl, PdnDisconnectField, PdnDisconnectFieldDecodeError,
+    PdnDisconnectRequest, PdnDisconnectResponse, PdnInfoContainers, PdnInfoField,
+    PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse, PlmnSearchRequest,
+    PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse, Positioning, QosField,
+    ResultResponse, ResultResponseKind,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -1378,6 +1378,96 @@ pub struct BroadcastReport {
     pub sent_clients: usize,
 }
 
+fn broadcast_variable_callback(
+    server: &mut Server,
+    device_id: u32,
+    callback_kind: SdkCallbackKind,
+    data: &[u8],
+) -> Result<BroadcastReport, HandleError> {
+    let total = 12_usize.checked_add(data.len()).ok_or_else(|| {
+        HandleError::Ipc(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stock callback length overflow",
+        ))
+    })?;
+    let mut frame = vec![0_u8; total];
+    let frame_len = SdkCallback {
+        callback_id: callback_kind.callback_id(),
+        device_id,
+        data,
+    }
+    .encode(&mut frame)
+    .map_err(|_| {
+        HandleError::Ipc(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stock callback exceeds recovered 16-bit local envelope",
+        ))
+    })?;
+
+    let mut report = BroadcastReport::default();
+    for client_id in server.client_ids() {
+        let registered = server
+            .client_context(client_id)?
+            .read_u32_be(callback_kind.registration_offset())?
+            != 0;
+        if !registered {
+            continue;
+        }
+        report.registered_clients += 1;
+        server.send_to_client(client_id, &frame[..frame_len])?;
+        report.sent_clients += 1;
+    }
+    Ok(report)
+}
+
+/// Broadcast callback 126 (`AT_COMMAND_FROM_DEVICE`) as raw command bytes.
+///
+/// The live stock client reconstructs its historical `{cmd pointer, length}`
+/// object locally from this variable callback payload, so no pointer-bearing C
+/// layout crosses the daemon boundary.
+///
+/// # Errors
+/// Returns [`HandleError::Ipc`] for an unrepresentable callback length or an
+/// IPC/socket failure.
+pub fn broadcast_at_callback(
+    server: &mut Server,
+    device_id: u32,
+    command: &[u8],
+) -> Result<BroadcastReport, HandleError> {
+    broadcast_variable_callback(
+        server,
+        device_id,
+        SdkCallbackKind::AtCommandFromDevice,
+        command,
+    )
+}
+
+/// Broadcast callback 128 (`AT_COMMAND_FROM_DEVICE_EXT`) as
+/// `[channel, command...]`.
+///
+/// The stock client converts that local payload back into its historical
+/// `{channel, cmd pointer, length}` view before invoking the registered callback.
+///
+/// # Errors
+/// Returns [`HandleError::Ipc`] for an unrepresentable callback length or an
+/// IPC/socket failure.
+pub fn broadcast_at_ext_callback(
+    server: &mut Server,
+    device_id: u32,
+    channel: u8,
+    command: &[u8],
+) -> Result<BroadcastReport, HandleError> {
+    let mut data = Vec::with_capacity(1 + command.len());
+    data.push(channel);
+    data.extend_from_slice(command);
+    broadcast_variable_callback(
+        server,
+        device_id,
+        SdkCallbackKind::AtCommandFromDeviceExt,
+        &data,
+    )
+}
+
 /// Broadcast one of the three proven four-byte result callbacks to every stock
 /// client that has the corresponding `cb_rsp[]` function slot registered.
 ///
@@ -1755,6 +1845,8 @@ impl DeviceBridge {
                 Ok(SdkCommand::PdnDisconnect) => self.dispatch_pdn_disconnect(modem, request),
                 Ok(SdkCommand::PlmnSearch) => self.dispatch_plmn_search(modem, request),
                 Ok(SdkCommand::PlmnSearchStop) => self.dispatch_plmn_search_stop(modem, request),
+                Ok(SdkCommand::AtCommand) => Self::dispatch_at(modem, request),
+                Ok(SdkCommand::AtCommandExt) => Self::dispatch_at_ext(modem, request),
                 Ok(_) => self.dispatch_zero_parameter(modem, request),
                 Err(_) => Err(HandleError::UnsupportedCommand(request.command)),
             }
@@ -1828,6 +1920,16 @@ impl DeviceBridge {
                 }
                 broadcast_pdn_disconnect_callback(server, self.device_id, *response).map(Some)
             }
+            ModemEvent::At(response) => {
+                broadcast_at_callback(server, self.device_id, response.command).map(Some)
+            }
+            ModemEvent::AtExt(response) => broadcast_at_ext_callback(
+                server,
+                self.device_id,
+                response.channel,
+                response.command,
+            )
+            .map(Some),
             ModemEvent::Result { kind, response } => {
                 let key = ResponseKey::Result(*kind);
                 if !self.pending.remove(key) {
@@ -2053,6 +2155,38 @@ impl DeviceBridge {
             modem.send_tracked_command(&mut self.pending, ModemCommand::Attach(attach))?;
         Ok(HandledCall {
             command: SdkCommand::Attach,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_at<T: Write>(
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let bytes_written = modem.send_command(ModemCommand::At(AtCommand::new(request.params)))?;
+        Ok(HandledCall {
+            command: SdkCommand::AtCommand,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_at_ext<T: Write>(
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let Some((&channel, command)) = request.params.split_first() else {
+            return Err(HandleError::UnexpectedParameters {
+                command: request.command,
+                expected: 1,
+                actual: 0,
+            });
+        };
+        let bytes_written =
+            modem.send_command(ModemCommand::AtExt(AtCommandExt::new(channel, command)))?;
+        Ok(HandledCall {
+            command: SdkCommand::AtCommandExt,
             device_id: request.device_id,
             bytes_written,
         })
@@ -3238,6 +3372,173 @@ mod tests {
         assert_eq!(&data[0x278..0x27d], &[1, 3, 0x11, 0x22, 0x33]);
         assert_eq!(&data[0x2de..0x2e2], &100_u32.to_be_bytes());
         assert_eq!(&data[0x2e2..0x2e6], &200_u32.to_be_bytes());
+
+        unsubscribed
+            .set_nonblocking(true)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut no_frame = [0_u8; 1];
+        let Err(error) = unsubscribed.recv(&mut no_frame) else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn stock_at_requests_match_exact_live_p4_local_and_hci_shapes() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        let normal = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::AtCommand as u16,
+                    device_id: 1,
+                    params: b"ATI",
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(normal.command, SdkCommand::AtCommand);
+        assert_eq!(normal.bytes_written, 8);
+        assert_eq!(bridge.pending_count(), 0);
+
+        let extended = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::AtCommandExt as u16,
+                    device_id: 1,
+                    params: &[7, b'A', b'T', b'I'],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(extended.command, SdkCommand::AtCommandExt);
+        assert_eq!(extended.bytes_written, 9);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(read_api_ret(&mut server, id), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            [
+                0x33, 0x07, 0x00, 0x04, b'A', b'T', b'I', b'\n', 0x33, 0x23, 0x00, 0x05, 7, b'A',
+                b'T', b'I', b'\n',
+            ]
+        );
+    }
+
+    #[test]
+    fn stock_extended_at_requires_only_the_channel_prefix() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::AtCommandExt as u16,
+                    device_id: 1,
+                    params: &[],
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                command,
+                expected: 1,
+                actual: 0,
+            }) if command == SdkCommand::AtCommandExt as u16
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn at_indications_broadcast_exact_variable_payloads_without_pending_state() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, subscribed_id) = open_client(&mut server, &dir, 0);
+        let (unsubscribed, _unsubscribed_id) = open_client(&mut server, &dir, 1);
+        let context = server
+            .client_context(subscribed_id)
+            .unwrap_or_else(|_| std::process::abort());
+        context
+            .write_u32_be(
+                SdkCallbackKind::AtCommandFromDevice.registration_offset(),
+                1,
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        context
+            .write_u32_be(
+                SdkCallbackKind::AtCommandFromDeviceExt.registration_offset(),
+                1,
+            )
+            .unwrap_or_else(|_| std::process::abort());
+
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        assert_eq!(bridge.pending_count(), 0);
+
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                [
+                    0xb3, 0x08, 0x00, 0x06, b'\r', b'\n', b'O', b'K', b'\r', b'\n'
+                ]
+                .to_vec(),
+            ),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                [0xb3, 0x24, 0x00, 0x03, 7, b'O', b'K'].to_vec(),
+            ),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 64];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 126);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(callback.data, b"\r\nOK\r\n");
+
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 128);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(callback.data, &[7, b'O', b'K']);
 
         unsubscribed
             .set_nonblocking(true)

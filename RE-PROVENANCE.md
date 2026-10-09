@@ -915,7 +915,7 @@ exact 700-byte stock image. End-to-end tests verify callback 28 routing, the
 legacy offsets above, subscription gating, and release of the family-level
 pending key.
 
-## Extended AT and PLMN-search-stop
+## AT command families and PLMN-search-stop
 
 Two request families previously omitted from the typed runtime now have direct
 live-P4 evidence rather than opcode inference.
@@ -929,6 +929,33 @@ live-P4 evidence rather than opcode inference.
 bytes after it and appends `0x0a`. `AtCommandExt` models precisely
 `[channel, command..., LF]` without preserving the unaligned pointer-bearing C
 object.
+
+The stock `liblted.so` IPC wrappers deliberately flatten those pointer-bearing
+objects before crossing the daemon boundary. Live P4 `LTED_ATCommandToDevice`
+at `0xe198` reads the `AT_COMMAND_DATA.length` word at offset 4, emits SDK
+command **125**, and copies exactly `length` bytes from the caller's command
+pointer as the complete local request parameters. `LTED_ATCommandToDeviceEXT`
+at `0xe3d0` reads the extended length at offset 5, emits SDK command **127**,
+copies the channel byte first, then exactly `length` pointed-to command bytes.
+The Rust bridge therefore accepts command 125 as raw AT bytes and command 127
+as `[channel, raw AT bytes...]`; no process-local pointer value or redundant
+length field is reproduced. Both paths remain deliberately untracked because
+the modem's AT receive stream has no request identity.
+
+The reverse path is equally pointer-free on the daemon wire. Live P4
+`ind_at_command_from_device` at `0x274bc` emits callback **126** with the raw
+`0xb308` payload. The stock client's callback-126 case at `0x6d20` derives the
+length from the local envelope, rebuilds `{cmd pointer, length}` on its own
+stack, and invokes `cb_rsp[60]` (function registration offset `0x1e4`, user at
+`0x1e8`). `ind_at_command_from_device_ext` at `0x275b0` emits callback **128**
+as one channel byte followed by the raw `0xb324` command bytes; the stock
+callback-128 case at `0x6d8c` reconstructs `{channel, cmd pointer, length}` and
+invokes `cb_rsp[61]` (registration offset `0x1ec`, user at `0x1f0`).
+
+Bridge tests verify exact command-125/127 local shapes, exact `0x3307`/`0x3323`
+HCI bytes including the SDK-added LF, callback 126/128 payloads and subscription
+slots, and that unsolicited AT receive events do not create or consume pending
+request state.
 
 `LAPI_PLMNSearchStopRequest` is exported at live P4 `0x495d4` (B014
 `0x46344`). It allocates five bytes, writes HCI `0x3127` with payload length

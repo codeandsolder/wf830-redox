@@ -33,6 +33,8 @@ pub enum SdkCallbackKind {
     Online,
     Offline,
     PsInit,
+    AtCommandFromDevice,
+    AtCommandFromDeviceExt,
 }
 
 impl SdkCallbackKind {
@@ -51,6 +53,8 @@ impl SdkCallbackKind {
             Self::Online => 59,
             Self::Offline => 62,
             Self::PsInit => 68,
+            Self::AtCommandFromDevice => 126,
+            Self::AtCommandFromDeviceExt => 128,
         }
     }
 
@@ -69,6 +73,8 @@ impl SdkCallbackKind {
             Self::Online => 18,
             Self::Offline => 19,
             Self::PsInit => 22,
+            Self::AtCommandFromDevice => 60,
+            Self::AtCommandFromDeviceExt => 61,
         }
     }
 
@@ -725,6 +731,16 @@ mod tests {
         assert_eq!(SdkCallbackKind::Offline.registration_offset(), 0x9c);
         assert_eq!(SdkCallbackKind::PsInit.callback_id(), 68);
         assert_eq!(SdkCallbackKind::PsInit.registration_offset(), 0xb4);
+        assert_eq!(SdkCallbackKind::AtCommandFromDevice.callback_id(), 126);
+        assert_eq!(
+            SdkCallbackKind::AtCommandFromDevice.registration_offset(),
+            0x1e4
+        );
+        assert_eq!(SdkCallbackKind::AtCommandFromDeviceExt.callback_id(), 128);
+        assert_eq!(
+            SdkCallbackKind::AtCommandFromDeviceExt.registration_offset(),
+            0x1ec
+        );
     }
 
     #[test]
