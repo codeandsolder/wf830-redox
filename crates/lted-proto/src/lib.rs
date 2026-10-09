@@ -26,6 +26,7 @@ pub enum SdkCallbackKind {
     PdnConnect,
     PdnDisconnect,
     PlmnSearch,
+    PlmnSearchStop,
     PlmnList,
     Online,
     Offline,
@@ -41,6 +42,7 @@ impl SdkCallbackKind {
             Self::PdnConnect => 33,
             Self::PdnDisconnect => 37,
             Self::PlmnSearch => 41,
+            Self::PlmnSearchStop => 64,
             Self::PlmnList => 45,
             Self::Online => 59,
             Self::Offline => 62,
@@ -56,6 +58,7 @@ impl SdkCallbackKind {
             Self::PdnConnect => 6,
             Self::PdnDisconnect => 8,
             Self::PlmnSearch => 9,
+            Self::PlmnSearchStop => 20,
             Self::PlmnList => 11,
             Self::Online => 18,
             Self::Offline => 19,
@@ -702,6 +705,8 @@ mod tests {
         assert_eq!(SdkCallbackKind::PdnDisconnect.registration_offset(), 0x44);
         assert_eq!(SdkCallbackKind::PlmnSearch.callback_id(), 41);
         assert_eq!(SdkCallbackKind::PlmnSearch.registration_offset(), 0x4c);
+        assert_eq!(SdkCallbackKind::PlmnSearchStop.callback_id(), 64);
+        assert_eq!(SdkCallbackKind::PlmnSearchStop.registration_offset(), 0xa4);
         assert_eq!(SdkCallbackKind::PlmnList.callback_id(), 45);
         assert_eq!(SdkCallbackKind::PlmnList.registration_offset(), 0x5c);
         assert_eq!(SdkCallbackKind::Online.callback_id(), 59);

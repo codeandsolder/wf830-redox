@@ -409,6 +409,24 @@ clients registered in that slot. Tests cover the exact command-40-to-`0x3109`
 translation, malformed local length before modem I/O, all recovered callback
 regions, subscription gating, and pending release.
 
+### Stock PLMN-search-stop bridge ABI
+
+PLMN Search Stop is another exact small compatibility family. Live P4
+`LTED_PLMNSearchStopRequest` sends SDK command 63 with exactly one parameter
+byte. `LAPI_PLMNSearchStopRequest` copies that byte unchanged as `search_type`
+into the one-byte payload of HCI `0x3127`; the existing typed codec already
+tracks the response by that search type.
+
+B014 DWARF fixes `_PLMN_SEARCH_STOP_RSP_INFO` at five bytes:
+`search_type:u8@0 | result:u32@1`. Live P4 `ind_plmn_search_stop_response`
+sends those exact five bytes through callback ID 64. The live callback lookup
+maps ID 64 to `cb_rsp[20]`, registration offset `0xa4`. Rust now requires the
+exact one-byte local request, tracks `ResponseKey::PlmnSearchStop(search_type)`,
+parses modem `0xb128`, reconstructs the fixed response image, and broadcasts
+callback 64 only to clients registered in that slot. Tests cover exact local and
+modem wire bytes, malformed request length before I/O, callback materialization,
+subscription gating, search-type correlation, and pending release.
+
 ## PLMN search/list wire grammar — live P4 confirmed
 
 B014 DWARF names `_PLMN_SEARCH_REQ_PARAM` as a nine-byte host structure

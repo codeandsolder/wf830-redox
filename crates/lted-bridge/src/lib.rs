@@ -14,8 +14,8 @@ use gct_lapi::{
     PdnConnectResponse, PdnConnectTailDecodeError, PdnConnectTailField, PdnConnectionControl,
     PdnDisconnectField, PdnDisconnectFieldDecodeError, PdnDisconnectRequest, PdnDisconnectResponse,
     PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError,
-    PlmnListResponse, PlmnSearchRequest, PlmnSearchResponse, Positioning, QosField, ResultResponse,
-    ResultResponseKind,
+    PlmnListResponse, PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest,
+    PlmnSearchStopResponse, Positioning, QosField, ResultResponse, ResultResponseKind,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -1017,6 +1017,56 @@ pub fn broadcast_result_callback(
     Ok(report)
 }
 
+const STOCK_PLMN_SEARCH_STOP_CALLBACK_DATA_LEN: usize = 5;
+const STOCK_PLMN_SEARCH_STOP_CALLBACK_FRAME_LEN: usize =
+    12 + STOCK_PLMN_SEARCH_STOP_CALLBACK_DATA_LEN;
+
+/// Materialize and broadcast live-P4 stock callback 64 (`PLMNSearchStop`).
+///
+/// B014 DWARF fixes `_PLMN_SEARCH_STOP_RSP_INFO` at five bytes:
+/// `search_type:u8 | result:u32be`. Live P4 callback lookup maps ID 64 to
+/// `cb_rsp[20]`, registration offset `0xa4`.
+///
+/// # Errors
+/// Returns [`HandleError::Ipc`] for callback/shared-context/socket failures.
+pub fn broadcast_plmn_search_stop_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: PlmnSearchStopResponse,
+) -> Result<BroadcastReport, HandleError> {
+    let mut data = [0_u8; STOCK_PLMN_SEARCH_STOP_CALLBACK_DATA_LEN];
+    data[0] = response.search_type;
+    data[1..5].copy_from_slice(&response.result.to_be_bytes());
+    let callback_kind = SdkCallbackKind::PlmnSearchStop;
+    let mut frame = [0_u8; STOCK_PLMN_SEARCH_STOP_CALLBACK_FRAME_LEN];
+    let frame_len = SdkCallback {
+        callback_id: callback_kind.callback_id(),
+        device_id,
+        data: &data,
+    }
+    .encode(&mut frame)
+    .map_err(|_| {
+        HandleError::Ipc(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fixed-size PLMN-search-stop callback failed to encode",
+        ))
+    })?;
+    let mut report = BroadcastReport::default();
+    for client_id in server.client_ids() {
+        let registered = server
+            .client_context(client_id)?
+            .read_u32_be(callback_kind.registration_offset())?
+            != 0;
+        if !registered {
+            continue;
+        }
+        report.registered_clients += 1;
+        server.send_to_client(client_id, &frame[..frame_len])?;
+        report.sent_clients += 1;
+    }
+    Ok(report)
+}
+
 const STOCK_PLMN_SEARCH_CALLBACK_DATA_LEN: usize = 436;
 const STOCK_PLMN_SEARCH_CALLBACK_FRAME_LEN: usize = 12 + STOCK_PLMN_SEARCH_CALLBACK_DATA_LEN;
 const STOCK_PLMN_SEARCH_RECORDS_OFFSET: usize = 31;
@@ -1291,6 +1341,7 @@ impl DeviceBridge {
                 Ok(SdkCommand::PdnConnect) => self.dispatch_pdn_connect(modem, request),
                 Ok(SdkCommand::PdnDisconnect) => self.dispatch_pdn_disconnect(modem, request),
                 Ok(SdkCommand::PlmnSearch) => self.dispatch_plmn_search(modem, request),
+                Ok(SdkCommand::PlmnSearchStop) => self.dispatch_plmn_search_stop(modem, request),
                 Ok(_) => self.dispatch_zero_parameter(modem, request),
                 Err(_) => Err(HandleError::UnsupportedCommand(request.command)),
             }
@@ -1368,6 +1419,13 @@ impl DeviceBridge {
                 }
                 broadcast_result_callback(server, *kind, self.device_id, *response).map(Some)
             }
+            ModemEvent::PlmnSearchStop(response) => {
+                let key = ResponseKey::PlmnSearchStop(response.search_type);
+                if !self.pending.remove(key) {
+                    return Ok(None);
+                }
+                broadcast_plmn_search_stop_callback(server, self.device_id, *response).map(Some)
+            }
             ModemEvent::PlmnSearch(response) => {
                 if !self.pending.remove(ResponseKey::PlmnSearch) {
                     return Ok(None);
@@ -1403,6 +1461,31 @@ impl DeviceBridge {
             }
         }
         Err(HandleError::TransactionIdsExhausted)
+    }
+
+    fn dispatch_plmn_search_stop<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let [search_type]: [u8; 1] =
+            request
+                .params
+                .try_into()
+                .map_err(|_| HandleError::UnexpectedParameters {
+                    command: request.command,
+                    expected: 1,
+                    actual: request.params.len(),
+                })?;
+        let bytes_written = modem.send_tracked_command(
+            &mut self.pending,
+            ModemCommand::PlmnSearchStop(PlmnSearchStopRequest { search_type }),
+        )?;
+        Ok(HandledCall {
+            command: SdkCommand::PlmnSearchStop,
+            device_id: request.device_id,
+            bytes_written,
+        })
     }
 
     fn dispatch_plmn_search<T: Write>(
@@ -2510,6 +2593,130 @@ mod tests {
         assert_eq!(&data[0x278..0x27d], &[1, 3, 0x11, 0x22, 0x33]);
         assert_eq!(&data[0x2de..0x2e2], &100_u32.to_be_bytes());
         assert_eq!(&data[0x2e2..0x2e6], &200_u32.to_be_bytes());
+
+        unsubscribed
+            .set_nonblocking(true)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut no_frame = [0_u8; 1];
+        let Err(error) = unsubscribed.recv(&mut no_frame) else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn stock_plmn_search_stop_matches_live_p4_hci() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::PlmnSearchStop as u16,
+                    device_id: 1,
+                    params: &[3],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.bytes_written, 5);
+        assert_eq!(bridge.pending_count(), 1);
+        assert!(bridge.pending.contains(ResponseKey::PlmnSearchStop(3)));
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            [0x31, 0x27, 0x00, 0x01, 0x03]
+        );
+    }
+
+    #[test]
+    fn malformed_stock_plmn_search_stop_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::PlmnSearchStop as u16,
+                    device_id: 1,
+                    params: &[],
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                command: 63,
+                expected: 1,
+                actual: 0
+            })
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn plmn_search_stop_response_materializes_exact_stock_callback_and_subscription_gate() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, subscribed_id) = open_client(&mut server, &dir, 0);
+        let (unsubscribed, _unsubscribed_id) = open_client(&mut server, &dir, 1);
+        server
+            .client_context(subscribed_id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::PlmnSearchStop.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                subscribed_id,
+                SdkApiRequest {
+                    command: SdkCommand::PlmnSearchStop as u16,
+                    device_id: 0x1122_3344,
+                    params: &[3],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.pending_count(), 1);
+
+        let hci = vec![0xb1, 0x28, 0x00, 0x05, 0x03, 0x11, 0x22, 0x33, 0x44];
+        assert_eq!(
+            route_one_hci(&mut bridge, &mut server, hci),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 32];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(len, 17);
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 64);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(callback.data, &[0x03, 0x11, 0x22, 0x33, 0x44]);
 
         unsubscribed
             .set_nonblocking(true)
