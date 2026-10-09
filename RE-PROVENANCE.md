@@ -589,10 +589,13 @@ This replaces the OEM callback's fixed 2028-byte data array.
 Successful READ RECORD response (`type 2`) is an eleven-byte fixed subtype
 prefix followed by record bytes: `uicc_ret`, `app_type`, `fid:u32`, `sw1`,
 `sw2`, `record_idx`, `len:u8`, `record_num:u8`, then `data`. Only `fid` needs
-endian conversion. The B014 `lted` consumer `print_uicc_read_record` iterates
-from zero up to byte 9 (`len`) and uses `record_num` only as separately reported
-metadata. Consequently `len` is validated as the total number of returned data
-bytes; it is not multiplied by `record_num`.
+endian conversion. Live P4 `ind_uicc_from_device` proves the length semantics:
+when `record_idx == 0` it sizes the legacy response as `11 + len * record_num`;
+for a specific record it uses `11 + len`. The live SDK zeroes a full 2048-byte
+callback scratch buffer before copying the modem's declared UICC payload, so
+legacy callback padding is deterministic zero rather than uninitialized data.
+The old debug printer only dumps one `len` chunk and is therefore not a valid
+description of the all-records payload grammar.
 
 Both response types remain allocation-free borrowed views and reject truncated
 fixed prefixes or disagreement between their embedded length and the common
@@ -616,6 +619,47 @@ requires the recovered 86-byte outer subtype size but exposes each result as a
 borrowed slice trimmed to its embedded length. Embedded lengths larger than the
 corresponding historical slot are rejected rather than allowing the OEM-style
 consumer to observe out-of-bounds logical data.
+
+### Stock command 147 / callback 148 UICC bridge
+
+The stock daemon boundary is independently recovered and is intentionally not
+modeled as the historical pointer-bearing subtype structs. Live P4
+`liblted.so::LTED_UICCRequest` reads the 16-bit length at caller bytes 2..3 and
+copies exactly `4 + len` bytes into SDK command **147**. The local parameter
+image is therefore the variable envelope `type:u16 | len:u16 | data[len]`.
+The bridge accepts only the six already-proven modem subtypes used by the clean
+runtime: status (0), read binary (1), read record (2), authenticate (5), PIN
+command (6), and PIN status (7). Unsafe fixed C shapes are required at their
+recovered widths before GLIF is touched. Type 7 deliberately ignores any local
+data because live `LAPI_UICCRequest` forcibly emits a zero-length modem subtype.
+
+AUTHENTICATE and PIN COMMAND deserve a special compatibility path: live P4
+copies their complete fixed 36-byte and 20-byte subtype objects raw, including
+otherwise-dead fixed-slot padding. `gct-lapi::UiccFixedRequest` therefore has
+only two constrained constructors for those exact widths and preserves every
+input byte. This avoids silently changing stock-observable padding while still
+refusing an unrestricted raw-UICC API. Status/read-binary/read-record continue
+through semantic typed encoders because their multi-byte fields have proven
+host/device conversion rules.
+
+Live P4 `ind_uicc_from_device` emits stock callback **148**. The unchanged stock
+client dispatches selector 148 directly through `cb_rsp[71]`, function offset
+`0x23c` (user at `0x240`). The local callback object is not in modem wire order:
+the live SDK explicitly reshuffles `0xb505` from wire
+`result:u16 | type:u16 | len:u16 | data` into historical
+`result:u16 | len:u16 | type:u16 | data` before invoking `lted`.
+
+The SDK response path allocates and zeroes a full 2048-byte scratch object before
+parsing. The daemon then exposes subtype-specific legacy sizes: failed responses
+carry only the six-byte historical prefix; STATUS adds 2 bytes; READ BINARY
+always adds the complete 2038-byte `_UICC_READ_BINARY_RSP` (therefore unused
+array tail is deterministic zero); READ RECORD adds `11 + len * record_num`
+bytes for `record_idx == 0` and `11 + len` otherwise; AUTHENTICATE adds 86;
+PIN COMMAND 5; PIN STATUS 11. The Rust bridge reproduces those exact callback
+sizes and prefix order, validates bounded subtype fields before broadcast, and
+releases the subtype-specific pending key only after successful materialization.
+Malformed callback data leaves the request reserved instead of losing
+correlation state.
 
 ## Detach-required and AT-from-device P0 indications — live P4 confirmed
 

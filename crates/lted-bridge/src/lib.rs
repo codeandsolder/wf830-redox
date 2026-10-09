@@ -17,7 +17,8 @@ use gct_lapi::{
     PdnDisconnectRequest, PdnDisconnectResponse, PdnInfoContainers, PdnInfoField,
     PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse, PlmnSearchRequest,
     PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse, Positioning, QosField,
-    ResultResponse, ResultResponseKind,
+    ResultResponse, ResultResponseKind, UiccFixedRequest, UiccPinStatusRequest,
+    UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse, UiccStatusRequest, uicc_control,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -50,6 +51,8 @@ pub enum HandleError {
     LegacyPdnConnect(LegacyPdnConnectDecodeError),
     LegacyPdnConnectExt(LegacyPdnConnectExtDecodeError),
     LegacyPdnDisconnect(LegacyPdnDisconnectDecodeError),
+    LegacyUicc(LegacyUiccDecodeError),
+    UiccCallback(UiccCallbackError),
     AttachCallback(AttachCallbackError),
     AttachExtCallback(AttachExtCallbackError),
     PdnConnectCallback(PdnConnectCallbackError),
@@ -97,6 +100,8 @@ impl std::fmt::Display for HandleError {
             Self::LegacyPdnDisconnect(error) => {
                 write!(f, "invalid stock PDN-disconnect request: {error:?}")
             }
+            Self::LegacyUicc(error) => write!(f, "invalid stock UICC request: {error:?}"),
+            Self::UiccCallback(error) => write!(f, "invalid UICC callback payload: {error:?}"),
             Self::AttachCallback(error) => write!(f, "invalid attach callback payload: {error:?}"),
             Self::AttachExtCallback(error) => {
                 write!(f, "invalid extended-attach callback payload: {error:?}")
@@ -134,6 +139,8 @@ impl std::error::Error for HandleError {
             | Self::LegacyPdnConnect(_)
             | Self::LegacyPdnConnectExt(_)
             | Self::LegacyPdnDisconnect(_)
+            | Self::LegacyUicc(_)
+            | Self::UiccCallback(_)
             | Self::AttachCallback(_)
             | Self::AttachExtCallback(_)
             | Self::PdnConnectCallback(_)
@@ -396,6 +403,126 @@ pub fn decode_legacy_pdn_connect_ext(
         auth_flag: params[0x0e9],
         pco: legacy_pco_info(params, 0x0ea),
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyUiccRequest<'a> {
+    Status(UiccStatusRequest),
+    ReadBinary(UiccReadBinaryRequest),
+    ReadRecord(UiccReadRecordRequest),
+    Fixed(UiccFixedRequest<'a>),
+    PinStatus(UiccPinStatusRequest),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyUiccDecodeError {
+    TruncatedEnvelope {
+        minimum: usize,
+        actual: usize,
+    },
+    LengthMismatch {
+        declared: usize,
+        actual: usize,
+    },
+    UnexpectedSubtypeLength {
+        kind: u16,
+        expected: usize,
+        actual: usize,
+    },
+    UnsupportedKind(u16),
+}
+
+fn exact_uicc_subtype_len(
+    kind: u16,
+    data: &[u8],
+    expected: usize,
+) -> Result<(), LegacyUiccDecodeError> {
+    if data.len() != expected {
+        return Err(LegacyUiccDecodeError::UnexpectedSubtypeLength {
+            kind,
+            expected,
+            actual: data.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Decode the exact variable local payload produced by stock SDK command 147.
+///
+/// The stock wrapper copies `type:u16 | len:u16 | data[len]`. Known unsafe C
+/// shapes are accepted only at their proven widths. PIN STATUS intentionally
+/// ignores any declared local data because live `LAPI_UICCRequest` forcibly
+/// sends that subtype with zero modem data length.
+///
+/// # Errors
+/// Returns [`LegacyUiccDecodeError`] for a truncated/inconsistent envelope, a
+/// malformed supported subtype or an as-yet unsupported UICC kind.
+pub fn decode_legacy_uicc(params: &[u8]) -> Result<LegacyUiccRequest<'_>, LegacyUiccDecodeError> {
+    if params.len() < 4 {
+        return Err(LegacyUiccDecodeError::TruncatedEnvelope {
+            minimum: 4,
+            actual: params.len(),
+        });
+    }
+    let kind = u16::from_be_bytes([params[0], params[1]]);
+    let declared = usize::from(u16::from_be_bytes([params[2], params[3]]));
+    let data = &params[4..];
+    if declared != data.len() {
+        return Err(LegacyUiccDecodeError::LengthMismatch {
+            declared,
+            actual: data.len(),
+        });
+    }
+
+    match kind {
+        uicc_control::STATUS => {
+            exact_uicc_subtype_len(kind, data, 1)?;
+            Ok(LegacyUiccRequest::Status(UiccStatusRequest {
+                app_type: data[0],
+            }))
+        }
+        uicc_control::READ_BINARY => {
+            exact_uicc_subtype_len(kind, data, 9)?;
+            Ok(LegacyUiccRequest::ReadBinary(UiccReadBinaryRequest {
+                app_type: data[0],
+                fid: u32::from_be_bytes([data[1], data[2], data[3], data[4]]),
+                offset: u16::from_be_bytes([data[5], data[6]]),
+                length: u16::from_be_bytes([data[7], data[8]]),
+            }))
+        }
+        uicc_control::READ_RECORD => {
+            exact_uicc_subtype_len(kind, data, 6)?;
+            Ok(LegacyUiccRequest::ReadRecord(UiccReadRecordRequest {
+                app_type: data[0],
+                fid: u32::from_be_bytes([data[1], data[2], data[3], data[4]]),
+                record_index: data[5],
+            }))
+        }
+        uicc_control::AUTHENTICATE => {
+            exact_uicc_subtype_len(kind, data, 36)?;
+            let request = UiccFixedRequest::authenticate(data).map_err(|_| {
+                LegacyUiccDecodeError::UnexpectedSubtypeLength {
+                    kind,
+                    expected: 36,
+                    actual: data.len(),
+                }
+            })?;
+            Ok(LegacyUiccRequest::Fixed(request))
+        }
+        uicc_control::PIN_COMMAND => {
+            exact_uicc_subtype_len(kind, data, 20)?;
+            let request = UiccFixedRequest::pin_command(data).map_err(|_| {
+                LegacyUiccDecodeError::UnexpectedSubtypeLength {
+                    kind,
+                    expected: 20,
+                    actual: data.len(),
+                }
+            })?;
+            Ok(LegacyUiccRequest::Fixed(request))
+        }
+        uicc_control::PIN_STATUS => Ok(LegacyUiccRequest::PinStatus(UiccPinStatusRequest)),
+        _ => Err(LegacyUiccDecodeError::UnsupportedKind(kind)),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1468,6 +1595,180 @@ pub fn broadcast_at_ext_callback(
     )
 }
 
+const STOCK_UICC_PREFIX_LEN: usize = 6;
+const STOCK_UICC_READ_BINARY_RSP_LEN: usize = 2038;
+const STOCK_UICC_READ_RECORD_RSP_MAX_LEN: usize = 2038;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiccCallbackError {
+    UnsupportedKind(u16),
+    UnexpectedSubtypeLength {
+        kind: u16,
+        expected: usize,
+        actual: usize,
+    },
+    EmbeddedLengthMismatch {
+        kind: u16,
+        declared: usize,
+        actual: usize,
+    },
+    AuthenticationFieldTooLong {
+        offset: usize,
+        maximum: usize,
+        actual: usize,
+    },
+    LegacyObjectTooLong {
+        kind: u16,
+        maximum: usize,
+        actual: usize,
+    },
+}
+
+fn require_uicc_callback_len(
+    kind: u16,
+    data: &[u8],
+    expected: usize,
+) -> Result<usize, UiccCallbackError> {
+    if data.len() != expected {
+        return Err(UiccCallbackError::UnexpectedSubtypeLength {
+            kind,
+            expected,
+            actual: data.len(),
+        });
+    }
+    Ok(STOCK_UICC_PREFIX_LEN + expected)
+}
+
+fn validate_uicc_read_binary(data: &[u8]) -> Result<usize, UiccCallbackError> {
+    if data.len() < 10 {
+        return Err(UiccCallbackError::UnexpectedSubtypeLength {
+            kind: uicc_control::READ_BINARY,
+            expected: 10,
+            actual: data.len(),
+        });
+    }
+    let declared = usize::from(u16::from_be_bytes([data[8], data[9]]));
+    let actual = data.len() - 10;
+    if declared != actual {
+        return Err(UiccCallbackError::EmbeddedLengthMismatch {
+            kind: uicc_control::READ_BINARY,
+            declared,
+            actual,
+        });
+    }
+    if data.len() > STOCK_UICC_READ_BINARY_RSP_LEN {
+        return Err(UiccCallbackError::LegacyObjectTooLong {
+            kind: uicc_control::READ_BINARY,
+            maximum: STOCK_UICC_READ_BINARY_RSP_LEN,
+            actual: data.len(),
+        });
+    }
+    Ok(STOCK_UICC_PREFIX_LEN + STOCK_UICC_READ_BINARY_RSP_LEN)
+}
+
+fn validate_uicc_read_record(data: &[u8]) -> Result<usize, UiccCallbackError> {
+    if data.len() < 11 {
+        return Err(UiccCallbackError::UnexpectedSubtypeLength {
+            kind: uicc_control::READ_RECORD,
+            expected: 11,
+            actual: data.len(),
+        });
+    }
+    let one_len = usize::from(data[9]);
+    let record_count = usize::from(data[10]);
+    let declared = if data[8] == 0 {
+        one_len
+            .checked_mul(record_count)
+            .ok_or(UiccCallbackError::LegacyObjectTooLong {
+                kind: uicc_control::READ_RECORD,
+                maximum: STOCK_UICC_READ_RECORD_RSP_MAX_LEN - 11,
+                actual: usize::MAX,
+            })?
+    } else {
+        one_len
+    };
+    let actual = data.len() - 11;
+    if declared != actual {
+        return Err(UiccCallbackError::EmbeddedLengthMismatch {
+            kind: uicc_control::READ_RECORD,
+            declared,
+            actual,
+        });
+    }
+    if data.len() > STOCK_UICC_READ_RECORD_RSP_MAX_LEN {
+        return Err(UiccCallbackError::LegacyObjectTooLong {
+            kind: uicc_control::READ_RECORD,
+            maximum: STOCK_UICC_READ_RECORD_RSP_MAX_LEN,
+            actual: data.len(),
+        });
+    }
+    Ok(STOCK_UICC_PREFIX_LEN + data.len())
+}
+
+fn validate_uicc_authenticate(data: &[u8]) -> Result<usize, UiccCallbackError> {
+    require_uicc_callback_len(uicc_control::AUTHENTICATE, data, 86)?;
+    for (offset, maximum) in [(3, 16), (20, 16), (37, 16), (54, 16), (71, 4), (76, 8)] {
+        let actual = usize::from(data[offset]);
+        if actual > maximum {
+            return Err(UiccCallbackError::AuthenticationFieldTooLong {
+                offset,
+                maximum,
+                actual,
+            });
+        }
+    }
+    Ok(STOCK_UICC_PREFIX_LEN + 86)
+}
+
+fn validate_uicc_callback_response(response: UiccResponse<'_>) -> Result<usize, UiccCallbackError> {
+    if response.result != 0 {
+        return Ok(STOCK_UICC_PREFIX_LEN);
+    }
+    match response.kind {
+        uicc_control::STATUS => require_uicc_callback_len(response.kind, response.data, 2),
+        uicc_control::READ_BINARY => validate_uicc_read_binary(response.data),
+        uicc_control::READ_RECORD => validate_uicc_read_record(response.data),
+        uicc_control::AUTHENTICATE => validate_uicc_authenticate(response.data),
+        uicc_control::PIN_COMMAND => require_uicc_callback_len(response.kind, response.data, 5),
+        uicc_control::PIN_STATUS => require_uicc_callback_len(response.kind, response.data, 11),
+        _ => Err(UiccCallbackError::UnsupportedKind(response.kind)),
+    }
+}
+
+/// Broadcast live-P4 stock callback 148 (`UICC_FROM_DEVICE`).
+///
+/// The modem wire order is `{result,type,len,data}` but stock callback memory is
+/// `{result,len,type,data}`. Live P4 zeroes a 2048-byte scratch object before
+/// parsing; READ BINARY then deliberately exposes its entire fixed 2038-byte
+/// legacy subtype object, including deterministic zero padding.
+///
+/// # Errors
+/// Returns [`HandleError::UiccCallback`] for a malformed proven subtype or
+/// [`HandleError::Ipc`] for local callback transport failures.
+pub fn broadcast_uicc_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: UiccResponse<'_>,
+) -> Result<BroadcastReport, HandleError> {
+    let callback_len =
+        validate_uicc_callback_response(response).map_err(HandleError::UiccCallback)?;
+    let mut data = vec![0_u8; callback_len];
+    data[0..2].copy_from_slice(&response.result.to_be_bytes());
+    let raw_len = u16::try_from(response.data.len()).map_err(|_| {
+        HandleError::UiccCallback(UiccCallbackError::LegacyObjectTooLong {
+            kind: response.kind,
+            maximum: usize::from(u16::MAX),
+            actual: response.data.len(),
+        })
+    })?;
+    data[2..4].copy_from_slice(&raw_len.to_be_bytes());
+    data[4..6].copy_from_slice(&response.kind.to_be_bytes());
+    if response.result == 0 {
+        data[6..6 + response.data.len()].copy_from_slice(response.data);
+    }
+    broadcast_variable_callback(server, device_id, SdkCallbackKind::UiccFromDevice, &data)
+}
+
 /// Broadcast one of the three proven four-byte result callbacks to every stock
 /// client that has the corresponding `cb_rsp[]` function slot registered.
 ///
@@ -1847,6 +2148,7 @@ impl DeviceBridge {
                 Ok(SdkCommand::PlmnSearchStop) => self.dispatch_plmn_search_stop(modem, request),
                 Ok(SdkCommand::AtCommand) => Self::dispatch_at(modem, request),
                 Ok(SdkCommand::AtCommandExt) => Self::dispatch_at_ext(modem, request),
+                Ok(SdkCommand::UiccRequest) => self.dispatch_uicc(modem, request),
                 Ok(_) => self.dispatch_zero_parameter(modem, request),
                 Err(_) => Err(HandleError::UnsupportedCommand(request.command)),
             }
@@ -1863,6 +2165,20 @@ impl DeviceBridge {
         status_result?;
         release_result?;
         dispatch
+    }
+
+    fn handle_uicc_event(
+        &mut self,
+        server: &mut Server,
+        response: UiccResponse<'_>,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        let key = ResponseKey::Uicc(response.kind);
+        if !self.pending.contains(key) {
+            return Ok(None);
+        }
+        let report = broadcast_uicc_callback(server, self.device_id, response)?;
+        self.pending.remove(key);
+        Ok(Some(report))
     }
 
     /// Route one decoded modem event through the asynchronous stock callback
@@ -1930,6 +2246,7 @@ impl DeviceBridge {
                 response.command,
             )
             .map(Some),
+            ModemEvent::Uicc(response) => self.handle_uicc_event(server, *response),
             ModemEvent::Result { kind, response } => {
                 let key = ResponseKey::Result(*kind);
                 if !self.pending.remove(key) {
@@ -2160,6 +2477,27 @@ impl DeviceBridge {
         })
     }
 
+    fn dispatch_uicc<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let decoded = decode_legacy_uicc(request.params).map_err(HandleError::LegacyUicc)?;
+        let modem_command = match decoded {
+            LegacyUiccRequest::Status(request) => ModemCommand::UiccStatus(request),
+            LegacyUiccRequest::ReadBinary(request) => ModemCommand::UiccReadBinary(request),
+            LegacyUiccRequest::ReadRecord(request) => ModemCommand::UiccReadRecord(request),
+            LegacyUiccRequest::Fixed(request) => ModemCommand::UiccFixed(request),
+            LegacyUiccRequest::PinStatus(request) => ModemCommand::UiccPinStatus(request),
+        };
+        let bytes_written = modem.send_tracked_command(&mut self.pending, modem_command)?;
+        Ok(HandledCall {
+            command: SdkCommand::UiccRequest,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
     fn dispatch_at<T: Write>(
         modem: &mut Modem<T>,
         request: SdkApiRequest<'_>,
@@ -2241,7 +2579,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use gct_lapi::{ResultResponse, ResultResponseKind};
+    use gct_lapi::{ResultResponse, ResultResponseKind, UiccResponse};
     use gct_runtime::{Modem, ModemEvent, ResponseKey};
     use gct_transport::HciIo;
     use lted_compat::Server;
@@ -2255,9 +2593,9 @@ mod tests {
         LegacyAttachExtDecodeError, LegacyAttachExtStringField, LegacyAttachStringField,
         LegacyPdnConnectDecodeError, LegacyPdnConnectExtDecodeError,
         LegacyPdnConnectExtStringField, LegacyPdnConnectStringField,
-        LegacyPdnDisconnectDecodeError, PS_INIT_COMPLETE_OFFSET, StartupPhase,
-        broadcast_result_callback, decode_legacy_attach, decode_legacy_attach_ext,
-        decode_legacy_pdn_connect_ext, decode_legacy_pdn_disconnect,
+        LegacyPdnDisconnectDecodeError, LegacyUiccDecodeError, PS_INIT_COMPLETE_OFFSET,
+        StartupPhase, UiccCallbackError, broadcast_result_callback, decode_legacy_attach,
+        decode_legacy_attach_ext, decode_legacy_pdn_connect_ext, decode_legacy_pdn_disconnect,
     };
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -3381,6 +3719,296 @@ mod tests {
             std::process::abort();
         };
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn stock_uicc_supported_requests_match_exact_live_p4_hci() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        let cases: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (
+                vec![0x00, 0x00, 0x00, 0x01, 0x02],
+                vec![0x35, 0x04, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x02],
+            ),
+            (
+                vec![
+                    0x00, 0x01, 0x00, 0x09, 0x02, 0x00, 0x00, 0x6f, 0x07, 0x01, 0x23, 0x00, 0x40,
+                ],
+                vec![
+                    0x35, 0x04, 0x00, 0x0d, 0x00, 0x01, 0x00, 0x09, 0x02, 0x00, 0x00, 0x6f, 0x07,
+                    0x01, 0x23, 0x00, 0x40,
+                ],
+            ),
+            (
+                vec![0x00, 0x02, 0x00, 0x06, 0x01, 0x00, 0x00, 0x6f, 0x3a, 0x00],
+                vec![
+                    0x35, 0x04, 0x00, 0x0a, 0x00, 0x02, 0x00, 0x06, 0x01, 0x00, 0x00, 0x6f, 0x3a,
+                    0x00,
+                ],
+            ),
+        ];
+        let mut expected = Vec::new();
+        for (params, hci) in cases {
+            bridge
+                .handle_sdk_api(
+                    &mut server,
+                    &mut modem,
+                    id,
+                    SdkApiRequest {
+                        command: SdkCommand::UiccRequest as u16,
+                        device_id: 1,
+                        params: &params,
+                    },
+                )
+                .unwrap_or_else(|_| std::process::abort());
+            expected.extend_from_slice(&hci);
+        }
+
+        let mut auth = vec![0xa5_u8; 40];
+        auth[0..4].copy_from_slice(&[0x00, 0x05, 0x00, 0x24]);
+        auth[4] = 2;
+        auth[5] = 1;
+        auth[6] = 0x11;
+        auth[22] = 1;
+        auth[23] = 0x22;
+        auth[39] = 1;
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::UiccRequest as u16,
+                    device_id: 1,
+                    params: &auth,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        expected.extend_from_slice(&[0x35, 0x04, 0x00, 0x28, 0x00, 0x05, 0x00, 0x24]);
+        expected.extend_from_slice(&auth[4..]);
+
+        let mut pin = vec![0x5a_u8; 24];
+        pin[0..4].copy_from_slice(&[0x00, 0x06, 0x00, 0x14]);
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::UiccRequest as u16,
+                    device_id: 1,
+                    params: &pin,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        expected.extend_from_slice(&[0x35, 0x04, 0x00, 0x18, 0x00, 0x06, 0x00, 0x14]);
+        expected.extend_from_slice(&pin[4..]);
+
+        // Live type-7 handling ignores the local data and emits len=0.
+        let pin_status = [0x00, 0x07, 0x00, 0x03, 0xaa, 0xbb, 0xcc];
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::UiccRequest as u16,
+                    device_id: 1,
+                    params: &pin_status,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        expected.extend_from_slice(&[0x35, 0x04, 0x00, 0x04, 0x00, 0x07, 0x00, 0x00]);
+
+        assert_eq!(bridge.pending_count(), 6);
+        assert_eq!(read_api_ret(&mut server, id), 0);
+        assert_eq!(modem.into_transport().into_inner().into_inner(), expected);
+    }
+
+    #[test]
+    fn malformed_stock_uicc_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        let malformed = [0x00, 0x01, 0x00, 0x09, 1, 2, 3];
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::UiccRequest as u16,
+                    device_id: 1,
+                    params: &malformed,
+                },
+            ),
+            Err(HandleError::LegacyUicc(
+                LegacyUiccDecodeError::LengthMismatch {
+                    declared: 9,
+                    actual: 3,
+                }
+            ))
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn uicc_callback_matches_stock_prefix_padding_and_subscription_gate() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, subscribed_id) = open_client(&mut server, &dir, 0);
+        let (unsubscribed, _unsubscribed_id) = open_client(&mut server, &dir, 1);
+        server
+            .client_context(subscribed_id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::UiccFromDevice.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        let status_request = [0x00, 0x00, 0x00, 0x01, 0x02];
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                subscribed_id,
+                SdkApiRequest {
+                    command: SdkCommand::UiccRequest as u16,
+                    device_id: 0x1122_3344,
+                    params: &status_request,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                vec![
+                    0xb5, 0x05, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 3, 2
+                ],
+            ),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        let mut frame = vec![0_u8; 4096];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(
+            Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 148);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(callback.data, &[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 3, 2]);
+
+        // READ BINARY uses the full fixed 2038-byte legacy subtype object.
+        let binary_request = [
+            0x00, 0x01, 0x00, 0x09, 0x02, 0x00, 0x00, 0x6f, 0x07, 0x00, 0x00, 0x00, 0x04,
+        ];
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                subscribed_id,
+                SdkApiRequest {
+                    command: SdkCommand::UiccRequest as u16,
+                    device_id: 0x1122_3344,
+                    params: &binary_request,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        let binary_hci = vec![
+            0xb5, 0x05, 0x00, 0x14, 0x00, 0x00, 0x00, 0x01, 0x00, 0x0e, 0x00, 0x02, 0x00, 0x00,
+            0x6f, 0x07, 0x90, 0x00, 0x00, 0x04, 0xde, 0xad, 0xbe, 0xef,
+        ];
+        assert!(route_one_hci(&mut bridge, &mut server, binary_hci).is_some());
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(len, 12 + 6 + 2038);
+        let callback = SdkCallback::parse(
+            Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.data.len(), 2044);
+        assert_eq!(&callback.data[..6], &[0, 0, 0, 14, 0, 1]);
+        assert_eq!(
+            &callback.data[6..20],
+            &[
+                0, 2, 0, 0, 0x6f, 0x07, 0x90, 0, 0, 4, 0xde, 0xad, 0xbe, 0xef
+            ]
+        );
+        assert!(callback.data[20..].iter().all(|&byte| byte == 0));
+
+        unsubscribed
+            .set_nonblocking(true)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut no_frame = [0_u8; 1];
+        let Err(error) = unsubscribed.recv(&mut no_frame) else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn malformed_uicc_callback_keeps_pending_request_reserved() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let request = [0x00, 0x02, 0x00, 0x06, 1, 0, 0, 0x6f, 0x3a, 0];
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::UiccRequest as u16,
+                    device_id: 1,
+                    params: &request,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.pending_count(), 1);
+
+        let malformed = UiccResponse {
+            result: 0,
+            kind: 2,
+            data: &[0, 1, 0, 0, 0x6f, 0x3a, 0x90, 0, 0, 3, 2, 1, 2, 3, 4, 5],
+        };
+        assert!(matches!(
+            bridge.handle_modem_event(&mut server, &ModemEvent::Uicc(malformed)),
+            Err(HandleError::UiccCallback(
+                UiccCallbackError::EmbeddedLengthMismatch {
+                    kind: 2,
+                    declared: 6,
+                    actual: 5,
+                }
+            ))
+        ));
+        assert_eq!(bridge.pending_count(), 1);
     }
 
     #[test]

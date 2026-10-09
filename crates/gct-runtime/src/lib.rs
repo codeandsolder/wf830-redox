@@ -21,8 +21,9 @@ use gct_lapi::{
     PdnResponseDecodeError, PlmnListResponse, PlmnSearchDecodeError, PlmnSearchRequest,
     PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse, ResponseDecodeError,
     ResultResponse, ResultResponseKind, UiccAuthenticateEncodeError, UiccAuthenticateRequest,
-    UiccPinCommandRequest, UiccPinEncodeError, UiccPinStatusRequest, UiccReadBinaryRequest,
-    UiccReadRecordRequest, UiccResponse, UiccResponseDecodeError, UiccStatusRequest, uicc_control,
+    UiccFixedRequest, UiccFixedRequestError, UiccPinCommandRequest, UiccPinEncodeError,
+    UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse,
+    UiccResponseDecodeError, UiccStatusRequest, uicc_control,
 };
 use gct_transport::{
     GlifTransport, HciIo, HciStreamDecoder, MAX_HCI_FRAME_LEN, OEM_READ_BUFFER_LEN,
@@ -188,6 +189,7 @@ pub enum ModemCommand<'a> {
     At(AtCommand<'a>),
     AtExt(AtCommandExt<'a>),
     UiccStatus(UiccStatusRequest),
+    UiccFixed(UiccFixedRequest<'a>),
     UiccReadBinary(UiccReadBinaryRequest),
     UiccReadRecord(UiccReadRecordRequest),
     UiccAuthenticate(UiccAuthenticateRequest<'a>),
@@ -247,6 +249,7 @@ impl ModemCommand<'_> {
             }
             Self::At(_) | Self::AtExt(_) => None,
             Self::UiccStatus(_) => Some(ResponseKey::Uicc(uicc_control::STATUS)),
+            Self::UiccFixed(request) => Some(ResponseKey::Uicc(request.kind())),
             Self::UiccReadBinary(_) => Some(ResponseKey::Uicc(uicc_control::READ_BINARY)),
             Self::UiccReadRecord(_) => Some(ResponseKey::Uicc(uicc_control::READ_RECORD)),
             Self::UiccAuthenticate(_) => Some(ResponseKey::Uicc(uicc_control::AUTHENTICATE)),
@@ -358,6 +361,7 @@ pub enum CommandEncodeError {
     AttachExt(AttachExtEncodeError),
     Pdn(PdnEncodeError),
     UiccAuthenticate(UiccAuthenticateEncodeError),
+    UiccFixed(UiccFixedRequestError),
     UiccPin(UiccPinEncodeError),
 }
 
@@ -388,6 +392,12 @@ impl From<PdnEncodeError> for CommandEncodeError {
 impl From<UiccAuthenticateEncodeError> for CommandEncodeError {
     fn from(value: UiccAuthenticateEncodeError) -> Self {
         Self::UiccAuthenticate(value)
+    }
+}
+
+impl From<UiccFixedRequestError> for CommandEncodeError {
+    fn from(value: UiccFixedRequestError) -> Self {
+        Self::UiccFixed(value)
     }
 }
 
@@ -457,6 +467,7 @@ pub fn encode_command(
         ModemCommand::At(request) => Ok(request.encode(output)?),
         ModemCommand::AtExt(request) => Ok(request.encode(output)?),
         ModemCommand::UiccStatus(request) => Ok(request.encode(output)?),
+        ModemCommand::UiccFixed(request) => Ok(request.encode(output)?),
         ModemCommand::UiccReadBinary(request) => Ok(request.encode(output)?),
         ModemCommand::UiccReadRecord(request) => Ok(request.encode(output)?),
         ModemCommand::UiccAuthenticate(request) => Ok(request.encode(output)?),

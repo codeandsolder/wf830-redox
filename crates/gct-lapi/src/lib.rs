@@ -2021,6 +2021,80 @@ fn encode_uicc_request(kind: u16, data: &[u8], output: &mut [u8]) -> Result<usiz
     Ok(frame_len)
 }
 
+/// One fixed-width UICC request whose stock bytes are already the proven modem
+/// subtype representation.
+///
+/// This intentionally supports only the two fixed raw-copy families where the
+/// live SDK performs no subtype endian conversion. Keeping the original bytes
+/// preserves stock padding/dead-slot contents without opening an unrestricted
+/// raw UICC escape hatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UiccFixedRequest<'a> {
+    kind: u16,
+    data: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiccFixedRequestError {
+    UnexpectedLength {
+        kind: u16,
+        expected: usize,
+        actual: usize,
+    },
+    Hci(EncodeError),
+}
+
+impl From<EncodeError> for UiccFixedRequestError {
+    fn from(value: EncodeError) -> Self {
+        Self::Hci(value)
+    }
+}
+
+impl<'a> UiccFixedRequest<'a> {
+    /// Preserve one exact 36-byte AUTHENTICATE subtype object.
+    ///
+    /// # Errors
+    /// Returns [`UiccFixedRequestError::UnexpectedLength`] unless `data` is
+    /// exactly the recovered 36-byte subtype width.
+    pub fn authenticate(data: &'a [u8]) -> Result<Self, UiccFixedRequestError> {
+        Self::new(uicc_control::AUTHENTICATE, 36, data)
+    }
+
+    /// Preserve one exact 20-byte PIN COMMAND subtype object.
+    ///
+    /// # Errors
+    /// Returns [`UiccFixedRequestError::UnexpectedLength`] unless `data` is
+    /// exactly the recovered 20-byte subtype width.
+    pub fn pin_command(data: &'a [u8]) -> Result<Self, UiccFixedRequestError> {
+        Self::new(uicc_control::PIN_COMMAND, 20, data)
+    }
+
+    fn new(kind: u16, expected: usize, data: &'a [u8]) -> Result<Self, UiccFixedRequestError> {
+        if data.len() != expected {
+            return Err(UiccFixedRequestError::UnexpectedLength {
+                kind,
+                expected,
+                actual: data.len(),
+            });
+        }
+        Ok(Self { kind, data })
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> u16 {
+        self.kind
+    }
+
+    /// Encode the preserved fixed subtype under the common UICC envelope.
+    ///
+    /// # Errors
+    /// Returns [`UiccFixedRequestError::Hci`] when the destination buffer is
+    /// too short.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, UiccFixedRequestError> {
+        Ok(encode_uicc_request(self.kind, self.data, output)?)
+    }
+}
+
 /// UICC READ BINARY request (`type 1`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UiccReadBinaryRequest {
@@ -2144,9 +2218,10 @@ pub struct UiccReadRecordResponse<'a> {
 impl<'a> UiccReadRecordResponse<'a> {
     /// Decode the eleven-byte READ RECORD prefix and borrow its payload.
     ///
-    /// The B014 `lted` consumer iterates exactly to the byte at offset 9
-    /// (`len`) and merely reports `record_num` separately, so the embedded
-    /// length is validated directly against the remaining bytes.
+    /// Live P4 `ind_uicc_from_device` exposes `len * record_num` bytes when
+    /// `record_idx == 0` (the all-records form), and exactly `len` bytes for a
+    /// specific record. The parser validates the same shape against the bytes
+    /// actually carried by the modem response.
     ///
     /// # Errors
     /// Returns [`UiccFileDecodeError`] for a failed/wrong outer UICC response,
@@ -2159,11 +2234,22 @@ impl<'a> UiccReadRecordResponse<'a> {
                 actual: response.data.len(),
             });
         }
-        let declared = usize::from(response.data[9]);
+        let record_len = usize::from(response.data[9]);
+        let record_count = usize::from(response.data[10]);
+        let expected = if response.data[8] == 0 {
+            record_len.checked_mul(record_count).ok_or(
+                UiccFileDecodeError::EmbeddedLengthMismatch {
+                    declared: usize::MAX,
+                    actual: response.data.len().saturating_sub(11),
+                },
+            )?
+        } else {
+            record_len
+        };
         let data = &response.data[11..];
-        if declared != data.len() {
+        if expected != data.len() {
             return Err(UiccFileDecodeError::EmbeddedLengthMismatch {
-                declared,
+                declared: expected,
                 actual: data.len(),
             });
         }
@@ -4923,13 +5009,13 @@ mod tests {
     }
 
     #[test]
-    fn uicc_read_record_response_uses_len_as_total_returned_bytes() {
-        let payload = [
+    fn uicc_read_record_response_distinguishes_one_record_from_all_records() {
+        let one = [
             0x00, 0x00, 0x00, 0x02, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x6f, 0x3a, 0x90, 0x00,
             0x07, 0x05, 0x02, 1, 2, 3, 4, 5,
         ];
         assert_eq!(
-            super::UiccReadRecordResponse::parse(packet(0xb505, &payload)),
+            super::UiccReadRecordResponse::parse(packet(0xb505, &one)),
             Ok(super::UiccReadRecordResponse {
                 uicc_return: 0,
                 app_type: 1,
@@ -4942,6 +5028,72 @@ mod tests {
                 data: &[1, 2, 3, 4, 5],
             })
         );
+
+        let all = [
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x11, 0x00, 0x01, 0x00, 0x00, 0x6f, 0x3a, 0x90, 0x00,
+            0x00, 0x03, 0x02, 1, 2, 3, 4, 5, 6,
+        ];
+        assert_eq!(
+            super::UiccReadRecordResponse::parse(packet(0xb505, &all)),
+            Ok(super::UiccReadRecordResponse {
+                uicc_return: 0,
+                app_type: 1,
+                fid: 0x6f3a,
+                sw1: 0x90,
+                sw2: 0x00,
+                record_index: 0,
+                length: 3,
+                record_count: 2,
+                data: &[1, 2, 3, 4, 5, 6],
+            })
+        );
+
+        let truncated_all = [
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x6f, 0x3a, 0x90, 0x00,
+            0x00, 0x03, 0x02, 1, 2, 3, 4, 5,
+        ];
+        assert_eq!(
+            super::UiccReadRecordResponse::parse(packet(0xb505, &truncated_all)),
+            Err(super::UiccFileDecodeError::EmbeddedLengthMismatch {
+                declared: 6,
+                actual: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn uicc_fixed_requests_preserve_every_stock_subtype_byte() {
+        let mut authenticate = [0xa5_u8; 36];
+        authenticate[0] = 2;
+        authenticate[1] = 1;
+        authenticate[2] = 0x11;
+        authenticate[18] = 1;
+        authenticate[19] = 0x22;
+        authenticate[35] = 1;
+        let mut wire = [0_u8; 44];
+        assert_eq!(
+            super::UiccFixedRequest::authenticate(&authenticate)
+                .and_then(|request| request.encode(&mut wire)),
+            Ok(44)
+        );
+        assert_eq!(
+            &wire[..8],
+            &[0x35, 0x04, 0x00, 0x28, 0x00, 0x05, 0x00, 0x24]
+        );
+        assert_eq!(&wire[8..], &authenticate);
+
+        let pin = [0x5a_u8; 20];
+        let mut wire = [0_u8; 28];
+        assert_eq!(
+            super::UiccFixedRequest::pin_command(&pin)
+                .and_then(|request| request.encode(&mut wire)),
+            Ok(28)
+        );
+        assert_eq!(
+            &wire[..8],
+            &[0x35, 0x04, 0x00, 0x18, 0x00, 0x06, 0x00, 0x14]
+        );
+        assert_eq!(&wire[8..], &pin);
     }
 
     #[test]

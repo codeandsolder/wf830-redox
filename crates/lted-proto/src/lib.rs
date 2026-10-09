@@ -35,6 +35,7 @@ pub enum SdkCallbackKind {
     PsInit,
     AtCommandFromDevice,
     AtCommandFromDeviceExt,
+    UiccFromDevice,
 }
 
 impl SdkCallbackKind {
@@ -55,6 +56,7 @@ impl SdkCallbackKind {
             Self::PsInit => 68,
             Self::AtCommandFromDevice => 126,
             Self::AtCommandFromDeviceExt => 128,
+            Self::UiccFromDevice => 148,
         }
     }
 
@@ -75,6 +77,7 @@ impl SdkCallbackKind {
             Self::PsInit => 22,
             Self::AtCommandFromDevice => 60,
             Self::AtCommandFromDeviceExt => 61,
+            Self::UiccFromDevice => 71,
         }
     }
 
@@ -741,6 +744,8 @@ mod tests {
             SdkCallbackKind::AtCommandFromDeviceExt.registration_offset(),
             0x1ec
         );
+        assert_eq!(SdkCallbackKind::UiccFromDevice.callback_id(), 148);
+        assert_eq!(SdkCallbackKind::UiccFromDevice.registration_offset(), 0x23c);
     }
 
     #[test]
