@@ -1830,6 +1830,156 @@ impl PlmnSearchRequest {
     }
 }
 
+/// Mobile-ID read request carried by the shared `0x3145` read-info command.
+///
+/// Live P4 `LAPI_MobileIDReadRequest` emits a five-byte payload containing two
+/// SDK-generated big-endian words (`1`, `1`) followed by the caller's one-byte
+/// `mobile_id_type`. The same HCI opcode is shared by adjacent identity/status
+/// reads, so the subtype words are part of the typed request rather than being
+/// inferred from opcode adjacency.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MobileIdReadRequest {
+    pub mobile_id_type: u8,
+}
+
+impl MobileIdReadRequest {
+    /// Encode exact live-P4 bytes `31 45 00 05 00 01 00 01 <type>`.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than nine
+    /// bytes.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        encode_packet(
+            recovered_opcode::MISC_READ_REQUEST,
+            &[0x00, 0x01, 0x00, 0x01, self.mobile_id_type],
+            output,
+        )
+    }
+}
+
+/// One successful Mobile-ID chunk recovered from shared response `0xb146`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MobileIdReadResponse<'a> {
+    pub read_result: u16,
+    pub id_type: u8,
+    pub result: u8,
+    pub id: &'a [u8],
+}
+
+/// Decoded shape of the shared `0xb146` read-info response relevant to the
+/// currently proven compatibility surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MiscReadResponse<'a> {
+    /// Top-level nonzero result. Live SDK exits before dispatching any subtype
+    /// callback, so no subtype identity exists on this path.
+    Failure {
+        read_result: u16,
+    },
+    MobileId(MobileIdReadResponse<'a>),
+    /// Successful response containing only not-yet-modeled read subtypes.
+    UnsupportedSuccess,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MiscReadDecodeError {
+    Response(ResponseDecodeError),
+    TruncatedChunkHeader {
+        offset: usize,
+        actual: usize,
+    },
+    TruncatedChunk {
+        subtype: u16,
+        declared: usize,
+        actual: usize,
+    },
+    MobileIdBodyTooShort {
+        actual: usize,
+    },
+    MobileIdChunkTooLong {
+        actual: usize,
+    },
+    MobileIdEmbeddedLength {
+        declared: usize,
+        available: usize,
+    },
+}
+
+impl From<ResponseDecodeError> for MiscReadDecodeError {
+    fn from(value: ResponseDecodeError) -> Self {
+        Self::Response(value)
+    }
+}
+
+impl<'a> MiscReadResponse<'a> {
+    /// Decode the live-P4 shared read response and extract Mobile-ID subtype 1.
+    ///
+    /// Wire grammar on success is `read_result:u16 == 0`, followed by zero or
+    /// more chunks `subtype:u16 | len:u16 | body[len]`. Mobile ID is subtype 1
+    /// with body `id_type:u8 | result:u8 | len:u8 | id...`. The SDK's
+    /// historical object has a 16-byte ID array; overlong or truncated bodies
+    /// are rejected before they can become stock callbacks.
+    ///
+    /// # Errors
+    /// Returns [`MiscReadDecodeError`] for the wrong opcode, a truncated chunk
+    /// envelope/body, or an unsafe Mobile-ID length.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, MiscReadDecodeError> {
+        let payload = prefix_payload(packet, recovered_opcode::MISC_READ_RESPONSE, 2)?;
+        let read_result = be_u16(payload, 0);
+        if read_result != 0 {
+            return Ok(Self::Failure { read_result });
+        }
+
+        let mut offset = 2_usize;
+        while offset < payload.len() {
+            let remaining = payload.len() - offset;
+            if remaining < 4 {
+                return Err(MiscReadDecodeError::TruncatedChunkHeader {
+                    offset,
+                    actual: remaining,
+                });
+            }
+            let subtype = be_u16(payload, offset);
+            let declared = usize::from(be_u16(payload, offset + 2));
+            let body_start = offset + 4;
+            let available = payload.len() - body_start;
+            if declared > available {
+                return Err(MiscReadDecodeError::TruncatedChunk {
+                    subtype,
+                    declared,
+                    actual: available,
+                });
+            }
+            let body = &payload[body_start..body_start + declared];
+            if subtype == 1 {
+                if body.len() < 3 {
+                    return Err(MiscReadDecodeError::MobileIdBodyTooShort { actual: body.len() });
+                }
+                let slot_payload = body.len() - 3;
+                if slot_payload > 16 {
+                    return Err(MiscReadDecodeError::MobileIdChunkTooLong {
+                        actual: slot_payload,
+                    });
+                }
+                let id_len = usize::from(body[2]);
+                if id_len > slot_payload || id_len > 16 {
+                    return Err(MiscReadDecodeError::MobileIdEmbeddedLength {
+                        declared: id_len,
+                        available: slot_payload.min(16),
+                    });
+                }
+                return Ok(Self::MobileId(MobileIdReadResponse {
+                    read_result,
+                    id_type: body[0],
+                    result: body[1],
+                    id: &body[3..3 + id_len],
+                }));
+            }
+            offset = body_start + declared;
+        }
+        Ok(Self::UnsupportedSuccess)
+    }
+}
+
 /// PLMN-search-stop request `0x3127`.
 ///
 /// B014 DWARF describes `_PLMN_SEARCH_STOP_REQ_PARAM` as one byte named
@@ -4667,6 +4817,84 @@ mod tests {
         assert_eq!(
             manual.encode(&mut short),
             Err(gct_hci::EncodeError::NoSpace)
+        );
+    }
+
+    #[test]
+    fn mobile_id_read_matches_shared_live_p4_request_and_response_grammar() {
+        let mut request = [0_u8; 9];
+        assert_eq!(
+            super::MobileIdReadRequest { mobile_id_type: 3 }.encode(&mut request),
+            Ok(9)
+        );
+        assert_eq!(
+            request,
+            [0x31, 0x45, 0x00, 0x05, 0x00, 0x01, 0x00, 0x01, 0x03]
+        );
+
+        let success = [
+            0x00, 0x00, // top-level read_result
+            0x00, 0x01, 0x00, 0x08, // Mobile-ID subtype + body length
+            0x03, 0x00, 0x05, b'1', b'2', b'3', b'4', b'5',
+        ];
+        assert_eq!(
+            super::MiscReadResponse::parse(packet(
+                super::recovered_opcode::MISC_READ_RESPONSE,
+                &success,
+            )),
+            Ok(super::MiscReadResponse::MobileId(
+                super::MobileIdReadResponse {
+                    read_result: 0,
+                    id_type: 3,
+                    result: 0,
+                    id: b"12345",
+                }
+            ))
+        );
+
+        assert_eq!(
+            super::MiscReadResponse::parse(packet(
+                super::recovered_opcode::MISC_READ_RESPONSE,
+                &[0x00, 0x07],
+            )),
+            Ok(super::MiscReadResponse::Failure { read_result: 7 })
+        );
+
+        let unsupported = [0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xaa];
+        assert_eq!(
+            super::MiscReadResponse::parse(packet(
+                super::recovered_opcode::MISC_READ_RESPONSE,
+                &unsupported,
+            )),
+            Ok(super::MiscReadResponse::UnsupportedSuccess)
+        );
+    }
+
+    #[test]
+    fn mobile_id_read_rejects_unsafe_or_truncated_shared_chunks() {
+        let overlong = [
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x14, 1, 0, 17, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+            13, 14, 15, 16, 17,
+        ];
+        assert_eq!(
+            super::MiscReadResponse::parse(packet(
+                super::recovered_opcode::MISC_READ_RESPONSE,
+                &overlong,
+            )),
+            Err(super::MiscReadDecodeError::MobileIdChunkTooLong { actual: 17 })
+        );
+
+        let truncated = [0x00, 0x00, 0x00, 0x01, 0x00, 0x05, 1, 0, 2, 0xaa];
+        assert_eq!(
+            super::MiscReadResponse::parse(packet(
+                super::recovered_opcode::MISC_READ_RESPONSE,
+                &truncated,
+            )),
+            Err(super::MiscReadDecodeError::TruncatedChunk {
+                subtype: 1,
+                declared: 5,
+                actual: 4,
+            })
         );
     }
 

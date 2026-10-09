@@ -661,6 +661,59 @@ releases the subtype-specific pending key only after successful materialization.
 Malformed callback data leaves the request reserved instead of losing
 correlation state.
 
+## Mobile ID read — shared read-info HCI family, live P4 confirmed
+
+This path is stock-client relevant rather than a debug-only curiosity: the live
+P4 connection managers (`sprint_cm`, `smartfren`, `lteautocm`, and `cmcc_cm`)
+all import `LTED_MobileIDReadRequest`.
+
+The unchanged live P4 `liblted.so::LTED_MobileIDReadRequest` at `0xcf08`
+constructs SDK command **76** and copies exactly one caller byte,
+`mobile_id_type`, into its local request envelope. B014 DWARF independently
+names `_MOBILE_ID_READ_REQ_PARAM` as a one-byte object containing only that
+field.
+
+Live P4 `libltesdk.so::LAPI_MobileIDReadRequest` at `0x4ab04` proves that this
+stock call uses the shared HCI read-info request opcode **`0x3145`**. It
+allocates a nine-byte frame, converts payload length 5 with `H2D`, writes two
+SDK-generated `u16` values both equal to 1, then appends the caller's
+`mobile_id_type`. The exact request is therefore:
+
+`31 45 00 05 00 01 00 01 <mobile_id_type>`.
+
+Adjacent stock APIs such as ICCID and MSISDN use the same opcode with different
+subtype words, so Rust names the wire family `MISC_READ` rather than pretending
+`0x3145` is Mobile-ID-specific.
+
+The live SDK `decode_hci_packet` dispatch table maps response opcode **`0xb146`**
+to the shared read-info parser at `0x16ee0`. A successful response begins with
+`read_result:u16 == 0` and then contains chunks
+`subtype:u16 | len:u16 | body[len]`. Subtype **1** dispatches to the Mobile-ID
+handler at `0x16124`. That handler uses SDK callback slot **26**, zeroes the
+exact 21-byte historical object, converts the top-level `read_result`, then
+materializes `id_type:u8 | result:u8 | len:u8 | id[16]`. It refuses a chunk
+whose payload beyond the three-byte prefix exceeds the historical 16-byte ID
+slot. A nonzero top-level `read_result` exits the shared parser before any
+subtype callback is invoked, so there is deliberately no stock Mobile-ID
+callback on that failure path.
+
+Live P4 `lted::ind_mobile_id_read_response` at `0x284f4` receives that 21-byte
+SDK object. On success it sends stock callback selector **77** with exactly
+`5 + len` bytes: `read_result:u16 | id_type:u8 | result:u8 | len:u8 | id[len]`.
+The unchanged live `liblted.so` selector switch maps callback 77 to case
+`0x6400`, which loads function pointer offset `0xd4` and user pointer offset
+`0xd8`: **`cb_rsp[26]`**. Thus the stock registration offset is exactly `0xd4`.
+
+The clean runtime models `0xb146` as a shared response family. Mobile-ID success
+is typed and bounded; other successful subtypes remain unsupported rather than
+being misparsed. Because a top-level failure carries no subtype identity, all
+currently implemented shared-read commands use one conservative family-level
+`ResponseKey::MiscRead`. The bridge releases that key on either Mobile-ID
+success or shared failure. Only success becomes callback 77, matching the OEM
+SDK behavior. Tests cover exact command-76/HCI bytes, safe shared-chunk parsing,
+callback 77 materialization and subscription gating, malformed local input
+before GLIF, and failure cleanup without a fabricated callback.
+
 ## Detach-required and AT-from-device P0 indications — live P4 confirmed
 
 The detach-required indication is dispatch opcode `0xb16a`, not a guessed

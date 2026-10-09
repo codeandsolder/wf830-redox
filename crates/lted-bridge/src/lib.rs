@@ -11,15 +11,15 @@ use std::{io, io::Write};
 use gct_lapi::{
     ApnType, AtCommand, AtCommandExt, AttachExtProfile, AttachExtRequest, AttachExtResponse,
     AttachRequest, AttachResponse, AttachTailDecodeError, AttachTailField, DetachRequest,
-    DetachRequiredIndication, DetachResponse, EmergencyNumberDecodeError, EmptyRequest, PcoInfo,
-    PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse,
-    PdnConnectTailDecodeError, PdnConnectTailField, PdnConnectionControl, PdnDisconnectField,
-    PdnDisconnectFieldDecodeError, PdnDisconnectRequest, PdnDisconnectResponse, PdnInfoContainers,
-    PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse,
-    PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
-    Positioning, QosField, ResultResponse, ResultResponseKind, UiccFixedRequest,
-    UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse,
-    UiccStatusRequest, uicc_control,
+    DetachRequiredIndication, DetachResponse, EmergencyNumberDecodeError, EmptyRequest,
+    MobileIdReadRequest, MobileIdReadResponse, PcoInfo, PdnConnectExtRequest,
+    PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse, PdnConnectTailDecodeError,
+    PdnConnectTailField, PdnConnectionControl, PdnDisconnectField, PdnDisconnectFieldDecodeError,
+    PdnDisconnectRequest, PdnDisconnectResponse, PdnInfoContainers, PdnInfoField,
+    PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse, PlmnSearchRequest,
+    PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse, Positioning, QosField,
+    ResultResponse, ResultResponseKind, UiccFixedRequest, UiccPinStatusRequest,
+    UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse, UiccStatusRequest, uicc_control,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -1651,6 +1651,34 @@ const STOCK_UICC_PREFIX_LEN: usize = 6;
 const STOCK_UICC_READ_BINARY_RSP_LEN: usize = 2038;
 const STOCK_UICC_READ_RECORD_RSP_MAX_LEN: usize = 2038;
 
+/// Broadcast stock callback 77 (`MOBILE_ID_READ_RSP`) through `cb_rsp[26]`.
+///
+/// Live P4 `lted` sends exactly `5 + len` bytes from the historical 21-byte
+/// object: `read_result:u16 | id_type:u8 | result:u8 | len:u8 | id[len]`.
+///
+/// # Errors
+/// Returns [`HandleError::Ipc`] for an unrepresentable local callback or IPC
+/// failure.
+pub fn broadcast_mobile_id_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: MobileIdReadResponse<'_>,
+) -> Result<BroadcastReport, HandleError> {
+    let id_len = u8::try_from(response.id.len()).map_err(|_| {
+        HandleError::Ipc(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Mobile ID exceeds stock one-byte length",
+        ))
+    })?;
+    let mut data = Vec::with_capacity(5 + response.id.len());
+    data.extend_from_slice(&response.read_result.to_be_bytes());
+    data.push(response.id_type);
+    data.push(response.result);
+    data.push(id_len);
+    data.extend_from_slice(response.id);
+    broadcast_variable_callback(server, device_id, SdkCallbackKind::MobileIdRead, &data)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UiccCallbackError {
     UnsupportedKind(u16),
@@ -2198,6 +2226,7 @@ impl DeviceBridge {
                 Ok(SdkCommand::PdnDisconnect) => self.dispatch_pdn_disconnect(modem, request),
                 Ok(SdkCommand::PlmnSearch) => self.dispatch_plmn_search(modem, request),
                 Ok(SdkCommand::PlmnSearchStop) => self.dispatch_plmn_search_stop(modem, request),
+                Ok(SdkCommand::MobileIdRead) => self.dispatch_mobile_id_read(modem, request),
                 Ok(SdkCommand::AtCommand) => Self::dispatch_at(modem, request),
                 Ok(SdkCommand::AtCommandExt) => Self::dispatch_at_ext(modem, request),
                 Ok(SdkCommand::UiccRequest) => self.dispatch_uicc(modem, request),
@@ -2231,6 +2260,26 @@ impl DeviceBridge {
         let report = broadcast_uicc_callback(server, self.device_id, response)?;
         self.pending.remove(key);
         Ok(Some(report))
+    }
+
+    fn handle_misc_read_event(
+        &mut self,
+        server: &mut Server,
+        event: &ModemEvent<'_>,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        match event {
+            ModemEvent::MobileIdRead(response) => {
+                if !self.pending.remove(ResponseKey::MiscRead) {
+                    return Ok(None);
+                }
+                broadcast_mobile_id_callback(server, self.device_id, *response).map(Some)
+            }
+            ModemEvent::MiscReadFailure { .. } => {
+                self.pending.remove(ResponseKey::MiscRead);
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Route one decoded modem event through the asynchronous stock callback
@@ -2330,6 +2379,9 @@ impl DeviceBridge {
                     return Ok(None);
                 }
                 broadcast_plmn_search_callback(server, self.device_id, *response).map(Some)
+            }
+            ModemEvent::MobileIdRead(_) | ModemEvent::MiscReadFailure { .. } => {
+                self.handle_misc_read_event(server, event)
             }
             ModemEvent::PlmnList(response) => {
                 let key = ResponseKey::PlmnList;
@@ -2580,6 +2632,31 @@ impl DeviceBridge {
             modem.send_command(ModemCommand::AtExt(AtCommandExt::new(channel, command)))?;
         Ok(HandledCall {
             command: SdkCommand::AtCommandExt,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_mobile_id_read<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let [mobile_id_type] = request.params else {
+            return Err(HandleError::UnexpectedParameters {
+                command: request.command,
+                expected: 1,
+                actual: request.params.len(),
+            });
+        };
+        let bytes_written = modem.send_tracked_command(
+            &mut self.pending,
+            ModemCommand::MobileIdRead(MobileIdReadRequest {
+                mobile_id_type: *mobile_id_type,
+            }),
+        )?;
+        Ok(HandledCall {
+            command: SdkCommand::MobileIdRead,
             device_id: request.device_id,
             bytes_written,
         })
@@ -4421,6 +4498,159 @@ mod tests {
             std::process::abort();
         };
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn stock_mobile_id_read_matches_live_p4_hci_and_callback_77() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, subscribed_id) = open_client(&mut server, &dir, 0);
+        let (unsubscribed, _unsubscribed_id) = open_client(&mut server, &dir, 1);
+        server
+            .client_context(subscribed_id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::MobileIdRead.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                subscribed_id,
+                SdkApiRequest {
+                    command: SdkCommand::MobileIdRead as u16,
+                    device_id: 1,
+                    params: &[3],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.bytes_written, 9);
+        assert_eq!(bridge.pending_count(), 1);
+        assert!(bridge.pending.contains(ResponseKey::MiscRead));
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            [0x31, 0x45, 0x00, 0x05, 0x00, 0x01, 0x00, 0x01, 0x03]
+        );
+
+        let response = vec![
+            0xb1, 0x46, 0x00, 0x0e, // shared response header
+            0x00, 0x00, // read_result success
+            0x00, 0x01, 0x00, 0x08, // Mobile-ID chunk + length
+            0x03, 0x00, 0x05, b'1', b'2', b'3', b'4', b'5',
+        ];
+        assert_eq!(
+            route_one_hci(&mut bridge, &mut server, response),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 32];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(len, 22);
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 77);
+        assert_eq!(callback.device_id, 1);
+        assert_eq!(
+            callback.data,
+            &[0, 0, 3, 0, 5, b'1', b'2', b'3', b'4', b'5']
+        );
+
+        unsubscribed
+            .set_nonblocking(true)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut no_frame = [0_u8; 1];
+        let Err(error) = unsubscribed.recv(&mut no_frame) else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn mobile_id_shared_failure_releases_family_without_stock_callback() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (client, id) = open_client(&mut server, &dir, 0);
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::MobileIdRead.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::MobileIdRead as u16,
+                    device_id: 1,
+                    params: &[1],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.pending_count(), 1);
+
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                vec![0xb1, 0x46, 0x00, 0x02, 0x00, 0x07],
+            ),
+            None
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        client
+            .set_nonblocking(true)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut no_frame = [0_u8; 1];
+        let Err(error) = client.recv(&mut no_frame) else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn malformed_stock_mobile_id_read_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::MobileIdRead as u16,
+                    device_id: 1,
+                    params: &[],
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                command: 76,
+                expected: 1,
+                actual: 0,
+            })
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]

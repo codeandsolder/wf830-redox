@@ -16,14 +16,15 @@ use gct_lapi::{
     AtCommand, AtCommandExt, AtCommandFromDevice, AtCommandFromDeviceExt, AttachEncodeError,
     AttachExtEncodeError, AttachExtRequest, AttachExtResponse, AttachRequest, AttachResponse,
     AttachResponseDecodeError, DetachRequest, DetachRequiredIndication, DetachResponse,
-    EmptyRequest, PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest,
-    PdnConnectResponse, PdnDisconnectRequest, PdnDisconnectResponse, PdnEncodeError,
-    PdnResponseDecodeError, PlmnListResponse, PlmnSearchDecodeError, PlmnSearchRequest,
-    PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse, ResponseDecodeError,
-    ResultResponse, ResultResponseKind, UiccAuthenticateEncodeError, UiccAuthenticateRequest,
-    UiccFixedRequest, UiccFixedRequestError, UiccPinCommandRequest, UiccPinEncodeError,
-    UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse,
-    UiccResponseDecodeError, UiccStatusRequest, uicc_control,
+    EmptyRequest, MiscReadDecodeError, MiscReadResponse, MobileIdReadRequest, MobileIdReadResponse,
+    PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse,
+    PdnDisconnectRequest, PdnDisconnectResponse, PdnEncodeError, PdnResponseDecodeError,
+    PlmnListResponse, PlmnSearchDecodeError, PlmnSearchRequest, PlmnSearchResponse,
+    PlmnSearchStopRequest, PlmnSearchStopResponse, ResponseDecodeError, ResultResponse,
+    ResultResponseKind, UiccAuthenticateEncodeError, UiccAuthenticateRequest, UiccFixedRequest,
+    UiccFixedRequestError, UiccPinCommandRequest, UiccPinEncodeError, UiccPinStatusRequest,
+    UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse, UiccResponseDecodeError,
+    UiccStatusRequest, uicc_control,
 };
 use gct_transport::{
     GlifTransport, HciIo, HciStreamDecoder, MAX_HCI_FRAME_LEN, OEM_READ_BUFFER_LEN,
@@ -150,6 +151,10 @@ pub enum ModemEvent<'a> {
     PlmnSearch(PlmnSearchResponse<'a>),
     PlmnSearchStop(PlmnSearchStopResponse),
     PlmnList(PlmnListResponse<'a>),
+    MobileIdRead(MobileIdReadResponse<'a>),
+    MiscReadFailure {
+        read_result: u16,
+    },
     Result {
         kind: ResultResponseKind,
         response: ResultResponse,
@@ -168,6 +173,7 @@ pub enum EventDecodeError {
     Attach(AttachResponseDecodeError),
     Pdn(PdnResponseDecodeError),
     PlmnSearch(PlmnSearchDecodeError),
+    MiscRead(MiscReadDecodeError),
     Uicc(UiccResponseDecodeError),
 }
 
@@ -185,6 +191,7 @@ pub enum ModemCommand<'a> {
     PdnDisconnect(PdnDisconnectRequest<'a>),
     PlmnSearch(PlmnSearchRequest),
     PlmnSearchStop(PlmnSearchStopRequest),
+    MobileIdRead(MobileIdReadRequest),
     Empty(EmptyRequest),
     At(AtCommand<'a>),
     AtExt(AtCommandExt<'a>),
@@ -214,6 +221,7 @@ pub enum ResponseKey {
     PlmnSearch,
     PlmnSearchStop(u8),
     PlmnList,
+    MiscRead,
     Result(ResultResponseKind),
     Uicc(u16),
 }
@@ -237,6 +245,7 @@ impl ModemCommand<'_> {
             }
             Self::PlmnSearch(_) => Some(ResponseKey::PlmnSearch),
             Self::PlmnSearchStop(request) => Some(ResponseKey::PlmnSearchStop(request.search_type)),
+            Self::MobileIdRead(_) => Some(ResponseKey::MiscRead),
             Self::Empty(EmptyRequest::PlmnList) => Some(ResponseKey::PlmnList),
             Self::Empty(EmptyRequest::Online) => {
                 Some(ResponseKey::Result(ResultResponseKind::Online))
@@ -281,6 +290,7 @@ impl ModemEvent<'_> {
                 Some(ResponseKey::PlmnSearchStop(response.search_type))
             }
             Self::PlmnList(_) => Some(ResponseKey::PlmnList),
+            Self::MobileIdRead(_) | Self::MiscReadFailure { .. } => Some(ResponseKey::MiscRead),
             Self::Result { kind, .. } => Some(ResponseKey::Result(*kind)),
             Self::Uicc(response) => Some(ResponseKey::Uicc(response.kind)),
         }
@@ -463,6 +473,7 @@ pub fn encode_command(
         ModemCommand::PdnDisconnect(request) => Ok(request.encode(output)?),
         ModemCommand::PlmnSearch(request) => Ok(request.encode(output)?),
         ModemCommand::PlmnSearchStop(request) => Ok(request.encode(output)?),
+        ModemCommand::MobileIdRead(request) => Ok(request.encode(output)?),
         ModemCommand::Empty(request) => Ok(request.encode(output)?),
         ModemCommand::At(request) => Ok(request.encode(output)?),
         ModemCommand::AtExt(request) => Ok(request.encode(output)?),
@@ -497,6 +508,12 @@ impl From<PdnResponseDecodeError> for EventDecodeError {
 impl From<PlmnSearchDecodeError> for EventDecodeError {
     fn from(value: PlmnSearchDecodeError) -> Self {
         Self::PlmnSearch(value)
+    }
+}
+
+impl From<MiscReadDecodeError> for EventDecodeError {
+    fn from(value: MiscReadDecodeError) -> Self {
+        Self::MiscRead(value)
     }
 }
 
@@ -561,6 +578,13 @@ pub fn decode_event(packet: Packet<'_>) -> Result<ModemEvent<'_>, EventDecodeErr
             Ok(ModemEvent::AtExt(AtCommandFromDeviceExt::parse(packet)?))
         }
         recovered_opcode::UICC_RESPONSE => Ok(ModemEvent::Uicc(UiccResponse::parse(packet)?)),
+        recovered_opcode::MISC_READ_RESPONSE => match MiscReadResponse::parse(packet)? {
+            MiscReadResponse::MobileId(response) => Ok(ModemEvent::MobileIdRead(response)),
+            MiscReadResponse::Failure { read_result } => {
+                Ok(ModemEvent::MiscReadFailure { read_result })
+            }
+            MiscReadResponse::UnsupportedSuccess => Ok(ModemEvent::Unknown(packet)),
+        },
         _ => Ok(ModemEvent::Unknown(packet)),
     }
 }
@@ -746,15 +770,15 @@ mod tests {
     use gct_hci::{Header, Packet, public_opcode, recovered_opcode};
     use gct_lapi::{
         AtCommand, AtCommandExt, AtCommandFromDevice, AttachExtProfile, AttachExtRequest,
-        EmptyRequest, PcoInfo, PinData, PlmnSearchStopRequest, ResponseDecodeError,
-        ResultResponseKind, UiccPinCommandRequest,
+        EmptyRequest, MobileIdReadRequest, PcoInfo, PinData, PlmnSearchStopRequest,
+        ResponseDecodeError, ResultResponseKind, UiccPinCommandRequest,
     };
     use gct_transport::HciIo;
 
     use super::{
         CommandEncodeError, EventDecodeError, Modem, ModemCommand, ModemEvent, PendingError,
         PendingRequests, PollOutcome, ResponseKey, SendCommandError, SendTrackedCommandError,
-        decode_event,
+        decode_event, encode_command,
     };
 
     #[test]
@@ -836,6 +860,48 @@ mod tests {
                 0x33, 0x07, 0x00, 0x03, b'A', b'T', b'\n', // AT
             ]
         );
+    }
+
+    #[test]
+    fn mobile_id_read_uses_shared_misc_family_for_send_success_and_failure() {
+        let request = ModemCommand::MobileIdRead(MobileIdReadRequest { mobile_id_type: 3 });
+        assert_eq!(request.response_key(), Some(ResponseKey::MiscRead));
+        let mut encoded = [0_u8; 16];
+        assert_eq!(encode_command(request, &mut encoded), Ok(9));
+        assert_eq!(
+            &encoded[..9],
+            &[0x31, 0x45, 0x00, 0x05, 0x00, 0x01, 0x00, 0x01, 0x03]
+        );
+
+        let success_payload = [
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x03, 0x00, 0x05, b'1', b'2', b'3', b'4', b'5',
+        ];
+        let success = decode_event(Packet {
+            header: Header {
+                command: recovered_opcode::MISC_READ_RESPONSE,
+                payload_len: 14,
+            },
+            payload: &success_payload,
+        })
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(success.response_key(), Some(ResponseKey::MiscRead));
+        assert!(matches!(
+            success,
+            ModemEvent::MobileIdRead(response)
+                if response.id_type == 3 && response.result == 0 && response.id == b"12345"
+        ));
+
+        let failure_payload = [0x00, 0x07];
+        let failure = decode_event(Packet {
+            header: Header {
+                command: recovered_opcode::MISC_READ_RESPONSE,
+                payload_len: 2,
+            },
+            payload: &failure_payload,
+        })
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(failure, ModemEvent::MiscReadFailure { read_result: 7 });
+        assert_eq!(failure.response_key(), Some(ResponseKey::MiscRead));
     }
 
     #[test]
