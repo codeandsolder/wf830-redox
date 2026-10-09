@@ -1418,3 +1418,36 @@ subtype-specific helpers while adding ICCID rather than weakening the strict
 13-byte subtype-2 parsing, truncated ICCID rejection, shared-family collision,
 callback 79 / slot `0xdc`, subscription gating, and local nonzero-parameter
 rejection before GLIF I/O.
+
+## Live P4 Temperature Read
+
+The live import inventory has one shipped importer of
+`LTED_TemperatureReadRequest`. Live `liblted.so::LTED_TemperatureReadRequest`
+at `0xd3b8` emits SDK command **82** with **zero local parameter bytes**. Live
+`libltesdk.so::LAPI_TemperatureReadRequest@0x4b270` serializes the shared
+read-info request as HCI **`0x3145`** with exact payload `00 04 00 00`:
+subtype **4**, empty subtype body.
+
+The live shared `0xb146` dispatcher routes subtype 4 to handler `0x16798`.
+That handler obtains SDK response slot **29**, zeroes exactly four bytes,
+converts/stores `read_result:u16@0`, copies `result:u8@2`, and copies the next
+byte as the temperature value at offset 3. B014 DWARF independently proves
+`_TEMPERATURE_READ_RSP_INFO` is exactly **4 bytes**:
+`read_result:u16@0 | result:u8@2 | temperature:s8@3`. Rust therefore models
+temperature as signed `i8` and uses explicit signed/unsigned byte casts at the
+wire boundary rather than implicit wrapping casts.
+
+Live daemon `ind_temperature_read_response@0x28c74` emits stock callback
+**83** and always assembles the exact four-byte historical response object.
+The live registration is independently pinned: SDK slot 29 loads literal
+`0xfffef648` from `0x39b4c`, which resolves at the registration site to
+`0x28c74`. Live stock `liblted.so` callback dispatch reads the callback pointer
+at **offset `0xec`**, i.e. `cb_rsp[29]`.
+
+Temperature Read is another member of the shared family-level
+`ResponseKey::MiscRead`, preventing overlap with Mobile ID, ICCID, and MSISDN
+when the shared top-level failure path carries no subtype identity. Tests cover
+exact command-82/HCI request bytes, signed negative-temperature decoding,
+truncated subtype-body rejection, shared-family collision, exact callback 83 /
+slot `0xec`, subscription gating, and local nonzero-parameter rejection before
+GLIF I/O.

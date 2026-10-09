@@ -2027,6 +2027,34 @@ impl MobileIdReadRequest {
     }
 }
 
+/// Temperature read request carried by the shared `0x3145` read-info command.
+///
+/// Live P4 `LAPI_TemperatureReadRequest` emits subtype 4 with an empty subtype body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TemperatureReadRequest;
+
+impl TemperatureReadRequest {
+    /// Encode exact live-P4 bytes `31 45 00 04 00 04 00 00`.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than eight bytes.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        encode_packet(
+            recovered_opcode::MISC_READ_REQUEST,
+            &[0x00, 0x04, 0x00, 0x00],
+            output,
+        )
+    }
+}
+
+/// Temperature response recovered from shared response `0xb146` subtype 4.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TemperatureReadResponse {
+    pub read_result: u16,
+    pub result: u8,
+    pub temperature: i8,
+}
+
 /// ICCID read request carried by the shared `0x3145` read-info command.
 ///
 /// Live P4 `LAPI_ICCIDReadRequest` emits subtype 2 with an empty subtype body.
@@ -2121,6 +2149,7 @@ pub enum MiscReadResponse<'a> {
     MobileId(MobileIdReadResponse<'a>),
     Iccid(IccidReadResponse<'a>),
     Msisdn(MsisdnReadResponse<'a>),
+    Temperature(TemperatureReadResponse),
     /// Successful response containing only not-yet-modeled read subtypes.
     UnsupportedSuccess,
 }
@@ -2148,6 +2177,10 @@ pub enum MiscReadDecodeError {
         available: usize,
     },
     IccidBodyTooShort {
+        minimum: usize,
+        actual: usize,
+    },
+    TemperatureBodyTooShort {
         minimum: usize,
         actual: usize,
     },
@@ -2217,6 +2250,24 @@ fn parse_iccid_chunk(
     }))
 }
 
+fn parse_temperature_chunk(
+    read_result: u16,
+    body: &[u8],
+) -> Result<MiscReadResponse<'_>, MiscReadDecodeError> {
+    const TEMPERATURE_BODY_LEN: usize = 2;
+    if body.len() < TEMPERATURE_BODY_LEN {
+        return Err(MiscReadDecodeError::TemperatureBodyTooShort {
+            minimum: TEMPERATURE_BODY_LEN,
+            actual: body.len(),
+        });
+    }
+    Ok(MiscReadResponse::Temperature(TemperatureReadResponse {
+        read_result,
+        result: body[0],
+        temperature: body[1].cast_signed(),
+    }))
+}
+
 fn parse_msisdn_chunk(
     read_result: u16,
     body: &[u8],
@@ -2268,7 +2319,7 @@ impl<'a> MiscReadResponse<'a> {
     ///
     /// Wire grammar on success is `read_result:u16 == 0`, followed by zero or
     /// more chunks `subtype:u16 | len:u16 | body[len]`. Mobile ID is subtype 1,
-    /// ICCID is subtype 2, and MSISDN is subtype 3.
+    /// ICCID is subtype 2, MSISDN is subtype 3, and temperature is subtype 4.
     ///
     /// # Errors
     /// Returns [`MiscReadDecodeError`] for the wrong opcode, a truncated chunk
@@ -2305,6 +2356,7 @@ impl<'a> MiscReadResponse<'a> {
                 1 => return parse_mobile_id_chunk(read_result, body),
                 2 => return parse_iccid_chunk(read_result, body),
                 3 => return parse_msisdn_chunk(read_result, body),
+                4 => return parse_temperature_chunk(read_result, body),
                 _ => offset = body_start + declared,
             }
         }
@@ -5588,7 +5640,7 @@ mod tests {
             Ok(super::MiscReadResponse::Failure { read_result: 7 })
         );
 
-        let unsupported = [0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0xaa];
+        let unsupported = [0x00, 0x00, 0x7f, 0xff, 0x00, 0x01, 0xaa];
         assert_eq!(
             super::MiscReadResponse::parse(packet(
                 super::recovered_opcode::MISC_READ_RESPONSE,
@@ -5622,6 +5674,40 @@ mod tests {
                 subtype: 1,
                 declared: 5,
                 actual: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn temperature_read_matches_shared_live_p4_request_and_signed_response() {
+        let mut request = [0_u8; 8];
+        assert_eq!(super::TemperatureReadRequest.encode(&mut request), Ok(8));
+        assert_eq!(request, [0x31, 0x45, 0, 4, 0, 4, 0, 0]);
+
+        let payload = [0, 0, 0, 4, 0, 2, 0, 0xef];
+        assert_eq!(
+            super::MiscReadResponse::parse(packet(
+                super::recovered_opcode::MISC_READ_RESPONSE,
+                &payload,
+            )),
+            Ok(super::MiscReadResponse::Temperature(
+                super::TemperatureReadResponse {
+                    read_result: 0,
+                    result: 0,
+                    temperature: -17,
+                }
+            ))
+        );
+
+        let truncated = [0, 0, 0, 4, 0, 1, 0];
+        assert_eq!(
+            super::MiscReadResponse::parse(packet(
+                super::recovered_opcode::MISC_READ_RESPONSE,
+                &truncated,
+            )),
+            Err(super::MiscReadDecodeError::TemperatureBodyTooShort {
+                minimum: 2,
+                actual: 1,
             })
         );
     }

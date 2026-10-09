@@ -21,9 +21,9 @@ use gct_lapi::{
     PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError,
     PlmnListResponse, PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchResponse,
     PlmnSearchStopRequest, PlmnSearchStopResponse, Positioning, PsmControlRequest, QosField,
-    ResultResponse, ResultResponseKind, UeModeChangeRequest, UeModeChangeResponse,
-    UiccFixedRequest, UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest,
-    UiccResponse, UiccStatusRequest, uicc_control,
+    ResultResponse, ResultResponseKind, TemperatureReadRequest, TemperatureReadResponse,
+    UeModeChangeRequest, UeModeChangeResponse, UiccFixedRequest, UiccPinStatusRequest,
+    UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse, UiccStatusRequest, uicc_control,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -1683,6 +1683,28 @@ pub fn broadcast_mobile_id_callback(
     broadcast_variable_callback(server, device_id, SdkCallbackKind::MobileIdRead, &data)
 }
 
+/// Broadcast stock callback 83 (`TEMPERATURE_READ_RSP`) through `cb_rsp[29]`.
+///
+/// Live P4 forwards the exact four-byte historical object
+/// `read_result:u16 | result:u8 | temperature:s8`.
+///
+/// # Errors
+/// Returns [`HandleError::Ipc`] for local IPC failures.
+pub fn broadcast_temperature_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: TemperatureReadResponse,
+) -> Result<BroadcastReport, HandleError> {
+    let read_result = response.read_result.to_be_bytes();
+    let data = [
+        read_result[0],
+        read_result[1],
+        response.result,
+        response.temperature.cast_unsigned(),
+    ];
+    broadcast_variable_callback(server, device_id, SdkCallbackKind::TemperatureRead, &data)
+}
+
 /// Broadcast stock callback 79 (`ICCID_READ_RSP`) through `cb_rsp[27]`.
 ///
 /// Live P4 forwards the exact 13-byte historical object
@@ -2353,6 +2375,7 @@ impl DeviceBridge {
                 Ok(SdkCommand::MobileIdRead) => self.dispatch_mobile_id_read(modem, request),
                 Ok(SdkCommand::IccidRead) => self.dispatch_iccid_read(modem, request),
                 Ok(SdkCommand::MsisdnRead) => self.dispatch_msisdn_read(modem, request),
+                Ok(SdkCommand::TemperatureRead) => self.dispatch_temperature_read(modem, request),
                 Ok(SdkCommand::AtCommand) => Self::dispatch_at(modem, request),
                 Ok(SdkCommand::AtCommandExt) => Self::dispatch_at_ext(modem, request),
                 Ok(SdkCommand::UiccRequest) => self.dispatch_uicc(modem, request),
@@ -2416,6 +2439,14 @@ impl DeviceBridge {
                     return Ok(None);
                 }
                 broadcast_mobile_id_callback(server, self.device_id, *response).map(Some)
+            }
+            ModemEvent::TemperatureRead(response) => {
+                if !self.pending.contains(ResponseKey::MiscRead) {
+                    return Ok(None);
+                }
+                let report = broadcast_temperature_callback(server, self.device_id, *response)?;
+                self.pending.remove(ResponseKey::MiscRead);
+                Ok(Some(report))
             }
             ModemEvent::MsisdnRead(response) => {
                 if !self.pending.contains(ResponseKey::MiscRead) {
@@ -2566,6 +2597,7 @@ impl DeviceBridge {
             ModemEvent::MobileIdRead(_)
             | ModemEvent::IccidRead(_)
             | ModemEvent::MsisdnRead(_)
+            | ModemEvent::TemperatureRead(_)
             | ModemEvent::MiscReadFailure { .. } => self.handle_misc_read_event(server, event),
             ModemEvent::PlmnList(response) => {
                 let key = ResponseKey::PlmnList;
@@ -3033,6 +3065,29 @@ impl DeviceBridge {
             modem.send_command(ModemCommand::AtExt(AtCommandExt::new(channel, command)))?;
         Ok(HandledCall {
             command: SdkCommand::AtCommandExt,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_temperature_read<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        if !request.params.is_empty() {
+            return Err(HandleError::UnexpectedParameters {
+                command: request.command,
+                expected: 0,
+                actual: request.params.len(),
+            });
+        }
+        let bytes_written = modem.send_tracked_command(
+            &mut self.pending,
+            ModemCommand::TemperatureRead(TemperatureReadRequest),
+        )?;
+        Ok(HandledCall {
+            command: SdkCommand::TemperatureRead,
             device_id: request.device_id,
             bytes_written,
         })
@@ -4943,6 +4998,104 @@ mod tests {
             std::process::abort();
         };
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn stock_temperature_read_matches_live_p4_hci_and_callback_83() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, subscribed_id) = open_client(&mut server, &dir, 0);
+        let (unsubscribed, _unsubscribed_id) = open_client(&mut server, &dir, 1);
+        server
+            .client_context(subscribed_id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::TemperatureRead.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                subscribed_id,
+                SdkApiRequest {
+                    command: SdkCommand::TemperatureRead as u16,
+                    device_id: 1,
+                    params: &[],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.bytes_written, 8);
+        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            [0x31, 0x45, 0, 4, 0, 4, 0, 0]
+        );
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                vec![0xb1, 0x46, 0, 8, 0, 0, 0, 4, 0, 2, 0, 0xef],
+            ),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        let mut frame = [0_u8; 32];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(len, 16);
+        let callback = SdkCallback::parse(
+            Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 83);
+        assert_eq!(callback.data, &[0, 0, 0, 0xef]);
+
+        unsubscribed
+            .set_nonblocking(true)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut no_frame = [0_u8; 1];
+        let Err(error) = unsubscribed.recv(&mut no_frame) else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn malformed_stock_temperature_read_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::TemperatureRead as u16,
+                    device_id: 1,
+                    params: &[0],
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                command: 82,
+                expected: 0,
+                actual: 1,
+            })
+        ));
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]
