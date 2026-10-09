@@ -354,9 +354,14 @@ pub mod recovered_opcode {
     pub const UE_MODE_CHANGE_REQUEST: u16 = 0x3118;
     /// Shared EMM control request used by timer-control and NI-reattach families.
     pub const EMM_CONTROL_REQUEST: u16 = 0x3155;
+    /// RRC-capability set request used by the shipped connection manager.
+    pub const RRC_CAPABILITY_CONTROL_REQUEST: u16 = 0x3906;
+    /// RRC-capability get request used by the shipped connection manager.
+    pub const RRC_CAPABILITY_CONTROL_GET_REQUEST: u16 = 0x390d;
 
-    // Response values below are proven by the `decode_hci_packet` dispatch
-    // table at B014 virtual address 0x89f6c.
+    // Response values below are proven by recovered SDK dispatch tables.
+    // Older families were cross-checked against B014; newer P4-only entries
+    // are pinned directly from the live P4 table rather than opcode adjacency.
     pub const ATTACH_RESPONSE: u16 = 0xb102;
     pub const ATTACH_RESPONSE_EXT: u16 = 0xb166;
     pub const DETACH_RESPONSE: u16 = 0xb104;
@@ -380,6 +385,10 @@ pub mod recovered_opcode {
     pub const EMM_CONTROL_RESPONSE: u16 = 0xb156;
     /// Shared unsolicited EMM-control report envelope.
     pub const EMM_CONTROL_REPORT: u16 = 0xb164;
+    /// Response to `RRC_CAPABILITY_CONTROL_REQUEST`; live SDK callback slot 115.
+    pub const RRC_CAPABILITY_CONTROL_RESPONSE: u16 = 0xb907;
+    /// Response to `RRC_CAPABILITY_CONTROL_GET_REQUEST`; live SDK callback slot 116.
+    pub const RRC_CAPABILITY_CONTROL_GET_RESPONSE: u16 = 0xb90e;
 }
 
 #[cfg(test)]

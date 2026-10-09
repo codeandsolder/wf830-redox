@@ -25,7 +25,8 @@ use gct_lapi::{
     PdnResponseDecodeError, PlmnListResponse, PlmnSearchDecodeError, PlmnSearchExtEncodeError,
     PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest,
     PlmnSearchStopResponse, PsmControlRequest, ResponseDecodeError, ResultResponse,
-    ResultResponseKind, TemperatureReadRequest, TemperatureReadResponse, UeModeChangeRequest,
+    ResultResponseKind, RrcCapabilityGetRequest, RrcCapabilityGetResponse, RrcCapabilitySetRequest,
+    RrcCapabilitySetResponse, TemperatureReadRequest, TemperatureReadResponse, UeModeChangeRequest,
     UeModeChangeResponse, UiccAuthenticateEncodeError, UiccAuthenticateRequest, UiccFixedRequest,
     UiccFixedRequestError, UiccPinCommandRequest, UiccPinEncodeError, UiccPinStatusRequest,
     UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse, UiccResponseDecodeError,
@@ -175,6 +176,8 @@ pub enum ModemEvent<'a> {
     At(AtCommandFromDevice<'a>),
     AtExt(AtCommandFromDeviceExt<'a>),
     Uicc(UiccResponse<'a>),
+    RrcCapabilitySet(RrcCapabilitySetResponse<'a>),
+    RrcCapabilityGet(RrcCapabilityGetResponse<'a>),
     Unknown(Packet<'a>),
 }
 
@@ -227,6 +230,8 @@ pub enum ModemCommand<'a> {
     UiccAuthenticate(UiccAuthenticateRequest<'a>),
     UiccPinStatus(UiccPinStatusRequest),
     UiccPinCommand(UiccPinCommandRequest<'a>),
+    RrcCapabilitySet(RrcCapabilitySetRequest<'a>),
+    RrcCapabilityGet(RrcCapabilityGetRequest),
 }
 
 /// Identity available on both sides of a proven request/response exchange.
@@ -251,6 +256,8 @@ pub enum ResponseKey {
     EmmNiReattachControl,
     Result(ResultResponseKind),
     Uicc(u16),
+    RrcCapabilitySet(u16),
+    RrcCapabilityGet(u16),
 }
 
 impl ModemCommand<'_> {
@@ -302,6 +309,8 @@ impl ModemCommand<'_> {
             Self::UiccAuthenticate(_) => Some(ResponseKey::Uicc(uicc_control::AUTHENTICATE)),
             Self::UiccPinStatus(_) => Some(ResponseKey::Uicc(uicc_control::PIN_STATUS)),
             Self::UiccPinCommand(_) => Some(ResponseKey::Uicc(uicc_control::PIN_COMMAND)),
+            Self::RrcCapabilitySet(request) => Some(ResponseKey::RrcCapabilitySet(request.type_id)),
+            Self::RrcCapabilityGet(request) => Some(ResponseKey::RrcCapabilityGet(request.type_id)),
         }
     }
 }
@@ -341,6 +350,12 @@ impl ModemEvent<'_> {
             Self::EmmNiReattachControl { .. } => Some(ResponseKey::EmmNiReattachControl),
             Self::Result { kind, .. } => Some(ResponseKey::Result(*kind)),
             Self::Uicc(response) => Some(ResponseKey::Uicc(response.kind)),
+            Self::RrcCapabilitySet(response) => {
+                Some(ResponseKey::RrcCapabilitySet(response.type_id))
+            }
+            Self::RrcCapabilityGet(response) => {
+                Some(ResponseKey::RrcCapabilityGet(response.type_id))
+            }
         }
     }
 }
@@ -550,6 +565,8 @@ pub fn encode_command(
         ModemCommand::UiccAuthenticate(request) => Ok(request.encode(output)?),
         ModemCommand::UiccPinStatus(request) => Ok(request.encode(output)?),
         ModemCommand::UiccPinCommand(request) => Ok(request.encode(output)?),
+        ModemCommand::RrcCapabilitySet(request) => Ok(request.encode(output)?),
+        ModemCommand::RrcCapabilityGet(request) => Ok(request.encode(output)?),
     }
 }
 
@@ -661,6 +678,12 @@ pub fn decode_event(packet: Packet<'_>) -> Result<ModemEvent<'_>, EventDecodeErr
             EmmControlReport::Reattach(report) => Ok(ModemEvent::EmmReattachControlReport(report)),
             EmmControlReport::Unsupported { .. } => Ok(ModemEvent::Unknown(packet)),
         },
+        recovered_opcode::RRC_CAPABILITY_CONTROL_RESPONSE => Ok(ModemEvent::RrcCapabilitySet(
+            RrcCapabilitySetResponse::parse(packet)?,
+        )),
+        recovered_opcode::RRC_CAPABILITY_CONTROL_GET_RESPONSE => Ok(ModemEvent::RrcCapabilityGet(
+            RrcCapabilityGetResponse::parse(packet)?,
+        )),
         recovered_opcode::MISC_READ_RESPONSE => match MiscReadResponse::parse(packet)? {
             MiscReadResponse::MobileId(response) => Ok(ModemEvent::MobileIdRead(response)),
             MiscReadResponse::Iccid(response) => Ok(ModemEvent::IccidRead(response)),
@@ -860,7 +883,8 @@ mod tests {
         IccidReadRequest, LcsControlRequest, LppControlRequest, MobileIdReadRequest,
         MsisdnReadRequest, PcoInfo, PinData, PlmnSearchExtRequest, PlmnSearchRequest,
         PlmnSearchStopRequest, PsmControlRequest, ResponseDecodeError, ResultResponseKind,
-        TemperatureReadRequest, UiccPinCommandRequest,
+        RrcCapabilityGetRequest, RrcCapabilitySetRequest, TemperatureReadRequest,
+        UiccPinCommandRequest,
     };
     use gct_transport::HciIo;
 
@@ -1449,6 +1473,49 @@ mod tests {
             Ok(ModemEvent::UeModeChange(gct_lapi::UeModeChangeResponse {
                 result: 0x7f,
             }))
+        );
+    }
+
+    #[test]
+    fn rrc_capability_tracks_by_type_and_decodes_both_response_families() {
+        let set = ModemCommand::RrcCapabilitySet(RrcCapabilitySetRequest {
+            type_id: 18,
+            data: &[0xaa],
+        });
+        let get = ModemCommand::RrcCapabilityGet(RrcCapabilityGetRequest { type_id: 4 });
+        assert_eq!(set.response_key(), Some(ResponseKey::RrcCapabilitySet(18)));
+        assert_eq!(get.response_key(), Some(ResponseKey::RrcCapabilityGet(4)));
+
+        let set_payload = [0, 0, 0, 0, 0, 18];
+        let set_packet = Packet {
+            header: Header {
+                command: recovered_opcode::RRC_CAPABILITY_CONTROL_RESPONSE,
+                payload_len: 6,
+            },
+            payload: &set_payload,
+        };
+        let Ok(set_event) = decode_event(set_packet) else {
+            std::process::abort();
+        };
+        assert_eq!(
+            set_event.response_key(),
+            Some(ResponseKey::RrcCapabilitySet(18))
+        );
+
+        let get_payload = [0, 0, 0, 4, 0, 1, 7];
+        let get_packet = Packet {
+            header: Header {
+                command: recovered_opcode::RRC_CAPABILITY_CONTROL_GET_RESPONSE,
+                payload_len: 7,
+            },
+            payload: &get_payload,
+        };
+        let Ok(get_event) = decode_event(get_packet) else {
+            std::process::abort();
+        };
+        assert_eq!(
+            get_event.response_key(),
+            Some(ResponseKey::RrcCapabilityGet(4))
         );
     }
 

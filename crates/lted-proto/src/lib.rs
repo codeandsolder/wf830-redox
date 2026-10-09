@@ -44,6 +44,8 @@ pub enum SdkCallbackKind {
     UeModeChange,
     EmmNiReattachControl,
     EmmReattachControlReport,
+    RrcCapabilityControl,
+    RrcCapabilityControlGet,
 }
 
 impl SdkCallbackKind {
@@ -73,6 +75,8 @@ impl SdkCallbackKind {
             Self::UeModeChange => 162,
             Self::EmmNiReattachControl => 308,
             Self::EmmReattachControlReport => 309,
+            Self::RrcCapabilityControl => 221,
+            Self::RrcCapabilityControlGet => 223,
         }
     }
 
@@ -102,6 +106,8 @@ impl SdkCallbackKind {
             Self::UeModeChange => 82,
             Self::EmmNiReattachControl => 159,
             Self::EmmReattachControlReport => 160,
+            Self::RrcCapabilityControl => 115,
+            Self::RrcCapabilityControlGet => 116,
         }
     }
 
@@ -179,6 +185,8 @@ pub enum SdkCommand {
     LppControl = 210,
     EmmNiReattachControl = 211,
     EmmTimerStart = 213,
+    RrcCapabilityControl = 220,
+    RrcCapabilityControlGet = 222,
 }
 
 impl TryFrom<u16> for SdkCommand {
@@ -214,6 +222,8 @@ impl TryFrom<u16> for SdkCommand {
             210 => Ok(Self::LppControl),
             211 => Ok(Self::EmmNiReattachControl),
             213 => Ok(Self::EmmTimerStart),
+            220 => Ok(Self::RrcCapabilityControl),
+            222 => Ok(Self::RrcCapabilityControlGet),
             _ => Err(UnknownSdkCommand(value)),
         }
     }
@@ -633,6 +643,14 @@ mod tests {
             Ok(SdkCommand::EmmNiReattachControl)
         );
         assert_eq!(SdkCommand::try_from(213), Ok(SdkCommand::EmmTimerStart));
+        assert_eq!(
+            SdkCommand::try_from(220),
+            Ok(SdkCommand::RrcCapabilityControl)
+        );
+        assert_eq!(
+            SdkCommand::try_from(222),
+            Ok(SdkCommand::RrcCapabilityControlGet)
+        );
         assert!(SdkCommand::try_from(0xffff).is_err());
     }
 
@@ -830,6 +848,16 @@ mod tests {
         assert_eq!(
             SdkCallbackKind::EmmReattachControlReport.registration_offset(),
             0x504
+        );
+        assert_eq!(SdkCallbackKind::RrcCapabilityControl.callback_id(), 221);
+        assert_eq!(
+            SdkCallbackKind::RrcCapabilityControl.registration_offset(),
+            0x39c
+        );
+        assert_eq!(SdkCallbackKind::RrcCapabilityControlGet.callback_id(), 223);
+        assert_eq!(
+            SdkCallbackKind::RrcCapabilityControlGet.registration_offset(),
+            0x3a4
         );
     }
 

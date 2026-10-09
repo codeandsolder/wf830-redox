@@ -4355,6 +4355,166 @@ impl<'a> AtCommandFromDeviceExt<'a> {
     }
 }
 
+/// RRC-capability set request `0x3906`.
+///
+/// Live P4 `LAPI_RRCCapabilityControlRequest` serializes a common
+/// `type:u16 | len:u16 | data[len]` payload for the shipped connection-manager
+/// type IDs. Type-specific policy belongs above this wire codec.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RrcCapabilitySetRequest<'a> {
+    pub type_id: u16,
+    pub data: &'a [u8],
+}
+
+impl RrcCapabilitySetRequest<'_> {
+    /// Encode the exact common live-P4 RRC-capability set frame.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::PayloadTooLong`] if `data` plus the four-byte
+    /// common prefix cannot fit the HCI u16 payload length, or
+    /// [`EncodeError::NoSpace`] when `output` is too small.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        let data_len = u16::try_from(self.data.len()).map_err(|_| EncodeError::PayloadTooLong)?;
+        let payload_len = 4_usize
+            .checked_add(self.data.len())
+            .ok_or(EncodeError::PayloadTooLong)?;
+        let payload_len_u16 =
+            u16::try_from(payload_len).map_err(|_| EncodeError::PayloadTooLong)?;
+        let total = HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or(EncodeError::PayloadTooLong)?;
+        let Some(dst) = output.get_mut(..total) else {
+            return Err(EncodeError::NoSpace);
+        };
+        dst[..HEADER_LEN].copy_from_slice(
+            &Header {
+                command: recovered_opcode::RRC_CAPABILITY_CONTROL_REQUEST,
+                payload_len: payload_len_u16,
+            }
+            .encode(),
+        );
+        dst[4..6].copy_from_slice(&self.type_id.to_be_bytes());
+        dst[6..8].copy_from_slice(&data_len.to_be_bytes());
+        dst[8..].copy_from_slice(self.data);
+        Ok(total)
+    }
+}
+
+/// RRC-capability get request `0x390d`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RrcCapabilityGetRequest {
+    pub type_id: u16,
+}
+
+impl RrcCapabilityGetRequest {
+    /// Encode the exact two-byte type selector consumed by the live SDK.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than six bytes.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        encode_packet(
+            recovered_opcode::RRC_CAPABILITY_CONTROL_GET_REQUEST,
+            &self.type_id.to_be_bytes(),
+            output,
+        )
+    }
+}
+
+/// Live `0xb907` RRC-capability set response.
+///
+/// The SDK normalizes the common header as `result:u16 | len:u16 | type:u16`
+/// and preserves any declared trailing bytes. The stock daemon callback uses
+/// only the first six bytes, but keeping `data` here preserves modem evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RrcCapabilitySetResponse<'a> {
+    pub result: u16,
+    pub type_id: u16,
+    pub data: &'a [u8],
+}
+
+impl<'a> RrcCapabilitySetResponse<'a> {
+    /// Decode the exact common set-response envelope.
+    ///
+    /// # Errors
+    /// Returns [`ResponseDecodeError`] for another opcode, a prefix shorter
+    /// than six bytes, or a declared data length inconsistent with the frame.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, ResponseDecodeError> {
+        let payload = response_payload(packet, recovered_opcode::RRC_CAPABILITY_CONTROL_RESPONSE)?;
+        if payload.len() < 6 {
+            return Err(ResponseDecodeError::TruncatedPrefix {
+                minimum: 6,
+                actual: payload.len(),
+            });
+        }
+        let declared = usize::from(be_u16(payload, 2));
+        let expected =
+            6_usize
+                .checked_add(declared)
+                .ok_or(ResponseDecodeError::UnexpectedLength {
+                    expected: usize::MAX,
+                    actual: payload.len(),
+                })?;
+        if payload.len() != expected {
+            return Err(ResponseDecodeError::UnexpectedLength {
+                expected,
+                actual: payload.len(),
+            });
+        }
+        Ok(Self {
+            result: be_u16(payload, 0),
+            type_id: be_u16(payload, 4),
+            data: &payload[6..],
+        })
+    }
+}
+
+/// Live `0xb90e` RRC-capability get response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RrcCapabilityGetResponse<'a> {
+    pub result: u16,
+    pub type_id: u16,
+    pub data: &'a [u8],
+}
+
+impl<'a> RrcCapabilityGetResponse<'a> {
+    /// Decode `result:u16 | type:u16 | len:u16 | data[len]`.
+    ///
+    /// # Errors
+    /// Returns [`ResponseDecodeError`] for another opcode, a short prefix, or
+    /// a declared data length inconsistent with the complete HCI frame.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, ResponseDecodeError> {
+        let payload = response_payload(
+            packet,
+            recovered_opcode::RRC_CAPABILITY_CONTROL_GET_RESPONSE,
+        )?;
+        if payload.len() < 6 {
+            return Err(ResponseDecodeError::TruncatedPrefix {
+                minimum: 6,
+                actual: payload.len(),
+            });
+        }
+        let declared = usize::from(be_u16(payload, 4));
+        let expected =
+            6_usize
+                .checked_add(declared)
+                .ok_or(ResponseDecodeError::UnexpectedLength {
+                    expected: usize::MAX,
+                    actual: payload.len(),
+                })?;
+        if payload.len() != expected {
+            return Err(ResponseDecodeError::UnexpectedLength {
+                expected,
+                actual: payload.len(),
+            });
+        }
+        Ok(Self {
+            result: be_u16(payload, 0),
+            type_id: be_u16(payload, 2),
+            data: &payload[6..],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -4365,7 +4525,8 @@ mod tests {
         PdnConnectResponsePrefix, PdnConnectionControl, PdnDisconnectRequest,
         PdnDisconnectResponsePrefix, PdnEncodeError, PdnField, PdnInfoContainerKind,
         PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, Positioning, QosField,
-        ResponseDecodeError, ResultResponse, ResultResponseKind,
+        ResponseDecodeError, ResultResponse, ResultResponseKind, RrcCapabilityGetRequest,
+        RrcCapabilityGetResponse, RrcCapabilitySetRequest, RrcCapabilitySetResponse,
     };
     use gct_hci::{Header, Packet, Tlv};
 
@@ -6515,6 +6676,53 @@ mod tests {
             Err(super::ResponseDecodeError::UnexpectedLength {
                 expected: 1,
                 actual: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn rrc_capability_common_frames_match_live_p4_set_and_get_grammar() {
+        let mut set_frame = [0_u8; 13];
+        let set = RrcCapabilitySetRequest {
+            type_id: 4,
+            data: &[2, 0, 1, 0, 2],
+        };
+        assert_eq!(set.encode(&mut set_frame), Ok(13));
+        assert_eq!(
+            set_frame,
+            [
+                0x39, 0x06, 0x00, 0x09, 0x00, 0x04, 0x00, 0x05, 2, 0, 1, 0, 2
+            ]
+        );
+
+        let mut get_frame = [0_u8; 6];
+        assert_eq!(
+            (RrcCapabilityGetRequest { type_id: 18 }).encode(&mut get_frame),
+            Ok(6)
+        );
+        assert_eq!(get_frame, [0x39, 0x0d, 0x00, 0x02, 0x00, 0x12]);
+
+        assert_eq!(
+            RrcCapabilitySetResponse::parse(packet(0xb907, &[0, 0, 0, 0, 0, 18])),
+            Ok(RrcCapabilitySetResponse {
+                result: 0,
+                type_id: 18,
+                data: &[],
+            })
+        );
+        assert_eq!(
+            RrcCapabilityGetResponse::parse(packet(0xb90e, &[0, 0, 0, 4, 0, 5, 2, 0, 1, 0, 2],)),
+            Ok(RrcCapabilityGetResponse {
+                result: 0,
+                type_id: 4,
+                data: &[2, 0, 1, 0, 2],
+            })
+        );
+        assert_eq!(
+            RrcCapabilityGetResponse::parse(packet(0xb90e, &[0, 0, 0, 4, 0, 5, 2, 0, 1])),
+            Err(ResponseDecodeError::UnexpectedLength {
+                expected: 11,
+                actual: 9,
             })
         );
     }

@@ -21,9 +21,11 @@ use gct_lapi::{
     PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError,
     PlmnListResponse, PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchResponse,
     PlmnSearchStopRequest, PlmnSearchStopResponse, Positioning, PsmControlRequest, QosField,
-    ResultResponse, ResultResponseKind, TemperatureReadRequest, TemperatureReadResponse,
-    UeModeChangeRequest, UeModeChangeResponse, UiccFixedRequest, UiccPinStatusRequest,
-    UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse, UiccStatusRequest, uicc_control,
+    ResultResponse, ResultResponseKind, RrcCapabilityGetRequest, RrcCapabilityGetResponse,
+    RrcCapabilitySetRequest, RrcCapabilitySetResponse, TemperatureReadRequest,
+    TemperatureReadResponse, UeModeChangeRequest, UeModeChangeResponse, UiccFixedRequest,
+    UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse,
+    UiccStatusRequest, uicc_control,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -57,6 +59,8 @@ pub enum HandleError {
     LegacyPdnConnectExt(LegacyPdnConnectExtDecodeError),
     LegacyPdnDisconnect(LegacyPdnDisconnectDecodeError),
     LegacyUicc(LegacyUiccDecodeError),
+    LegacyRrcCapability(LegacyRrcCapabilityDecodeError),
+    RrcCapabilityCallback(RrcCapabilityCallbackError),
     UiccCallback(UiccCallbackError),
     AttachCallback(AttachCallbackError),
     AttachExtCallback(AttachExtCallbackError),
@@ -106,6 +110,12 @@ impl std::fmt::Display for HandleError {
                 write!(f, "invalid stock PDN-disconnect request: {error:?}")
             }
             Self::LegacyUicc(error) => write!(f, "invalid stock UICC request: {error:?}"),
+            Self::LegacyRrcCapability(error) => {
+                write!(f, "invalid stock RRC-capability request: {error:?}")
+            }
+            Self::RrcCapabilityCallback(error) => {
+                write!(f, "invalid RRC-capability callback payload: {error:?}")
+            }
             Self::UiccCallback(error) => write!(f, "invalid UICC callback payload: {error:?}"),
             Self::AttachCallback(error) => write!(f, "invalid attach callback payload: {error:?}"),
             Self::AttachExtCallback(error) => {
@@ -145,6 +155,8 @@ impl std::error::Error for HandleError {
             | Self::LegacyPdnConnectExt(_)
             | Self::LegacyPdnDisconnect(_)
             | Self::LegacyUicc(_)
+            | Self::LegacyRrcCapability(_)
+            | Self::RrcCapabilityCallback(_)
             | Self::UiccCallback(_)
             | Self::AttachCallback(_)
             | Self::AttachExtCallback(_)
@@ -184,6 +196,122 @@ pub const LEGACY_PDN_CONNECT_PARAMS_LEN: usize = 0x1a4;
 pub const LEGACY_PDN_CONNECT_EXT_PARAMS_LEN: usize = 0x0f4;
 pub const LEGACY_PDN_DISCONNECT_FIXED_LEN: usize = 4;
 pub const LEGACY_PDN_DISCONNECT_MAX_LEN: usize = 0x44;
+
+/// RRC-capability type IDs exercised by the shipped P4 `lteautocm` binary.
+///
+/// The live SDK contains a much broader switch, but the replacement deliberately
+/// exposes only product-demanded shapes until another callsite is independently
+/// proven.
+const fn is_shipped_rrc_capability_type(type_id: u16) -> bool {
+    matches!(type_id, 1 | 2 | 3 | 4 | 11 | 18 | 20)
+}
+
+/// Successful set responses for types 11 and 20 are intentionally rejected by
+/// the live SDK response converter; failures still reach callback slot 115.
+const fn rrc_capability_set_success_has_callback(type_id: u16) -> bool {
+    matches!(type_id, 1 | 2 | 3 | 4 | 18)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyRrcCapabilityDecodeError {
+    Truncated {
+        minimum: usize,
+        actual: usize,
+    },
+    UnexpectedLength {
+        expected: usize,
+        actual: usize,
+    },
+    LengthMismatch {
+        declared: usize,
+        actual: usize,
+    },
+    UnsupportedType(u16),
+    Type4ListTruncated {
+        count: u8,
+        minimum_data_len: usize,
+        actual_data_len: usize,
+    },
+}
+
+fn validate_rrc_type4_list(data: &[u8]) -> Result<(), LegacyRrcCapabilityDecodeError> {
+    let Some(&count) = data.first() else {
+        return Err(LegacyRrcCapabilityDecodeError::Type4ListTruncated {
+            count: 0,
+            minimum_data_len: 1,
+            actual_data_len: 0,
+        });
+    };
+    let minimum_data_len = 1_usize.saturating_add(usize::from(count).saturating_mul(2));
+    if data.len() < minimum_data_len {
+        return Err(LegacyRrcCapabilityDecodeError::Type4ListTruncated {
+            count,
+            minimum_data_len,
+            actual_data_len: data.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Decode stock SDK command 220's variable local object.
+///
+/// Although B014 DWARF describes a five-byte flexible C struct, live
+/// `LTED_RRCCapabilityControlRequest` forwards exactly `4 + len` bytes, so a
+/// zero-length object is four bytes on the UNIX datagram boundary.
+///
+/// # Errors
+/// Rejects a malformed flexible envelope, an unshipped type ID, or an unsafe
+/// type-4 count/list shape before GLIF is touched.
+pub fn decode_legacy_rrc_capability_set(
+    params: &[u8],
+) -> Result<RrcCapabilitySetRequest<'_>, LegacyRrcCapabilityDecodeError> {
+    if params.len() < 4 {
+        return Err(LegacyRrcCapabilityDecodeError::Truncated {
+            minimum: 4,
+            actual: params.len(),
+        });
+    }
+    let type_id = u16::from_be_bytes([params[0], params[1]]);
+    if !is_shipped_rrc_capability_type(type_id) {
+        return Err(LegacyRrcCapabilityDecodeError::UnsupportedType(type_id));
+    }
+    let declared = usize::from(u16::from_be_bytes([params[2], params[3]]));
+    let data = &params[4..];
+    if data.len() != declared {
+        return Err(LegacyRrcCapabilityDecodeError::LengthMismatch {
+            declared,
+            actual: data.len(),
+        });
+    }
+    if type_id == 4 {
+        validate_rrc_type4_list(data)?;
+    }
+    Ok(RrcCapabilitySetRequest { type_id, data })
+}
+
+/// Decode stock SDK command 222's exact five-byte historical get object.
+///
+/// Live `LAPI_RRCCapabilityControlGetRequest` consumes only the leading
+/// `type:u16`; the historical `len:u16 + data[1]` tail remains local ABI noise.
+///
+/// # Errors
+/// Rejects any non-five-byte object or a type not exercised by shipped
+/// `lteautocm`.
+pub fn decode_legacy_rrc_capability_get(
+    params: &[u8],
+) -> Result<RrcCapabilityGetRequest, LegacyRrcCapabilityDecodeError> {
+    if params.len() != 5 {
+        return Err(LegacyRrcCapabilityDecodeError::UnexpectedLength {
+            expected: 5,
+            actual: params.len(),
+        });
+    }
+    let type_id = u16::from_be_bytes([params[0], params[1]]);
+    if !is_shipped_rrc_capability_type(type_id) {
+        return Err(LegacyRrcCapabilityDecodeError::UnsupportedType(type_id));
+    }
+    Ok(RrcCapabilityGetRequest { type_id })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LegacyAttachStringField {
@@ -1603,6 +1731,107 @@ fn broadcast_variable_callback(
     Ok(report)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RrcCapabilityCallbackError {
+    DataTooLong(usize),
+    Type4ListTruncated {
+        count: u8,
+        minimum_data_len: usize,
+        actual_data_len: usize,
+    },
+}
+
+fn validate_rrc_capability_get_callback(
+    response: RrcCapabilityGetResponse<'_>,
+) -> Result<(), RrcCapabilityCallbackError> {
+    if response.result != 0 || response.type_id != 4 {
+        return Ok(());
+    }
+    let Some(&count) = response.data.first() else {
+        return Err(RrcCapabilityCallbackError::Type4ListTruncated {
+            count: 0,
+            minimum_data_len: 1,
+            actual_data_len: 0,
+        });
+    };
+    let minimum_data_len = 1_usize.saturating_add(usize::from(count).saturating_mul(2));
+    if response.data.len() < minimum_data_len {
+        return Err(RrcCapabilityCallbackError::Type4ListTruncated {
+            count,
+            minimum_data_len,
+            actual_data_len: response.data.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Broadcast live-P4 callback 221 through `cb_rsp[115]` (`0x39c`).
+///
+/// The daemon exposes only the normalized six-byte `result,len,type` header;
+/// the SDK's set-response data buffer never crosses the stock local callback
+/// boundary.
+///
+/// # Errors
+/// Returns [`HandleError::RrcCapabilityCallback`] if the data length cannot be
+/// represented by the stock u16 field, or [`HandleError::Ipc`] for callback
+/// encoding/shared-context/socket failures.
+pub fn broadcast_rrc_capability_set_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: RrcCapabilitySetResponse<'_>,
+) -> Result<BroadcastReport, HandleError> {
+    let len = u16::try_from(response.data.len()).map_err(|_| {
+        HandleError::RrcCapabilityCallback(RrcCapabilityCallbackError::DataTooLong(
+            response.data.len(),
+        ))
+    })?;
+    let mut data = [0_u8; 6];
+    data[0..2].copy_from_slice(&response.result.to_be_bytes());
+    data[2..4].copy_from_slice(&len.to_be_bytes());
+    data[4..6].copy_from_slice(&response.type_id.to_be_bytes());
+    broadcast_variable_callback(
+        server,
+        device_id,
+        SdkCallbackKind::RrcCapabilityControl,
+        &data,
+    )
+}
+
+/// Broadcast live-P4 callback 223 through `cb_rsp[116]` (`0x3a4`).
+///
+/// The stock callback image is `result,type,len,data[len]`. Type 4 contains a
+/// count followed by u16 entries; validate its minimum extent before exposing
+/// bytes so the clean daemon cannot reproduce the OEM parser's possible
+/// over-read.
+///
+/// # Errors
+/// Returns [`HandleError::RrcCapabilityCallback`] for an unsafe type-4 list or
+/// unrepresentable data length, or [`HandleError::Ipc`] for callback
+/// encoding/shared-context/socket failures.
+pub fn broadcast_rrc_capability_get_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: RrcCapabilityGetResponse<'_>,
+) -> Result<BroadcastReport, HandleError> {
+    validate_rrc_capability_get_callback(response).map_err(HandleError::RrcCapabilityCallback)?;
+    let len = u16::try_from(response.data.len()).map_err(|_| {
+        HandleError::RrcCapabilityCallback(RrcCapabilityCallbackError::DataTooLong(
+            response.data.len(),
+        ))
+    })?;
+    let mut data = Vec::with_capacity(6 + response.data.len());
+    data.extend_from_slice(&response.result.to_be_bytes());
+    data.extend_from_slice(&response.type_id.to_be_bytes());
+    data.extend_from_slice(&len.to_be_bytes());
+    data.extend_from_slice(response.data);
+    broadcast_variable_callback(
+        server,
+        device_id,
+        SdkCallbackKind::RrcCapabilityControlGet,
+        &data,
+    )
+}
+
 /// Broadcast callback 126 (`AT_COMMAND_FROM_DEVICE`) as raw command bytes.
 ///
 /// The live stock client reconstructs its historical `{cmd pointer, length}`
@@ -2388,6 +2617,12 @@ impl DeviceBridge {
                 Ok(SdkCommand::EmmNiReattachControl) => {
                     self.dispatch_emm_ni_reattach_control(modem, request)
                 }
+                Ok(SdkCommand::RrcCapabilityControl) => {
+                    self.dispatch_rrc_capability_set(modem, request)
+                }
+                Ok(SdkCommand::RrcCapabilityControlGet) => {
+                    self.dispatch_rrc_capability_get(modem, request)
+                }
                 Ok(_) => self.dispatch_zero_parameter(modem, request),
                 Err(_) => Err(HandleError::UnsupportedCommand(request.command)),
             }
@@ -2404,6 +2639,54 @@ impl DeviceBridge {
         status_result?;
         release_result?;
         dispatch
+    }
+
+    fn handle_plmn_list_event(
+        &mut self,
+        server: &mut Server,
+        response: PlmnListResponse<'_>,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        let key = ResponseKey::PlmnList;
+        if !self.pending.contains(key) {
+            return Ok(None);
+        }
+        let report = broadcast_plmn_list_callback(server, self.device_id, response)?;
+        if response.search_complete != 0 {
+            self.pending.remove(key);
+        }
+        Ok(Some(report))
+    }
+
+    fn handle_rrc_capability_set_event(
+        &mut self,
+        server: &mut Server,
+        response: RrcCapabilitySetResponse<'_>,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        let key = ResponseKey::RrcCapabilitySet(response.type_id);
+        if !self.pending.contains(key) {
+            return Ok(None);
+        }
+        if response.result == 0 && !rrc_capability_set_success_has_callback(response.type_id) {
+            self.pending.remove(key);
+            return Ok(None);
+        }
+        let report = broadcast_rrc_capability_set_callback(server, self.device_id, response)?;
+        self.pending.remove(key);
+        Ok(Some(report))
+    }
+
+    fn handle_rrc_capability_get_event(
+        &mut self,
+        server: &mut Server,
+        response: RrcCapabilityGetResponse<'_>,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        let key = ResponseKey::RrcCapabilityGet(response.type_id);
+        if !self.pending.contains(key) {
+            return Ok(None);
+        }
+        let report = broadcast_rrc_capability_get_callback(server, self.device_id, response)?;
+        self.pending.remove(key);
+        Ok(Some(report))
     }
 
     fn handle_uicc_event(
@@ -2565,6 +2848,12 @@ impl DeviceBridge {
                 response.command,
             )
             .map(Some),
+            ModemEvent::RrcCapabilitySet(response) => {
+                self.handle_rrc_capability_set_event(server, *response)
+            }
+            ModemEvent::RrcCapabilityGet(response) => {
+                self.handle_rrc_capability_get_event(server, *response)
+            }
             ModemEvent::Uicc(response) => self.handle_uicc_event(server, *response),
             ModemEvent::UeModeChange(response) => {
                 self.handle_ue_mode_change_event(server, *response)
@@ -2599,17 +2888,7 @@ impl DeviceBridge {
             | ModemEvent::MsisdnRead(_)
             | ModemEvent::TemperatureRead(_)
             | ModemEvent::MiscReadFailure { .. } => self.handle_misc_read_event(server, event),
-            ModemEvent::PlmnList(response) => {
-                let key = ResponseKey::PlmnList;
-                if !self.pending.contains(key) {
-                    return Ok(None);
-                }
-                let report = broadcast_plmn_list_callback(server, self.device_id, *response)?;
-                if response.search_complete != 0 {
-                    self.pending.remove(key);
-                }
-                Ok(Some(report))
-            }
+            ModemEvent::PlmnList(response) => self.handle_plmn_list_event(server, *response),
             ModemEvent::Unknown(_) => Ok(None),
         }
     }
@@ -2628,6 +2907,42 @@ impl DeviceBridge {
             }
         }
         Err(HandleError::TransactionIdsExhausted)
+    }
+
+    fn dispatch_rrc_capability_set<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let modem_request = decode_legacy_rrc_capability_set(request.params)
+            .map_err(HandleError::LegacyRrcCapability)?;
+        let bytes_written = modem.send_tracked_command(
+            &mut self.pending,
+            ModemCommand::RrcCapabilitySet(modem_request),
+        )?;
+        Ok(HandledCall {
+            command: SdkCommand::RrcCapabilityControl,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_rrc_capability_get<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let modem_request = decode_legacy_rrc_capability_get(request.params)
+            .map_err(HandleError::LegacyRrcCapability)?;
+        let bytes_written = modem.send_tracked_command(
+            &mut self.pending,
+            ModemCommand::RrcCapabilityGet(modem_request),
+        )?;
+        Ok(HandledCall {
+            command: SdkCommand::RrcCapabilityControlGet,
+            device_id: request.device_id,
+            bytes_written,
+        })
     }
 
     fn dispatch_emm_timer_control<T: Write>(
@@ -3225,9 +3540,11 @@ mod tests {
         LegacyAttachExtDecodeError, LegacyAttachExtStringField, LegacyAttachStringField,
         LegacyPdnConnectDecodeError, LegacyPdnConnectExtDecodeError,
         LegacyPdnConnectExtStringField, LegacyPdnConnectStringField,
-        LegacyPdnDisconnectDecodeError, LegacyUiccDecodeError, PS_INIT_COMPLETE_OFFSET,
-        StartupPhase, UiccCallbackError, broadcast_result_callback, decode_legacy_attach,
-        decode_legacy_attach_ext, decode_legacy_pdn_connect_ext, decode_legacy_pdn_disconnect,
+        LegacyPdnDisconnectDecodeError, LegacyRrcCapabilityDecodeError, LegacyUiccDecodeError,
+        PS_INIT_COMPLETE_OFFSET, StartupPhase, UiccCallbackError, broadcast_result_callback,
+        decode_legacy_attach, decode_legacy_attach_ext, decode_legacy_pdn_connect_ext,
+        decode_legacy_pdn_disconnect, decode_legacy_rrc_capability_get,
+        decode_legacy_rrc_capability_set,
     };
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -6791,6 +7108,222 @@ mod tests {
                 actual: 101,
             })
         );
+    }
+
+    #[test]
+    fn stock_rrc_capability_set_get_round_trip_and_subscription_slots() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, id) = open_client(&mut server, &dir, 0);
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(
+                SdkCallbackKind::RrcCapabilityControl.registration_offset(),
+                1,
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(
+                SdkCallbackKind::RrcCapabilityControlGet.registration_offset(),
+                1,
+            )
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+
+        let set = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::RrcCapabilityControl as u16,
+                    device_id: 0x1122_3344,
+                    params: &[0, 18, 0, 2, 0xaa, 0xbb],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(set.bytes_written, 10);
+        let get = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::RrcCapabilityControlGet as u16,
+                    device_id: 0x1122_3344,
+                    params: &[0, 4, 0xff, 0xee, 0xdd],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(get.bytes_written, 6);
+        assert_eq!(bridge.pending_count(), 2);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![
+                0x39, 0x06, 0, 6, 0, 18, 0, 2, 0xaa, 0xbb, 0x39, 0x0d, 0, 2, 0, 4,
+            ]
+        );
+
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                vec![0xb9, 0x07, 0, 6, 0, 0, 0, 0, 0, 18],
+            ),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                vec![0xb9, 0x0e, 0, 11, 0, 0, 0, 4, 0, 5, 2, 0, 1, 0, 2,],
+            ),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 64];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(
+            Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 221);
+        assert_eq!(callback.data, &[0, 0, 0, 0, 0, 18]);
+
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(
+            Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 223);
+        assert_eq!(callback.data, &[0, 0, 0, 4, 0, 5, 2, 0, 1, 0, 2]);
+    }
+
+    #[test]
+    fn rrc_capability_legacy_decoder_rejects_unsafe_or_unshipped_shapes() {
+        assert_eq!(
+            decode_legacy_rrc_capability_set(&[0, 4, 0, 3, 2, 0, 1]),
+            Err(LegacyRrcCapabilityDecodeError::Type4ListTruncated {
+                count: 2,
+                minimum_data_len: 5,
+                actual_data_len: 3,
+            })
+        );
+        assert_eq!(
+            decode_legacy_rrc_capability_set(&[0, 5, 0, 0]),
+            Err(LegacyRrcCapabilityDecodeError::UnsupportedType(5))
+        );
+        assert_eq!(
+            decode_legacy_rrc_capability_get(&[0, 4, 0, 0]),
+            Err(LegacyRrcCapabilityDecodeError::UnexpectedLength {
+                expected: 5,
+                actual: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn rrc_capability_type11_success_is_silent_but_failure_emits_callback() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (client, id) = open_client(&mut server, &dir, 0);
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(
+                SdkCallbackKind::RrcCapabilityControl.registration_offset(),
+                1,
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::RrcCapabilityControl as u16,
+                    device_id: 1,
+                    params: &[0, 11, 0, 1, 0x7f],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                vec![0xb9, 0x07, 0, 6, 0, 0, 0, 0, 0, 11],
+            ),
+            None
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        client
+            .set_nonblocking(true)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut no_frame = [0_u8; 1];
+        let Err(error) = client.recv(&mut no_frame) else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        client
+            .set_nonblocking(false)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::RrcCapabilityControl as u16,
+                    device_id: 1,
+                    params: &[0, 11, 0, 1, 0x7f],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                vec![0xb9, 0x07, 0, 6, 0, 1, 0, 0, 0, 11],
+            ),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        let mut frame = [0_u8; 32];
+        let len = client
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(
+            Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 221);
+        assert_eq!(callback.data, &[0, 1, 0, 0, 0, 11]);
     }
 
     #[test]

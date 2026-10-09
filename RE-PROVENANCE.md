@@ -1451,3 +1451,93 @@ exact command-82/HCI request bytes, signed negative-temperature decoding,
 truncated subtype-body rejection, shared-family collision, exact callback 83 /
 slot `0xec`, subscription gating, and local nonzero-parameter rejection before
 GLIF I/O.
+
+
+## Live P4 RRC Capability Control
+
+The remaining RRC-capability API looked broad at the SDK boundary, but shipped
+callsite analysis makes the product surface finite. Live P4 `lteautocm` uses
+set/get type IDs **1, 2, 3, 11, 18, and 20**, plus a type-**4** variable-list
+setter. The replacement therefore supports exactly `{1,2,3,4,11,18,20}` and
+rejects the rest before GLIF rather than cloning a twenty-way legacy switch
+only exposed by generic AT/debug plumbing.
+
+Live P4 `liblted.so::LTED_RRCCapabilityControlRequest@0x108b0` emits SDK
+command **220**. B014 DWARF describes the historical flexible object as
+`type:u16@0 | len:u16@2 | data:u8[1]@4` (nominal C size 5), while the live
+wrapper is the authoritative local transport rule: it copies exactly
+**`4 + len` bytes** into the SDK datagram. Thus a declared zero-length set
+object is four bytes on the socket boundary. Live
+`libltesdk.so::LAPI_RRCCapabilityControlRequest@0x5215c` sends HCI
+**`0x3906`** with the common payload `type:u16 | len:u16 | data[len]` for the
+shipped types. Type 4 is the one shipped list shape: `data[0]` is a count
+followed by big-endian u16 entries. Rust validates the minimum
+`1 + 2*count` extent before GLIF instead of reproducing possible OEM over-read.
+
+Live P4 `liblted.so::LTED_RRCCapabilityControlGetRequest@0x10a80` emits SDK
+command **222** and copies the exact five-byte historical object. Live
+`LAPI_RRCCapabilityControlGetRequest@0x53450` consumes only its leading
+`type:u16` and emits HCI **`0x390d`** with exactly those two payload bytes; the
+legacy `len + data[1]` tail is local ABI noise and is intentionally ignored at
+the clean modem boundary.
+
+The live SDK dispatch table independently pins both response paths:
+**`0xb907 -> 0x218a4 -> SDK callback 115`** for set and
+**`0xb90e -> 0x21a50 -> SDK callback 116`** for get. Set responses use the
+common modem envelope `result:u16 | len:u16 | type:u16 | data[len]`; get uses
+`result:u16 | type:u16 | len:u16 | data[len]`. The get converter only performs
+additional type-specific normalization for types 4, 15, 16, and 19. For the
+shipped types 1/2/3/11/18/20 it preserves data bytes after normalizing the
+common words; type 4 converts its counted u16 list. Because both modem and
+stock callback representations are big-endian on the target, the clean bridge
+can preserve the bytes while still independently checking the type-4 bounds.
+
+Live daemon registration is exact rather than inferred. In `ind_regist`, SDK
+slot 115 loads literal `0xffff1674` at `0x39d64`; resolving it against the ARM
+PC at `0x3aa28` yields
+`ind_rrc_capability_control_req_indication@0x2c09c`. SDK slot 116 loads
+`0xffff1854` at `0x39d6c`; resolving it against PC `0x3aa64` yields
+`ind_rrc_capability_control_get_req_indication@0x2c2b8`. Those handlers emit
+stock callbacks **221** and **223** respectively.
+
+The live stock client jump table independently maps callback **221** to the
+registered function/context at offsets `0x39c/0x3a0`, i.e. **`cb_rsp[115]`**,
+and callback **223** to `0x3a4/0x3a8`, i.e. **`cb_rsp[116]`**. B014 DWARF fixes
+the historical response field order: set is
+`result:u16 | len:u16 | type:u16 | data...`; get is
+`result:u16 | type:u16 | len:u16 | data...`. The live daemon exposes only the
+six-byte set header to callback 221, while callback 223 carries exactly
+`6 + len` bytes.
+
+One live-SDK quirk is deliberately preserved: on successful set responses the
+converter accepts callback-bearing types **1/2/3/4/18**, but rejects types
+**11/20** after parsing, suppressing the daemon callback. A nonzero `result`
+skips that success-type switch, so failures for 11/20 still reach callback 221.
+Rust tracks all set requests by `type_id` so the direct HCI response always
+retires pending state; successful 11/20 responses are consumed silently, while
+failures are materialized as the stock six-byte callback. Get requests are
+also tracked by exact `type_id`.
+
+Golden tests cover the exact command-220 variable local envelope to `0x3906`,
+the exact five-byte command-222 local object to `0x390d`, both response opcode
+and field orders, callback 221/223 registration slots, subscription gating,
+per-type correlation, type-4 bounds rejection before unsafe exposure, silent
+successful type-11 completion, and the asymmetric type-11 failure callback.
+
+## Live P4 DMLogExt — transport proven, semantic bridge intentionally deferred
+
+Live P4 proves the DMLogExt transport contract completely: stock SDK command
+**173** maps to modem request **`0x3318`**; the live HCI dispatch table maps
+response **`0xb319`** to the DMLogExt response path; that path uses SDK callback
+**88**. The daemon registers slot 88 to `ind_dm_log_ext_response@0x30584` and
+emits stock callback **174**. Live stock callback routing maps selector 174 to
+**`cb_rsp[88]`**, registration offset **`0x2c4`**.
+
+This family is deliberately not implemented as opaque compatibility bytes.
+`0xb319` is a streaming/multi-record diagnostic format: the SDK walks records
+and performs category/item-specific conversion before producing separate
+callback-88 objects. Shipping a one-record or raw-forwarding bridge would be a
+false compatibility claim and would recreate a large legacy conversion switch
+without product-demand evidence. The proven transport facts are retained here
+for later work; implementation stays deferred until the used record grammar is
+narrowed by real callsites or captures.
