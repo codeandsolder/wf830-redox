@@ -358,6 +358,34 @@ registered in that slot. End-to-end tests cover exact `0x3107` bytes,
 variable-length local request validation, callback materialization,
 subscription gating, and pending release.
 
+### Stock normal-Detach bridge ABI
+
+Normal Detach is exact on both sides of the stock boundary. B014 DWARF fixes
+`_DETACH_REQ_PARAM` at four bytes with the single `detach_type:u32` field, and
+live P4 `LTED_DetachRequest` copies exactly those four caller bytes into local
+SDK command 29. Live `LAPI_DetachRequest` converts that word with `H4D()` and
+sends it unchanged as the complete four-byte payload of HCI `0x3103`. The Rust
+bridge therefore requires exactly four local request bytes and preserves the
+word without inventing semantic subfields.
+
+Live `LAPI_DetachRequest` also calls `tid_list_clean()` before the modem write.
+That list is populated by normal PDN-connect/disconnect TID allocation. The
+bridge mirrors the successful-call effect by retiring pending PDN transaction
+keys after the Detach write succeeds, while retaining the new family-level
+`ResponseKey::Detach` until its response arrives. This intentionally avoids
+losing tracked state on a failed write while preserving the observable
+post-success state.
+
+B014 DWARF fixes `_DETACH_RSP_INFO` at exactly eight bytes:
+`result:u32@0`, `deregister_cause1:u16@4`, and `deregister_cause2:u16@6`.
+Live P4 `ind_detach_response` passes callback ID 30 to the stock callback
+assembler; the live callback jump table maps ID 30 to `cb_rsp[4]`, registration
+offset `0x24`. Rust parses exact modem response `0xb104`, releases the pending
+Detach family, materializes those eight bytes, and emits stock `0x8107`
+callback 30 only to clients registered in that slot. Tests cover exact request
+bytes, malformed local length rejection before modem I/O, PDN-TID cleanup,
+callback materialization, subscription gating, and pending release.
+
 ## PLMN search/list wire grammar — live P4 confirmed
 
 B014 DWARF names `_PLMN_SEARCH_REQ_PARAM` as a nine-byte host structure

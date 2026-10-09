@@ -9,12 +9,12 @@
 use std::{io, io::Write};
 
 use gct_lapi::{
-    ApnType, AttachRequest, AttachResponse, AttachTailDecodeError, AttachTailField,
-    EmergencyNumberDecodeError, EmptyRequest, PdnConnectRequest, PdnConnectResponse,
-    PdnConnectTailDecodeError, PdnConnectTailField, PdnConnectionControl, PdnDisconnectField,
-    PdnDisconnectFieldDecodeError, PdnDisconnectRequest, PdnDisconnectResponse, PdnInfoContainers,
-    PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse, Positioning,
-    QosField, ResultResponse, ResultResponseKind,
+    ApnType, AttachRequest, AttachResponse, AttachTailDecodeError, AttachTailField, DetachRequest,
+    DetachResponse, EmergencyNumberDecodeError, EmptyRequest, PdnConnectRequest,
+    PdnConnectResponse, PdnConnectTailDecodeError, PdnConnectTailField, PdnConnectionControl,
+    PdnDisconnectField, PdnDisconnectFieldDecodeError, PdnDisconnectRequest, PdnDisconnectResponse,
+    PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError,
+    PlmnListResponse, Positioning, QosField, ResultResponse, ResultResponseKind,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -662,6 +662,58 @@ pub fn broadcast_attach_callback(
     Ok(report)
 }
 
+const STOCK_DETACH_CALLBACK_DATA_LEN: usize = 8;
+const STOCK_DETACH_CALLBACK_FRAME_LEN: usize = 12 + STOCK_DETACH_CALLBACK_DATA_LEN;
+
+/// Materialize and broadcast live-P4 stock callback 30 (`Detach`).
+///
+/// Live P4 `ind_detach_response` passes callback ID 30 to the stock callback
+/// assembler. The callback lookup maps ID 30 to `cb_rsp[4]`, registration
+/// offset `0x24`. B014 DWARF fixes `_DETACH_RSP_INFO` at exactly eight bytes.
+///
+/// # Errors
+/// Returns [`HandleError::Ipc`] for callback/shared-context/socket failures.
+pub fn broadcast_detach_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: DetachResponse,
+) -> Result<BroadcastReport, HandleError> {
+    let mut data = [0_u8; STOCK_DETACH_CALLBACK_DATA_LEN];
+    data[..4].copy_from_slice(&response.result.to_be_bytes());
+    data[4..6].copy_from_slice(&response.deregister_cause1.to_be_bytes());
+    data[6..8].copy_from_slice(&response.deregister_cause2.to_be_bytes());
+
+    let callback_kind = SdkCallbackKind::Detach;
+    let mut frame = [0_u8; STOCK_DETACH_CALLBACK_FRAME_LEN];
+    let frame_len = SdkCallback {
+        callback_id: callback_kind.callback_id(),
+        device_id,
+        data: &data,
+    }
+    .encode(&mut frame)
+    .map_err(|_| {
+        HandleError::Ipc(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fixed-size Detach callback failed to encode",
+        ))
+    })?;
+
+    let mut report = BroadcastReport::default();
+    for client_id in server.client_ids() {
+        let registered = server
+            .client_context(client_id)?
+            .read_u32_be(callback_kind.registration_offset())?
+            != 0;
+        if !registered {
+            continue;
+        }
+        report.registered_clients += 1;
+        server.send_to_client(client_id, &frame[..frame_len])?;
+        report.sent_clients += 1;
+    }
+    Ok(report)
+}
+
 const STOCK_PDN_CONNECT_CALLBACK_DATA_LEN: usize = 0x2e6;
 const STOCK_PDN_CONNECT_CALLBACK_FRAME_LEN: usize = 12 + STOCK_PDN_CONNECT_CALLBACK_DATA_LEN;
 const PDN_CONNECT_PDN_OFFSET: usize = 0x04c;
@@ -1134,6 +1186,7 @@ impl DeviceBridge {
                     }
                 }
                 Ok(SdkCommand::Attach) => self.dispatch_attach(modem, request),
+                Ok(SdkCommand::Detach) => self.dispatch_detach(modem, request),
                 Ok(SdkCommand::PdnConnect) => self.dispatch_pdn_connect(modem, request),
                 Ok(SdkCommand::PdnDisconnect) => self.dispatch_pdn_disconnect(modem, request),
                 Ok(_) => self.dispatch_zero_parameter(modem, request),
@@ -1176,6 +1229,12 @@ impl DeviceBridge {
                     return Ok(None);
                 }
                 broadcast_attach_callback(server, self.device_id, *response).map(Some)
+            }
+            ModemEvent::Detach(response) => {
+                if !self.pending.remove(ResponseKey::Detach) {
+                    return Ok(None);
+                }
+                broadcast_detach_callback(server, self.device_id, *response).map(Some)
             }
             ModemEvent::PdnConnect(response) => {
                 let key = ResponseKey::PdnConnect(response.transaction_id);
@@ -1236,6 +1295,39 @@ impl DeviceBridge {
             }
         }
         Err(HandleError::TransactionIdsExhausted)
+    }
+
+    fn dispatch_detach<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let bytes: [u8; 4] =
+            request
+                .params
+                .try_into()
+                .map_err(|_| HandleError::UnexpectedParameters {
+                    command: request.command,
+                    actual: request.params.len(),
+                })?;
+        let detach = DetachRequest::from_raw(u32::from_be_bytes(bytes));
+        let bytes_written =
+            modem.send_tracked_command(&mut self.pending, ModemCommand::Detach(detach))?;
+
+        // Live LAPI_DetachRequest calls tid_list_clean() before sending. That
+        // list is populated by normal PDN connect/disconnect TID allocation.
+        // Retire those pending transaction keys once the detach write succeeds.
+        for transaction_id in 1_u8..=253 {
+            self.pending.remove(ResponseKey::PdnConnect(transaction_id));
+            self.pending
+                .remove(ResponseKey::PdnDisconnect(transaction_id));
+        }
+
+        Ok(HandledCall {
+            command: SdkCommand::Detach,
+            device_id: request.device_id,
+            bytes_written,
+        })
     }
 
     fn dispatch_pdn_connect<T: Write>(
@@ -1336,7 +1428,7 @@ mod tests {
     };
 
     use gct_lapi::{ResultResponse, ResultResponseKind};
-    use gct_runtime::{Modem, ModemEvent};
+    use gct_runtime::{Modem, ModemEvent, ResponseKey};
     use gct_transport::HciIo;
     use lted_compat::Server;
     use lted_proto::{
@@ -2433,6 +2525,147 @@ mod tests {
         assert_eq!(&data[0x00a..0x00d], b"ims");
         assert_eq!(&data[0x04a..0x04f], &[1, 3, 0x11, 0x22, 0x33]);
         assert!(data[0x04f..].iter().all(|&byte| byte == 0));
+
+        unsubscribed
+            .set_nonblocking(true)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut no_frame = [0_u8; 1];
+        let Err(error) = unsubscribed.recv(&mut no_frame) else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn stock_detach_matches_live_p4_hci_and_cleans_pdn_transaction_state() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        bridge
+            .pending
+            .try_insert(ResponseKey::PdnConnect(7))
+            .unwrap_or_else(|_| std::process::abort());
+        bridge
+            .pending
+            .try_insert(ResponseKey::PdnDisconnect(9))
+            .unwrap_or_else(|_| std::process::abort());
+
+        let params = [0x11, 0x22, 0x33, 0x44];
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::Detach as u16,
+                    device_id: 1,
+                    params: &params,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(call.bytes_written, 8);
+        assert_eq!(bridge.pending_count(), 1);
+        assert!(bridge.pending.contains(ResponseKey::Detach));
+        assert!(!bridge.pending.contains(ResponseKey::PdnConnect(7)));
+        assert!(!bridge.pending.contains(ResponseKey::PdnDisconnect(9)));
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            [0x31, 0x03, 0x00, 0x04, 0x11, 0x22, 0x33, 0x44]
+        );
+    }
+
+    #[test]
+    fn malformed_stock_detach_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let params = [0x11, 0x22, 0x33];
+
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::Detach as u16,
+                    device_id: 1,
+                    params: &params,
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                command: 29,
+                actual: 3
+            })
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn detach_response_materializes_exact_stock_callback_and_subscription_gate() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, subscribed_id) = open_client(&mut server, &dir, 0);
+        let (unsubscribed, _unsubscribed_id) = open_client(&mut server, &dir, 1);
+        server
+            .client_context(subscribed_id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::Detach.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                subscribed_id,
+                SdkApiRequest {
+                    command: SdkCommand::Detach as u16,
+                    device_id: 0x1122_3344,
+                    params: &[0, 0, 0, 1],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.pending_count(), 1);
+
+        let hci = vec![
+            0xb1, 0x04, 0x00, 0x08, 0x01, 0x02, 0x03, 0x04, 0x11, 0x22, 0x33, 0x44,
+        ];
+        assert_eq!(
+            route_one_hci(&mut bridge, &mut server, hci),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 32];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(len, 20);
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 30);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(
+            callback.data,
+            &[0x01, 0x02, 0x03, 0x04, 0x11, 0x22, 0x33, 0x44]
+        );
 
         unsubscribed
             .set_nonblocking(true)
