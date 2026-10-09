@@ -458,6 +458,33 @@ callback 64 only to clients registered in that slot. Tests cover exact local and
 modem wire bytes, malformed request length before I/O, callback materialization,
 subscription gating, search-type correlation, and pending release.
 
+## UE mode change — live P4 command/response and callback-generation delta
+
+This is a high-value live-client path: eight recovered P4 LTE binaries import
+`LTED_UeModeChangeRequest`. Live `liblted.so` proves stock SDK command **161**
+and copies exactly one caller byte. B014 DWARF independently describes
+`_UE_MODE_CHANGE_REQ_PARAM` as exactly one byte, `mode:u8`.
+
+Live `LAPI_UeModeChangeRequest` emits HCI request **`0x3118`** with that byte
+unchanged. The live SDK receive table maps **`0xb14f`** to handler `0x2628c`.
+That handler requires registered SDK callback **82**, converts exactly one payload
+byte, and forwards it to the registered callback. B014 DWARF independently fixes
+`_UE_MODE_CHANGE_RSP_INFO` at one byte with sole field `result:u8`.
+
+The stock callback number is another firmware-generation trap. B014
+`ind_ue_mode_change_response` emits callback **167**, but the live P4 function at
+`0x2fd70` emits callback **162**. Live `lted::ind_regist` registers SDK callback
+82 directly to that function. In live `liblted.so`, selector 162 lands at the
+callback-dispatch case using `cb_rsp[82]`, whose function/user fields begin at
+**`0x294` / `0x298`**. Rust therefore uses live callback **162** and registration
+offset **`0x294`**, not the older B014 selector.
+
+Rust models this as a family-level tracked exchange because neither request nor
+response carries a transaction identity. Tests lock the exact five-byte request
+frame, exact one-byte `0xb14f` response, duplicate-in-flight rejection, stock
+command-161 parameter validation before GLIF, and callback-162 materialization
+and subscription gating.
+
 ## PLMN Search EXT — live P4 request path and response-wiring anomaly
 
 Live P4 `LTED_PLMNSearchExtRequest` uses stock SDK command **42** and copies the

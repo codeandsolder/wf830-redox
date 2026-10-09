@@ -351,6 +351,7 @@ pub mod recovered_opcode {
     pub const UICC_REQUEST: u16 = 0x3504;
     /// Shared read-info request used by Mobile ID and adjacent stock read APIs.
     pub const MISC_READ_REQUEST: u16 = 0x3145;
+    pub const UE_MODE_CHANGE_REQUEST: u16 = 0x3118;
 
     // Response values below are proven by the `decode_hci_packet` dispatch
     // table at B014 virtual address 0x89f6c.
@@ -372,6 +373,7 @@ pub mod recovered_opcode {
     pub const UICC_RESPONSE: u16 = 0xb505;
     /// Shared read-info response dispatched by subtype; Mobile ID is subtype 1.
     pub const MISC_READ_RESPONSE: u16 = 0xb146;
+    pub const UE_MODE_CHANGE_RESPONSE: u16 = 0xb14f;
 }
 
 #[cfg(test)]

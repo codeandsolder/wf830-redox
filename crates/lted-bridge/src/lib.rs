@@ -18,9 +18,9 @@ use gct_lapi::{
     PdnDisconnectRequest, PdnDisconnectResponse, PdnInfoContainers, PdnInfoField,
     PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse, PlmnSearchExtRequest,
     PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
-    Positioning, QosField, ResultResponse, ResultResponseKind, UiccFixedRequest,
-    UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse,
-    UiccStatusRequest, uicc_control,
+    Positioning, QosField, ResultResponse, ResultResponseKind, UeModeChangeRequest,
+    UeModeChangeResponse, UiccFixedRequest, UiccPinStatusRequest, UiccReadBinaryRequest,
+    UiccReadRecordRequest, UiccResponse, UiccStatusRequest, uicc_control,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -1900,6 +1900,23 @@ pub fn broadcast_result_callback(
     Ok(report)
 }
 
+/// Broadcast the exact live-P4 one-byte UE-mode-change callback 162.
+///
+/// # Errors
+/// Returns [`HandleError::Ipc`] for shared-context or UNIX-datagram failures.
+pub fn broadcast_ue_mode_change_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: UeModeChangeResponse,
+) -> Result<BroadcastReport, HandleError> {
+    broadcast_variable_callback(
+        server,
+        device_id,
+        SdkCallbackKind::UeModeChange,
+        &[response.result],
+    )
+}
+
 const STOCK_PLMN_SEARCH_STOP_CALLBACK_DATA_LEN: usize = 5;
 const STOCK_PLMN_SEARCH_STOP_CALLBACK_FRAME_LEN: usize =
     12 + STOCK_PLMN_SEARCH_STOP_CALLBACK_DATA_LEN;
@@ -2232,6 +2249,7 @@ impl DeviceBridge {
                 Ok(SdkCommand::AtCommand) => Self::dispatch_at(modem, request),
                 Ok(SdkCommand::AtCommandExt) => Self::dispatch_at_ext(modem, request),
                 Ok(SdkCommand::UiccRequest) => self.dispatch_uicc(modem, request),
+                Ok(SdkCommand::UeModeChange) => self.dispatch_ue_mode_change(modem, request),
                 Ok(_) => self.dispatch_zero_parameter(modem, request),
                 Err(_) => Err(HandleError::UnsupportedCommand(request.command)),
             }
@@ -2282,6 +2300,39 @@ impl DeviceBridge {
             }
             _ => Ok(None),
         }
+    }
+
+    fn handle_ue_mode_change_event(
+        &mut self,
+        server: &mut Server,
+        response: UeModeChangeResponse,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        if !self.pending.remove(ResponseKey::UeModeChange) {
+            return Ok(None);
+        }
+        broadcast_ue_mode_change_callback(server, self.device_id, response).map(Some)
+    }
+
+    fn handle_result_event(
+        &mut self,
+        server: &mut Server,
+        kind: ResultResponseKind,
+        response: ResultResponse,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        let key = ResponseKey::Result(kind);
+        if !self.pending.remove(key) {
+            return Ok(None);
+        }
+        match (kind, self.startup_phase) {
+            (ResultResponseKind::PsInit, StartupPhase::AwaitingPsInit) => {
+                self.startup_phase = StartupPhase::NeedOnline;
+            }
+            (ResultResponseKind::Online, StartupPhase::AwaitingOnline) => {
+                self.startup_phase = StartupPhase::Complete;
+            }
+            _ => {}
+        }
+        broadcast_result_callback(server, kind, self.device_id, response).map(Some)
     }
 
     /// Route one decoded modem event through the asynchronous stock callback
@@ -2353,21 +2404,11 @@ impl DeviceBridge {
             )
             .map(Some),
             ModemEvent::Uicc(response) => self.handle_uicc_event(server, *response),
+            ModemEvent::UeModeChange(response) => {
+                self.handle_ue_mode_change_event(server, *response)
+            }
             ModemEvent::Result { kind, response } => {
-                let key = ResponseKey::Result(*kind);
-                if !self.pending.remove(key) {
-                    return Ok(None);
-                }
-                match (*kind, self.startup_phase) {
-                    (ResultResponseKind::PsInit, StartupPhase::AwaitingPsInit) => {
-                        self.startup_phase = StartupPhase::NeedOnline;
-                    }
-                    (ResultResponseKind::Online, StartupPhase::AwaitingOnline) => {
-                        self.startup_phase = StartupPhase::Complete;
-                    }
-                    _ => {}
-                }
-                broadcast_result_callback(server, *kind, self.device_id, *response).map(Some)
+                self.handle_result_event(server, *kind, *response)
             }
             ModemEvent::PlmnSearchStop(response) => {
                 let key = ResponseKey::PlmnSearchStop(response.search_type);
@@ -2414,6 +2455,31 @@ impl DeviceBridge {
             }
         }
         Err(HandleError::TransactionIdsExhausted)
+    }
+
+    fn dispatch_ue_mode_change<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let [mode]: [u8; 1] =
+            request
+                .params
+                .try_into()
+                .map_err(|_| HandleError::UnexpectedParameters {
+                    command: request.command,
+                    expected: 1,
+                    actual: request.params.len(),
+                })?;
+        let bytes_written = modem.send_tracked_command(
+            &mut self.pending,
+            ModemCommand::UeModeChange(UeModeChangeRequest { mode }),
+        )?;
+        Ok(HandledCall {
+            command: SdkCommand::UeModeChange,
+            device_id: request.device_id,
+            bytes_written,
+        })
     }
 
     fn dispatch_plmn_search_stop<T: Write>(
@@ -5459,6 +5525,93 @@ mod tests {
             std::process::abort();
         };
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn stock_ue_mode_change_round_trips_exact_live_p4_contract() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, id) = open_client(&mut server, &dir, 0);
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::UeModeChange.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::UeModeChange as u16,
+                    device_id: 0x1122_3344,
+                    params: &[7],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.bytes_written, 5);
+        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![0x31, 0x18, 0x00, 0x01, 7]
+        );
+
+        assert_eq!(
+            route_one_hci(&mut bridge, &mut server, vec![0xb1, 0x4f, 0x00, 0x01, 9]),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 32];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(len, 13);
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 162);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(callback.data, &[9]);
+    }
+
+    #[test]
+    fn malformed_stock_ue_mode_change_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::UeModeChange as u16,
+                    device_id: 1,
+                    params: &[],
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                command: 161,
+                expected: 1,
+                actual: 0,
+            })
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]

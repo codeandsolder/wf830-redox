@@ -21,10 +21,11 @@ use gct_lapi::{
     PdnDisconnectRequest, PdnDisconnectResponse, PdnEncodeError, PdnResponseDecodeError,
     PlmnListResponse, PlmnSearchDecodeError, PlmnSearchExtEncodeError, PlmnSearchExtRequest,
     PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
-    ResponseDecodeError, ResultResponse, ResultResponseKind, UiccAuthenticateEncodeError,
-    UiccAuthenticateRequest, UiccFixedRequest, UiccFixedRequestError, UiccPinCommandRequest,
-    UiccPinEncodeError, UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest,
-    UiccResponse, UiccResponseDecodeError, UiccStatusRequest, uicc_control,
+    ResponseDecodeError, ResultResponse, ResultResponseKind, UeModeChangeRequest,
+    UeModeChangeResponse, UiccAuthenticateEncodeError, UiccAuthenticateRequest, UiccFixedRequest,
+    UiccFixedRequestError, UiccPinCommandRequest, UiccPinEncodeError, UiccPinStatusRequest,
+    UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse, UiccResponseDecodeError,
+    UiccStatusRequest, uicc_control,
 };
 use gct_transport::{
     GlifTransport, HciIo, HciStreamDecoder, MAX_HCI_FRAME_LEN, OEM_READ_BUFFER_LEN,
@@ -152,6 +153,7 @@ pub enum ModemEvent<'a> {
     PlmnSearchStop(PlmnSearchStopResponse),
     PlmnList(PlmnListResponse<'a>),
     MobileIdRead(MobileIdReadResponse<'a>),
+    UeModeChange(UeModeChangeResponse),
     MiscReadFailure {
         read_result: u16,
     },
@@ -193,6 +195,7 @@ pub enum ModemCommand<'a> {
     PlmnSearchExt(PlmnSearchExtRequest<'a>),
     PlmnSearchStop(PlmnSearchStopRequest),
     MobileIdRead(MobileIdReadRequest),
+    UeModeChange(UeModeChangeRequest),
     Empty(EmptyRequest),
     At(AtCommand<'a>),
     AtExt(AtCommandExt<'a>),
@@ -223,6 +226,7 @@ pub enum ResponseKey {
     PlmnSearchStop(u8),
     PlmnList,
     MiscRead,
+    UeModeChange,
     Result(ResultResponseKind),
     Uicc(u16),
 }
@@ -247,6 +251,7 @@ impl ModemCommand<'_> {
             Self::PlmnSearch(_) | Self::PlmnSearchExt(_) => Some(ResponseKey::PlmnSearch),
             Self::PlmnSearchStop(request) => Some(ResponseKey::PlmnSearchStop(request.search_type)),
             Self::MobileIdRead(_) => Some(ResponseKey::MiscRead),
+            Self::UeModeChange(_) => Some(ResponseKey::UeModeChange),
             Self::Empty(EmptyRequest::PlmnList) => Some(ResponseKey::PlmnList),
             Self::Empty(EmptyRequest::Online) => {
                 Some(ResponseKey::Result(ResultResponseKind::Online))
@@ -292,6 +297,7 @@ impl ModemEvent<'_> {
             }
             Self::PlmnList(_) => Some(ResponseKey::PlmnList),
             Self::MobileIdRead(_) | Self::MiscReadFailure { .. } => Some(ResponseKey::MiscRead),
+            Self::UeModeChange(_) => Some(ResponseKey::UeModeChange),
             Self::Result { kind, .. } => Some(ResponseKey::Result(*kind)),
             Self::Uicc(response) => Some(ResponseKey::Uicc(response.kind)),
         }
@@ -483,6 +489,7 @@ pub fn encode_command(
         ModemCommand::PlmnSearchExt(request) => Ok(request.encode(output)?),
         ModemCommand::PlmnSearchStop(request) => Ok(request.encode(output)?),
         ModemCommand::MobileIdRead(request) => Ok(request.encode(output)?),
+        ModemCommand::UeModeChange(request) => Ok(request.encode(output)?),
         ModemCommand::Empty(request) => Ok(request.encode(output)?),
         ModemCommand::At(request) => Ok(request.encode(output)?),
         ModemCommand::AtExt(request) => Ok(request.encode(output)?),
@@ -587,6 +594,9 @@ pub fn decode_event(packet: Packet<'_>) -> Result<ModemEvent<'_>, EventDecodeErr
             Ok(ModemEvent::AtExt(AtCommandFromDeviceExt::parse(packet)?))
         }
         recovered_opcode::UICC_RESPONSE => Ok(ModemEvent::Uicc(UiccResponse::parse(packet)?)),
+        recovered_opcode::UE_MODE_CHANGE_RESPONSE => Ok(ModemEvent::UeModeChange(
+            UeModeChangeResponse::parse(packet)?,
+        )),
         recovered_opcode::MISC_READ_RESPONSE => match MiscReadResponse::parse(packet)? {
             MiscReadResponse::MobileId(response) => Ok(ModemEvent::MobileIdRead(response)),
             MiscReadResponse::Failure { read_result } => {
@@ -1157,6 +1167,44 @@ mod tests {
         assert_eq!(
             modem.into_transport().into_inner().into_inner(),
             vec![0x31, 0x21, 0x00, 0x00, 0x31, 0x21, 0x00, 0x00,]
+        );
+    }
+
+    #[test]
+    fn ue_mode_change_is_tracked_and_decoded_as_one_family() {
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut pending = PendingRequests::new();
+        let command = ModemCommand::UeModeChange(gct_lapi::UeModeChangeRequest { mode: 3 });
+        assert!(matches!(
+            modem.send_tracked_command(&mut pending, command),
+            Ok(5)
+        ));
+        assert!(pending.contains(ResponseKey::UeModeChange));
+        assert!(matches!(
+            modem.send_tracked_command(&mut pending, command),
+            Err(SendTrackedCommandError::Pending(
+                PendingError::AlreadyPending(ResponseKey::UeModeChange)
+            ))
+        ));
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![0x31, 0x18, 0x00, 0x01, 3]
+        );
+
+        let payload = [0x7f];
+        let packet = Packet {
+            header: Header {
+                command: recovered_opcode::UE_MODE_CHANGE_RESPONSE,
+                payload_len: 1,
+            },
+            payload: &payload,
+        };
+        assert_eq!(
+            decode_event(packet),
+            Ok(ModemEvent::UeModeChange(gct_lapi::UeModeChangeResponse {
+                result: 0x7f,
+            }))
         );
     }
 

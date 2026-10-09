@@ -2150,6 +2150,50 @@ impl<'a> MiscReadResponse<'a> {
     }
 }
 
+/// UE-mode-change request `0x3118`.
+///
+/// Live P4 `LAPI_UeModeChangeRequest` allocates a five-byte HCI frame and copies
+/// the caller's single `mode` byte unchanged into the payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UeModeChangeRequest {
+    pub mode: u8,
+}
+
+impl UeModeChangeRequest {
+    /// Encode the exact one-byte UE-mode-change payload.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than five bytes.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        encode_packet(
+            recovered_opcode::UE_MODE_CHANGE_REQUEST,
+            &[self.mode],
+            output,
+        )
+    }
+}
+
+/// Exact one-byte UE-mode-change response `0xb14f`.
+///
+/// The live SDK dispatch-table entry targets handler `0x2628c`, which converts
+/// one payload byte and invokes SDK callback 82. B014 DWARF independently names
+/// the one-byte response field `result`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UeModeChangeResponse {
+    pub result: u8,
+}
+
+impl UeModeChangeResponse {
+    /// Decode the exact one-byte response.
+    ///
+    /// # Errors
+    /// Returns [`ResponseDecodeError`] for another opcode or any non-one-byte payload.
+    pub fn parse(packet: Packet<'_>) -> Result<Self, ResponseDecodeError> {
+        let payload = exact_payload(packet, recovered_opcode::UE_MODE_CHANGE_RESPONSE, 1)?;
+        Ok(Self { result: payload[0] })
+    }
+}
+
 /// PLMN-search-stop request `0x3127`.
 ///
 /// B014 DWARF describes `_PLMN_SEARCH_STOP_REQ_PARAM` as one byte named
@@ -5679,6 +5723,27 @@ mod tests {
             Err(super::ResponseDecodeError::UnexpectedLength {
                 expected: 4,
                 actual: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn ue_mode_change_has_exact_one_byte_request_and_response() {
+        let mut output = [0_u8; 5];
+        assert_eq!(
+            super::UeModeChangeRequest { mode: 7 }.encode(&mut output),
+            Ok(5)
+        );
+        assert_eq!(output, [0x31, 0x18, 0x00, 0x01, 7]);
+        assert_eq!(
+            super::UeModeChangeResponse::parse(packet(0xb14f, &[9])),
+            Ok(super::UeModeChangeResponse { result: 9 })
+        );
+        assert_eq!(
+            super::UeModeChangeResponse::parse(packet(0xb14f, &[9, 0])),
+            Err(super::ResponseDecodeError::UnexpectedLength {
+                expected: 1,
+                actual: 2,
             })
         );
     }
