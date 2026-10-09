@@ -13,15 +13,16 @@ use gct_lapi::{
     AttachRequest, AttachResponse, AttachTailDecodeError, AttachTailField, DetachRequest,
     DetachRequiredIndication, DetachResponse, EmergencyNumberDecodeError,
     EmmNiReattachControlRequest, EmmReattachControlReport, EmmTimerControlRequest, EmptyRequest,
-    MobileIdReadRequest, MobileIdReadResponse, PcoInfo, PdnConnectExtRequest,
-    PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse, PdnConnectTailDecodeError,
-    PdnConnectTailField, PdnConnectionControl, PdnDisconnectField, PdnDisconnectFieldDecodeError,
-    PdnDisconnectRequest, PdnDisconnectResponse, PdnInfoContainers, PdnInfoField,
-    PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse, PlmnSearchExtRequest,
-    PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
-    Positioning, QosField, ResultResponse, ResultResponseKind, UeModeChangeRequest,
-    UeModeChangeResponse, UiccFixedRequest, UiccPinStatusRequest, UiccReadBinaryRequest,
-    UiccReadRecordRequest, UiccResponse, UiccStatusRequest, uicc_control,
+    LcsControlRequest, LppControlRequest, MobileIdReadRequest, MobileIdReadResponse, PcoInfo,
+    PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse,
+    PdnConnectTailDecodeError, PdnConnectTailField, PdnConnectionControl, PdnDisconnectField,
+    PdnDisconnectFieldDecodeError, PdnDisconnectRequest, PdnDisconnectResponse, PdnInfoContainers,
+    PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse,
+    PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest,
+    PlmnSearchStopResponse, Positioning, PsmControlRequest, QosField, ResultResponse,
+    ResultResponseKind, UeModeChangeRequest, UeModeChangeResponse, UiccFixedRequest,
+    UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse,
+    UiccStatusRequest, uicc_control,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -2291,6 +2292,9 @@ impl DeviceBridge {
                 Ok(SdkCommand::UiccRequest) => self.dispatch_uicc(modem, request),
                 Ok(SdkCommand::UeModeChange) => self.dispatch_ue_mode_change(modem, request),
                 Ok(SdkCommand::EmmTimerControl) => Self::dispatch_emm_timer_control(modem, request),
+                Ok(SdkCommand::PsmControl) => Self::dispatch_psm_control(modem, request),
+                Ok(SdkCommand::LcsControl) => Self::dispatch_lcs_control(modem, request),
+                Ok(SdkCommand::LppControl) => Self::dispatch_lpp_control(modem, request),
                 Ok(SdkCommand::EmmNiReattachControl) => {
                     self.dispatch_emm_ni_reattach_control(modem, request)
                 }
@@ -2531,6 +2535,80 @@ impl DeviceBridge {
         let bytes_written = modem.send_command(ModemCommand::EmmTimerControl(modem_request))?;
         Ok(HandledCall {
             command: SdkCommand::EmmTimerControl,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_psm_control<T: Write>(
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let bytes: [u8; 6] =
+            request
+                .params
+                .try_into()
+                .map_err(|_| HandleError::UnexpectedParameters {
+                    command: request.command,
+                    expected: 6,
+                    actual: request.params.len(),
+                })?;
+        let modem_request = PsmControlRequest {
+            ctrl_cmd: u16::from_be_bytes([bytes[0], bytes[1]]),
+            t3324_timer_value_unit: bytes[2],
+            t3324_timer_value: bytes[3],
+            ext_t3412_timer_value_unit: bytes[4],
+            ext_t3412_timer_value: bytes[5],
+        };
+        let bytes_written = modem.send_command(ModemCommand::PsmControl(modem_request))?;
+        Ok(HandledCall {
+            command: SdkCommand::PsmControl,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_lcs_control<T: Write>(
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let bytes: [u8; 4] =
+            request
+                .params
+                .try_into()
+                .map_err(|_| HandleError::UnexpectedParameters {
+                    command: request.command,
+                    expected: 4,
+                    actual: request.params.len(),
+                })?;
+        let bytes_written = modem.send_command(ModemCommand::LcsControl(LcsControlRequest {
+            mode: u32::from_be_bytes(bytes),
+        }))?;
+        Ok(HandledCall {
+            command: SdkCommand::LcsControl,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_lpp_control<T: Write>(
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let bytes: [u8; 4] =
+            request
+                .params
+                .try_into()
+                .map_err(|_| HandleError::UnexpectedParameters {
+                    command: request.command,
+                    expected: 4,
+                    actual: request.params.len(),
+                })?;
+        let bytes_written = modem.send_command(ModemCommand::LppControl(LppControlRequest {
+            mode: u32::from_be_bytes(bytes),
+        }))?;
+        Ok(HandledCall {
+            command: SdkCommand::LppControl,
             device_id: request.device_id,
             bytes_written,
         })
@@ -5632,6 +5710,87 @@ mod tests {
             std::process::abort();
         };
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn stock_psm_lcs_lpp_controls_match_live_p4_request_only_contracts() {
+        let cases: &[(SdkCommand, &[u8], &[u8])] = &[
+            (
+                SdkCommand::PsmControl,
+                &[0x12, 0x34, 5, 6, 7, 8],
+                &[0x31, 0x55, 0, 10, 0, 8, 0, 6, 0x12, 0x34, 5, 6, 7, 8],
+            ),
+            (
+                SdkCommand::LcsControl,
+                &[0x11, 0x22, 0x33, 0x44],
+                &[0x31, 0x55, 0, 8, 0, 9, 0, 4, 0x11, 0x22, 0x33, 0x44],
+            ),
+            (
+                SdkCommand::LppControl,
+                &[0x55, 0x66, 0x77, 0x88],
+                &[0x31, 0x55, 0, 8, 0, 10, 0, 4, 0x55, 0x66, 0x77, 0x88],
+            ),
+        ];
+        for (command, params, expected) in cases {
+            let dir = TestDir::new();
+            let mut server = bind_server(&dir);
+            let (_client, id) = open_client(&mut server, &dir, 0);
+            let transport = HciIo::new(Cursor::new(Vec::new()));
+            let mut modem = Modem::new(transport);
+            let mut bridge = DeviceBridge::new(1);
+            let call = bridge
+                .handle_sdk_api(
+                    &mut server,
+                    &mut modem,
+                    id,
+                    SdkApiRequest {
+                        command: *command as u16,
+                        device_id: 1,
+                        params,
+                    },
+                )
+                .unwrap_or_else(|_| std::process::abort());
+            assert_eq!(call.command, *command);
+            assert_eq!(call.bytes_written, expected.len());
+            assert_eq!(bridge.pending_count(), 0);
+            assert_eq!(modem.into_transport().into_inner().into_inner(), *expected);
+        }
+    }
+
+    #[test]
+    fn malformed_stock_psm_lcs_lpp_controls_are_rejected_before_modem_write() {
+        let cases: &[(SdkCommand, &[u8], usize)] = &[
+            (SdkCommand::PsmControl, &[0_u8; 5], 6),
+            (SdkCommand::LcsControl, &[0_u8; 3], 4),
+            (SdkCommand::LppControl, &[0_u8; 5], 4),
+        ];
+        for (command, params, expected_len) in cases {
+            let dir = TestDir::new();
+            let mut server = bind_server(&dir);
+            let (_client, id) = open_client(&mut server, &dir, 0);
+            let transport = HciIo::new(Cursor::new(Vec::new()));
+            let mut modem = Modem::new(transport);
+            let mut bridge = DeviceBridge::new(1);
+            assert!(matches!(
+                bridge.handle_sdk_api(
+                    &mut server,
+                    &mut modem,
+                    id,
+                    SdkApiRequest {
+                        command: *command as u16,
+                        device_id: 1,
+                        params,
+                    },
+                ),
+                Err(HandleError::UnexpectedParameters { expected, actual, .. })
+                    if expected == *expected_len && actual == params.len()
+            ));
+            assert_eq!(bridge.pending_count(), 0);
+            assert_eq!(
+                modem.into_transport().into_inner().into_inner(),
+                Vec::<u8>::new()
+            );
+        }
     }
 
     #[test]

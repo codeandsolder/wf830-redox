@@ -17,16 +17,17 @@ use gct_lapi::{
     AttachExtEncodeError, AttachExtRequest, AttachExtResponse, AttachRequest, AttachResponse,
     AttachResponseDecodeError, DetachRequest, DetachRequiredIndication, DetachResponse,
     EmmControlDecodeError, EmmControlReport, EmmControlResponse, EmmNiReattachControlRequest,
-    EmmReattachControlReport, EmmTimerControlRequest, EmptyRequest, MiscReadDecodeError,
-    MiscReadResponse, MobileIdReadRequest, MobileIdReadResponse, PdnConnectExtRequest,
-    PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse, PdnDisconnectRequest,
-    PdnDisconnectResponse, PdnEncodeError, PdnResponseDecodeError, PlmnListResponse,
-    PlmnSearchDecodeError, PlmnSearchExtEncodeError, PlmnSearchExtRequest, PlmnSearchRequest,
-    PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse, ResponseDecodeError,
-    ResultResponse, ResultResponseKind, UeModeChangeRequest, UeModeChangeResponse,
-    UiccAuthenticateEncodeError, UiccAuthenticateRequest, UiccFixedRequest, UiccFixedRequestError,
-    UiccPinCommandRequest, UiccPinEncodeError, UiccPinStatusRequest, UiccReadBinaryRequest,
-    UiccReadRecordRequest, UiccResponse, UiccResponseDecodeError, UiccStatusRequest, uicc_control,
+    EmmReattachControlReport, EmmTimerControlRequest, EmptyRequest, LcsControlRequest,
+    LppControlRequest, MiscReadDecodeError, MiscReadResponse, MobileIdReadRequest,
+    MobileIdReadResponse, PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest,
+    PdnConnectResponse, PdnDisconnectRequest, PdnDisconnectResponse, PdnEncodeError,
+    PdnResponseDecodeError, PlmnListResponse, PlmnSearchDecodeError, PlmnSearchExtEncodeError,
+    PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest,
+    PlmnSearchStopResponse, PsmControlRequest, ResponseDecodeError, ResultResponse,
+    ResultResponseKind, UeModeChangeRequest, UeModeChangeResponse, UiccAuthenticateEncodeError,
+    UiccAuthenticateRequest, UiccFixedRequest, UiccFixedRequestError, UiccPinCommandRequest,
+    UiccPinEncodeError, UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest,
+    UiccResponse, UiccResponseDecodeError, UiccStatusRequest, uicc_control,
 };
 use gct_transport::{
     GlifTransport, HciIo, HciStreamDecoder, MAX_HCI_FRAME_LEN, OEM_READ_BUFFER_LEN,
@@ -203,6 +204,9 @@ pub enum ModemCommand<'a> {
     MobileIdRead(MobileIdReadRequest),
     UeModeChange(UeModeChangeRequest),
     EmmTimerControl(EmmTimerControlRequest),
+    PsmControl(PsmControlRequest),
+    LcsControl(LcsControlRequest),
+    LppControl(LppControlRequest),
     EmmNiReattachControl(EmmNiReattachControlRequest),
     Empty(EmptyRequest),
     At(AtCommand<'a>),
@@ -272,7 +276,12 @@ impl ModemCommand<'_> {
             Self::Empty(EmptyRequest::PsInit) => {
                 Some(ResponseKey::Result(ResultResponseKind::PsInit))
             }
-            Self::At(_) | Self::AtExt(_) | Self::EmmTimerControl(_) => None,
+            Self::At(_)
+            | Self::AtExt(_)
+            | Self::EmmTimerControl(_)
+            | Self::PsmControl(_)
+            | Self::LcsControl(_)
+            | Self::LppControl(_) => None,
             Self::UiccStatus(_) => Some(ResponseKey::Uicc(uicc_control::STATUS)),
             Self::UiccFixed(request) => Some(ResponseKey::Uicc(request.kind())),
             Self::UiccReadBinary(_) => Some(ResponseKey::Uicc(uicc_control::READ_BINARY)),
@@ -506,6 +515,9 @@ pub fn encode_command(
         ModemCommand::MobileIdRead(request) => Ok(request.encode(output)?),
         ModemCommand::UeModeChange(request) => Ok(request.encode(output)?),
         ModemCommand::EmmTimerControl(request) => Ok(request.encode(output)?),
+        ModemCommand::PsmControl(request) => Ok(request.encode(output)?),
+        ModemCommand::LcsControl(request) => Ok(request.encode(output)?),
+        ModemCommand::LppControl(request) => Ok(request.encode(output)?),
         ModemCommand::EmmNiReattachControl(request) => Ok(request.encode(output)?),
         ModemCommand::Empty(request) => Ok(request.encode(output)?),
         ModemCommand::At(request) => Ok(request.encode(output)?),
@@ -820,9 +832,10 @@ mod tests {
     use gct_hci::{Header, Packet, public_opcode, recovered_opcode};
     use gct_lapi::{
         AtCommand, AtCommandExt, AtCommandFromDevice, AttachExtProfile, AttachExtRequest,
-        EmmNiReattachControlRequest, EmmTimerControlRequest, EmptyRequest, MobileIdReadRequest,
-        PcoInfo, PinData, PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchStopRequest,
-        ResponseDecodeError, ResultResponseKind, UiccPinCommandRequest,
+        EmmNiReattachControlRequest, EmmTimerControlRequest, EmptyRequest, LcsControlRequest,
+        LppControlRequest, MobileIdReadRequest, PcoInfo, PinData, PlmnSearchExtRequest,
+        PlmnSearchRequest, PlmnSearchStopRequest, PsmControlRequest, ResponseDecodeError,
+        ResultResponseKind, UiccPinCommandRequest,
     };
     use gct_transport::HciIo;
 
@@ -1202,7 +1215,7 @@ mod tests {
     }
 
     #[test]
-    fn emm_control_tracking_and_decode_match_live_family_semantics() {
+    fn request_only_emm_controls_have_no_response_key() {
         let mut timer_bytes = [0_u8; 12];
         assert_eq!(
             encode_command(
@@ -1230,7 +1243,23 @@ mod tests {
             .response_key(),
             None
         );
+        for command in [
+            ModemCommand::PsmControl(PsmControlRequest {
+                ctrl_cmd: 1,
+                t3324_timer_value_unit: 2,
+                t3324_timer_value: 3,
+                ext_t3412_timer_value_unit: 4,
+                ext_t3412_timer_value: 5,
+            }),
+            ModemCommand::LcsControl(LcsControlRequest { mode: 6 }),
+            ModemCommand::LppControl(LppControlRequest { mode: 7 }),
+        ] {
+            assert_eq!(command.response_key(), None);
+        }
+    }
 
+    #[test]
+    fn emm_control_tracking_and_decode_match_live_family_semantics() {
         let transport = HciIo::new(Cursor::new(Vec::new()));
         let mut modem = Modem::new(transport);
         let mut pending = PendingRequests::new();
@@ -1288,18 +1317,17 @@ mod tests {
             ))
         );
 
-        let timer_ack = [0, 0, 0, 7, 0, 4, 0, 0, 0, 1];
-        let timer_packet = Packet {
-            header: Header {
-                command: recovered_opcode::EMM_CONTROL_RESPONSE,
-                payload_len: 10,
-            },
-            payload: &timer_ack,
-        };
-        assert_eq!(
-            decode_event(timer_packet),
-            Ok(ModemEvent::Unknown(timer_packet))
-        );
+        for kind in [7_u8, 8, 9, 10] {
+            let ignored_ack = [0, 0, 0, kind, 0, 4, 0, 0, 0, 1];
+            let packet = Packet {
+                header: Header {
+                    command: recovered_opcode::EMM_CONTROL_RESPONSE,
+                    payload_len: 10,
+                },
+                payload: &ignored_ack,
+            };
+            assert_eq!(decode_event(packet), Ok(ModemEvent::Unknown(packet)));
+        }
     }
 
     #[test]

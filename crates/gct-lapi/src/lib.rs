@@ -2183,6 +2183,89 @@ impl EmmTimerControlRequest {
     }
 }
 
+/// Power-saving-mode control request carried by shared command `0x3155`
+/// discriminator 8.
+///
+/// B014 DWARF names the exact six-byte object `_PSM_CTRL_REQ`; live P4
+/// `LAPI_PSMctrlRequest` consumes the same fields and width.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PsmControlRequest {
+    pub ctrl_cmd: u16,
+    pub t3324_timer_value_unit: u8,
+    pub t3324_timer_value: u8,
+    pub ext_t3412_timer_value_unit: u8,
+    pub ext_t3412_timer_value: u8,
+}
+
+impl PsmControlRequest {
+    /// Encode exact live-P4 bytes
+    /// `00 08 00 06 <ctrl:u16> <T3324 unit,value> <ext-T3412 unit,value>`.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than 14 bytes.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        let ctrl_cmd = self.ctrl_cmd.to_be_bytes();
+        encode_packet(
+            recovered_opcode::EMM_CONTROL_REQUEST,
+            &[
+                0x00,
+                0x08,
+                0x00,
+                0x06,
+                ctrl_cmd[0],
+                ctrl_cmd[1],
+                self.t3324_timer_value_unit,
+                self.t3324_timer_value,
+                self.ext_t3412_timer_value_unit,
+                self.ext_t3412_timer_value,
+            ],
+            output,
+        )
+    }
+}
+
+/// LCS control request carried by shared command `0x3155` discriminator 9.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LcsControlRequest {
+    pub mode: u32,
+}
+
+impl LcsControlRequest {
+    /// Encode exact live-P4 bytes `00 09 00 04 <mode:u32>`.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than 12 bytes.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        let mode = self.mode.to_be_bytes();
+        encode_packet(
+            recovered_opcode::EMM_CONTROL_REQUEST,
+            &[0x00, 0x09, 0x00, 0x04, mode[0], mode[1], mode[2], mode[3]],
+            output,
+        )
+    }
+}
+
+/// LPP control request carried by shared command `0x3155` discriminator 10.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LppControlRequest {
+    pub mode: u32,
+}
+
+impl LppControlRequest {
+    /// Encode exact live-P4 bytes `00 0a 00 04 <mode:u32>`.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than 12 bytes.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        let mode = self.mode.to_be_bytes();
+        encode_packet(
+            recovered_opcode::EMM_CONTROL_REQUEST,
+            &[0x00, 0x0a, 0x00, 0x04, mode[0], mode[1], mode[2], mode[3]],
+            output,
+        )
+    }
+}
+
 /// Network-initiated reattach-control request carried by shared command
 /// `0x3155` discriminator 11.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2236,8 +2319,9 @@ fn parse_emm_control_envelope(
 }
 
 /// Shared `0xb156` control response. Live P4 only wires discriminator 11 to the
-/// NI-reattach stock callback; discriminator 7 (timer control) is deliberately
-/// dropped by the SDK switch and remains [`Self::Unsupported`].
+/// NI-reattach stock callback; discriminators 7 (timer), 8 (PSM), 9 (LCS), and
+/// 10 (LPP) are deliberately dropped by the SDK switch and remain
+/// [`Self::Unsupported`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmmControlResponse {
     NiReattach { result: u32 },
@@ -5870,6 +5954,41 @@ mod tests {
     }
 
     #[test]
+    fn psm_lcs_lpp_control_requests_match_exact_live_p4_bytes() {
+        let mut psm = [0_u8; 14];
+        assert_eq!(
+            super::PsmControlRequest {
+                ctrl_cmd: 0x1234,
+                t3324_timer_value_unit: 5,
+                t3324_timer_value: 6,
+                ext_t3412_timer_value_unit: 7,
+                ext_t3412_timer_value: 8,
+            }
+            .encode(&mut psm),
+            Ok(14)
+        );
+        assert_eq!(
+            psm,
+            [
+                0x31, 0x55, 0x00, 0x0a, 0x00, 0x08, 0x00, 0x06, 0x12, 0x34, 5, 6, 7, 8
+            ]
+        );
+
+        let mut lcs = [0_u8; 12];
+        assert_eq!(
+            super::LcsControlRequest { mode: 0x1122_3344 }.encode(&mut lcs),
+            Ok(12)
+        );
+        assert_eq!(lcs, [0x31, 0x55, 0, 8, 0, 9, 0, 4, 0x11, 0x22, 0x33, 0x44]);
+        let mut lpp = [0_u8; 12];
+        assert_eq!(
+            super::LppControlRequest { mode: 0x1122_3344 }.encode(&mut lpp),
+            Ok(12)
+        );
+        assert_eq!(lpp, [0x31, 0x55, 0, 8, 0, 10, 0, 4, 0x11, 0x22, 0x33, 0x44]);
+    }
+
+    #[test]
     fn emm_control_requests_and_live_envelopes_match_exact_bytes() {
         let mut timer = [0_u8; 12];
         assert_eq!(
@@ -5915,6 +6034,15 @@ mod tests {
             super::EmmControlResponse::parse(packet(0xb156, &timer_response)),
             Ok(super::EmmControlResponse::Unsupported { kind: 7 })
         );
+        for kind in [8_u8, 9, 10] {
+            let response = [0, 0, 0, kind, 0, 4, 0, 0, 0, 1];
+            assert_eq!(
+                super::EmmControlResponse::parse(packet(0xb156, &response)),
+                Ok(super::EmmControlResponse::Unsupported {
+                    kind: u16::from(kind)
+                })
+            );
+        }
 
         let report = [0x12, 0x34, 0x00, 0x0b, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd];
         assert_eq!(

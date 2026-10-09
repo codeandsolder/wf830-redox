@@ -1203,3 +1203,50 @@ Because both request and response carry `search_type`, runtime correlation uses
 `ResponseKey::PlmnSearchStop(search_type)`. Extended AT remains deliberately
 untracked: like normal AT, its inbound channel/raw-byte stream has no recovered
 one-request completion identity.
+
+## Live P4 PSM / LCS / LPP shared controls
+
+A fresh live-rootfs import inventory was used to choose these families rather
+than extending old headers speculatively. `LTED_PSMctrlRequest`,
+`LTED_LCSctrlRequest`, and `LTED_LPPctrlRequest` are each imported by five
+shipped connection-manager binaries/instances (`lteautocm`, `smartfren`, and
+`sprint_cm`), making them the highest-use remaining compact request families.
+
+Live P4 `liblted.so` proves the stock local ABI directly:
+
+- `LTED_PSMctrlRequest` at `0x14108` emits SDK command **208** and copies exactly
+  **6 caller bytes**.
+- `LTED_LCSctrlRequest` at `0x142b8` emits command **209** and copies exactly
+  **4 caller bytes**.
+- `LTED_LPPctrlRequest` at `0x14468` emits command **210** and copies exactly
+  **4 caller bytes**.
+
+Older B014 DWARF independently names the same object layouts. `_PSM_CTRL_REQ`
+is six bytes: `ctrlCmd:u16@0`, `T3324TimerValUnit:u8@2`,
+`T3324TimerVal:u8@3`, `extT3412TimerValUnit:u8@4`, and
+`extT3412TimerVal:u8@5`. `_LCS_CTRL_REQ` and `_LPP_CTRL_REQ` are each exactly
+four bytes containing only `mode:u32@0`. The Rust compatibility layer decodes
+those semantics rather than carrying opaque historical C structs.
+
+The live modem SDK then proves all three wire grammars. `LAPI_PSMctrlRequest`
+at `0x5f388`, `LAPI_LCSctrlRequest` at `0x5f69c`, and
+`LAPI_LPPctrlRequest` at `0x5f9a4` all serialize through shared HCI opcode
+**`0x3155`**:
+
+- PSM: `00 08 00 06 <ctrlCmd:u16> <T3324 unit,value> <ext-T3412 unit,value>`.
+- LCS: `00 09 00 04 <mode:u32>`.
+- LPP: `00 0a 00 04 <mode:u32>`.
+
+The response side is intentionally *not* modeled as three request/response
+families. Live P4's shared `0xb156` handler at `0x3319c` switches on the
+payload discriminator and sends **7, 8, 9, and 10** to the same default/drop
+path; only discriminator 11 reaches the NI-reattach response handler. Thus EMM
+timer control, PSM, LCS, and LPP acknowledgements are all request-only from the
+observable stock-client ABI. Rust sends them with `send_command`, assigns no
+`ResponseKey`, and continues to decode any `0xb156` discriminator 7..10 as an
+unsupported/unknown event instead of inventing callbacks or pending-state
+completion.
+
+Golden tests cover each exact stock-local-to-HCI translation, malformed local
+length rejection before GLIF I/O, zero pending-state creation, and the live
+shared-response drop behavior for discriminators 7 through 10.

@@ -162,6 +162,9 @@ pub enum SdkCommand {
     UiccRequest = 147,
     UeModeChange = 161,
     EmmTimerControl = 207,
+    PsmControl = 208,
+    LcsControl = 209,
+    LppControl = 210,
     EmmNiReattachControl = 211,
 }
 
@@ -190,6 +193,9 @@ impl TryFrom<u16> for SdkCommand {
             147 => Ok(Self::UiccRequest),
             161 => Ok(Self::UeModeChange),
             207 => Ok(Self::EmmTimerControl),
+            208 => Ok(Self::PsmControl),
+            209 => Ok(Self::LcsControl),
+            210 => Ok(Self::LppControl),
             211 => Ok(Self::EmmNiReattachControl),
             _ => Err(UnknownSdkCommand(value)),
         }
@@ -599,6 +605,9 @@ mod tests {
         assert_eq!(SdkCommand::try_from(147), Ok(SdkCommand::UiccRequest));
         assert_eq!(SdkCommand::try_from(161), Ok(SdkCommand::UeModeChange));
         assert_eq!(SdkCommand::try_from(207), Ok(SdkCommand::EmmTimerControl));
+        assert_eq!(SdkCommand::try_from(208), Ok(SdkCommand::PsmControl));
+        assert_eq!(SdkCommand::try_from(209), Ok(SdkCommand::LcsControl));
+        assert_eq!(SdkCommand::try_from(210), Ok(SdkCommand::LppControl));
         assert_eq!(
             SdkCommand::try_from(211),
             Ok(SdkCommand::EmmNiReattachControl)
