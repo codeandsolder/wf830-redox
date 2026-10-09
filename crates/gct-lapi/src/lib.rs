@@ -2266,6 +2266,40 @@ impl LppControlRequest {
     }
 }
 
+/// Live-only EMM timer-start request carried by shared command `0x3155`
+/// discriminator 13.
+///
+/// The live P4 stock wrapper copies exactly three caller bytes and the live SDK
+/// preserves those bytes on the modem wire. No independently named field
+/// layout is available, so the fixed-size parameters intentionally remain
+/// opaque rather than assigning speculative semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmmTimerStartRequest {
+    pub params: [u8; 3],
+}
+
+impl EmmTimerStartRequest {
+    /// Encode exact live-P4 bytes `00 0d 00 03 <params[0..3]>`.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than 11 bytes.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        encode_packet(
+            recovered_opcode::EMM_CONTROL_REQUEST,
+            &[
+                0x00,
+                0x0d,
+                0x00,
+                0x03,
+                self.params[0],
+                self.params[1],
+                self.params[2],
+            ],
+            output,
+        )
+    }
+}
+
 /// Network-initiated reattach-control request carried by shared command
 /// `0x3155` discriminator 11.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2320,7 +2354,7 @@ fn parse_emm_control_envelope(
 
 /// Shared `0xb156` control response. Live P4 only wires discriminator 11 to the
 /// NI-reattach stock callback; discriminators 7 (timer), 8 (PSM), 9 (LCS), and
-/// 10 (LPP) are deliberately dropped by the SDK switch and remain
+/// 10 (LPP), and 13 (timer start) are deliberately dropped by the SDK switch and remain
 /// [`Self::Unsupported`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmmControlResponse {
@@ -2329,18 +2363,32 @@ pub enum EmmControlResponse {
 }
 
 impl EmmControlResponse {
-    /// Decode the exact ten-byte shared response envelope.
+    /// Decode the live shared response switch.
+    ///
+    /// Unsupported discriminators are returned after only the four-byte
+    /// prefix/discriminator pair has been proven present, matching the live
+    /// SDK switch which drops those families before reading their bodies.
+    /// Discriminator 11 then requires the exact ten-byte NI-reattach envelope.
     ///
     /// # Errors
-    /// Returns [`EmmControlDecodeError`] for a malformed opcode/length envelope.
+    /// Returns [`EmmControlDecodeError`] for a malformed opcode or NI-reattach
+    /// envelope.
     pub fn parse(packet: Packet<'_>) -> Result<Self, EmmControlDecodeError> {
-        let (_prefix, kind, value) =
+        let payload = response_payload(packet, recovered_opcode::EMM_CONTROL_RESPONSE)?;
+        if payload.len() < 4 {
+            return Err(ResponseDecodeError::TruncatedPrefix {
+                minimum: 4,
+                actual: payload.len(),
+            }
+            .into());
+        }
+        let kind = be_u16(payload, 2);
+        if kind != 11 {
+            return Ok(Self::Unsupported { kind });
+        }
+        let (_prefix, _kind, value) =
             parse_emm_control_envelope(packet, recovered_opcode::EMM_CONTROL_RESPONSE)?;
-        Ok(if kind == 11 {
-            Self::NiReattach { result: value }
-        } else {
-            Self::Unsupported { kind }
-        })
+        Ok(Self::NiReattach { result: value })
     }
 }
 
@@ -5986,6 +6034,24 @@ mod tests {
             Ok(12)
         );
         assert_eq!(lpp, [0x31, 0x55, 0, 8, 0, 10, 0, 4, 0x11, 0x22, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn emm_timer_start_preserves_exact_three_stock_bytes() {
+        let mut output = [0_u8; 11];
+        assert_eq!(
+            super::EmmTimerStartRequest {
+                params: [0x12, 0x34, 0x56]
+            }
+            .encode(&mut output),
+            Ok(11)
+        );
+        assert_eq!(output, [0x31, 0x55, 0, 7, 0, 13, 0, 3, 0x12, 0x34, 0x56]);
+        let dropped = [0, 0, 0, 13, 0, 3, 0xaa];
+        assert_eq!(
+            super::EmmControlResponse::parse(packet(0xb156, &dropped)),
+            Ok(super::EmmControlResponse::Unsupported { kind: 13 })
+        );
     }
 
     #[test]

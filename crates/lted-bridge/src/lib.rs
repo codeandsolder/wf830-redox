@@ -12,17 +12,17 @@ use gct_lapi::{
     ApnType, AtCommand, AtCommandExt, AttachExtProfile, AttachExtRequest, AttachExtResponse,
     AttachRequest, AttachResponse, AttachTailDecodeError, AttachTailField, DetachRequest,
     DetachRequiredIndication, DetachResponse, EmergencyNumberDecodeError,
-    EmmNiReattachControlRequest, EmmReattachControlReport, EmmTimerControlRequest, EmptyRequest,
-    LcsControlRequest, LppControlRequest, MobileIdReadRequest, MobileIdReadResponse, PcoInfo,
-    PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse,
-    PdnConnectTailDecodeError, PdnConnectTailField, PdnConnectionControl, PdnDisconnectField,
-    PdnDisconnectFieldDecodeError, PdnDisconnectRequest, PdnDisconnectResponse, PdnInfoContainers,
-    PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse,
-    PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest,
-    PlmnSearchStopResponse, Positioning, PsmControlRequest, QosField, ResultResponse,
-    ResultResponseKind, UeModeChangeRequest, UeModeChangeResponse, UiccFixedRequest,
-    UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse,
-    UiccStatusRequest, uicc_control,
+    EmmNiReattachControlRequest, EmmReattachControlReport, EmmTimerControlRequest,
+    EmmTimerStartRequest, EmptyRequest, LcsControlRequest, LppControlRequest, MobileIdReadRequest,
+    MobileIdReadResponse, PcoInfo, PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest,
+    PdnConnectResponse, PdnConnectTailDecodeError, PdnConnectTailField, PdnConnectionControl,
+    PdnDisconnectField, PdnDisconnectFieldDecodeError, PdnDisconnectRequest, PdnDisconnectResponse,
+    PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError,
+    PlmnListResponse, PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchResponse,
+    PlmnSearchStopRequest, PlmnSearchStopResponse, Positioning, PsmControlRequest, QosField,
+    ResultResponse, ResultResponseKind, UeModeChangeRequest, UeModeChangeResponse,
+    UiccFixedRequest, UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest,
+    UiccResponse, UiccStatusRequest, uicc_control,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -2295,6 +2295,7 @@ impl DeviceBridge {
                 Ok(SdkCommand::PsmControl) => Self::dispatch_psm_control(modem, request),
                 Ok(SdkCommand::LcsControl) => Self::dispatch_lcs_control(modem, request),
                 Ok(SdkCommand::LppControl) => Self::dispatch_lpp_control(modem, request),
+                Ok(SdkCommand::EmmTimerStart) => Self::dispatch_emm_timer_start(modem, request),
                 Ok(SdkCommand::EmmNiReattachControl) => {
                     self.dispatch_emm_ni_reattach_control(modem, request)
                 }
@@ -2609,6 +2610,28 @@ impl DeviceBridge {
         }))?;
         Ok(HandledCall {
             command: SdkCommand::LppControl,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_emm_timer_start<T: Write>(
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let params: [u8; 3] =
+            request
+                .params
+                .try_into()
+                .map_err(|_| HandleError::UnexpectedParameters {
+                    command: request.command,
+                    expected: 3,
+                    actual: request.params.len(),
+                })?;
+        let bytes_written =
+            modem.send_command(ModemCommand::EmmTimerStart(EmmTimerStartRequest { params }))?;
+        Ok(HandledCall {
+            command: SdkCommand::EmmTimerStart,
             device_id: request.device_id,
             bytes_written,
         })
@@ -5791,6 +5814,66 @@ mod tests {
                 Vec::<u8>::new()
             );
         }
+    }
+
+    #[test]
+    fn stock_emm_timer_start_is_exact_and_deliberately_untracked() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::EmmTimerStart as u16,
+                    device_id: 1,
+                    params: &[0x12, 0x34, 0x56],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.bytes_written, 11);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![0x31, 0x55, 0, 7, 0, 13, 0, 3, 0x12, 0x34, 0x56]
+        );
+    }
+
+    #[test]
+    fn malformed_stock_emm_timer_start_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::EmmTimerStart as u16,
+                    device_id: 1,
+                    params: &[0; 2],
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                command: 213,
+                expected: 3,
+                actual: 2,
+            })
+        ));
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]

@@ -1250,3 +1250,31 @@ completion.
 Golden tests cover each exact stock-local-to-HCI translation, malformed local
 length rejection before GLIF I/O, zero pending-state creation, and the live
 shared-response drop behavior for discriminators 7 through 10.
+
+## Live-only EMM Timer Start
+
+The live rootfs has one shipped importer of `LTED_EMMTimerStartRequest`
+(`lteautocm`). Live P4 `liblted.so::LTED_EMMTimerStartRequest` at `0x14978`
+emits SDK command **213** and copies exactly **3 caller bytes** into the local
+request. This family is absent from the older B014 type information available
+here, so those three bytes intentionally remain an opaque fixed-size parameter
+object rather than receiving guessed field names.
+
+Live `libltesdk.so::LAPI_EMMTimerStartRequest` at `0x604a8` independently proves
+the modem serialization: shared HCI opcode **`0x3155`**, discriminator **13**,
+declared body length **3**, followed by the same three caller bytes. The
+implementation combines the first two bytes into a word only to emit the same
+high/low bytes again; the third byte is copied directly. Thus the exact clean
+wire grammar is `00 0d 00 03 <three stock bytes>`.
+
+The live shared `0xb156` response switch at `0x3319c` routes discriminator 13 to
+the same default/drop path as 7..10. No stock response callback is therefore
+invented and Timer Start is request-only/untracked. This also exposed an overly
+strict assumption in the earlier shared-response decoder: stock chooses the
+handler from the discriminator *before* parsing a family-specific body, while
+Rust previously required every unsupported response to look like the ten-byte
+NI-reattach envelope. `EmmControlResponse::parse` now requires only enough bytes
+to read the discriminator for unsupported families; only discriminator 11 must
+satisfy the exact NI-reattach body grammar. Tests prove command 213, the exact
+11-byte HCI frame, malformed local-length rejection before GLIF I/O, zero
+pending state, and discriminator-13 drop behavior with a non-NI body shape.

@@ -166,6 +166,7 @@ pub enum SdkCommand {
     LcsControl = 209,
     LppControl = 210,
     EmmNiReattachControl = 211,
+    EmmTimerStart = 213,
 }
 
 impl TryFrom<u16> for SdkCommand {
@@ -197,6 +198,7 @@ impl TryFrom<u16> for SdkCommand {
             209 => Ok(Self::LcsControl),
             210 => Ok(Self::LppControl),
             211 => Ok(Self::EmmNiReattachControl),
+            213 => Ok(Self::EmmTimerStart),
             _ => Err(UnknownSdkCommand(value)),
         }
     }
@@ -612,6 +614,7 @@ mod tests {
             SdkCommand::try_from(211),
             Ok(SdkCommand::EmmNiReattachControl)
         );
+        assert_eq!(SdkCommand::try_from(213), Ok(SdkCommand::EmmTimerStart));
         assert!(SdkCommand::try_from(0xffff).is_err());
     }
 
