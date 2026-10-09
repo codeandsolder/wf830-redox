@@ -345,13 +345,14 @@ or inconsistent lengths, ignores the historical transaction byte, and mirrors
 live `LAPI_PDNDisconnRequest` by allocating a fresh TID before encoding
 `0x3107`.
 
-The reverse path is callback 36 (`PDNDisconn`). B014 DWARF fixes
-`_PDN_DISCONNECT_RSP_INFO` at 176 bytes: result/reject causes/default EPS ID at
+The reverse path on the target P4 firmware is callback 37 (`PDNDisconn`).
+B014 DWARF fixes `_PDN_DISCONNECT_RSP_INFO` at 176 bytes: result/reject causes/default EPS ID at
 `0x000..0x008`, transaction ID at `0x008`, 65-byte APN-NI at `0x009`, and
-102-byte operator PCO at `0x04a`. The stock `ind_pdn_disconnect_response`
-handler directly passes callback ID 36 to `lted_srv_send_sdk_cb_assemble_hci`;
-the callback jump table maps that ID to `cb_rsp[8]`, registration offset
-`0x44`. Rust parses `0xb108`, correlates by the fresh transaction ID,
+102-byte operator PCO at `0x04a`. Live P4 `ind_pdn_disconnect_response` directly passes callback ID 37 to
+`lted_srv_send_sdk_cb_assemble_hci`, and its callback jump table maps ID 37 to
+`cb_rsp[8]`, registration offset `0x44`. The older B014 daemon passes 36 here;
+this is a firmware-generation selector delta, so the live P4 value is the
+compatibility contract. Rust parses `0xb108`, correlates by the fresh transaction ID,
 re-materializes the 176-byte legacy response, and broadcasts only to clients
 registered in that slot. End-to-end tests cover exact `0x3107` bytes,
 variable-length local request validation, callback materialization,

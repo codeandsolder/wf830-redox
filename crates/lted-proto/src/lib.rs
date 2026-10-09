@@ -36,7 +36,7 @@ impl SdkCallbackKind {
         match self {
             Self::Attach => 26,
             Self::PdnConnect => 33,
-            Self::PdnDisconnect => 36,
+            Self::PdnDisconnect => 37,
             Self::PlmnList => 45,
             Self::Online => 59,
             Self::Offline => 62,
@@ -690,7 +690,7 @@ mod tests {
         assert_eq!(SdkCallbackKind::Attach.registration_offset(), 0x14);
         assert_eq!(SdkCallbackKind::PdnConnect.callback_id(), 33);
         assert_eq!(SdkCallbackKind::PdnConnect.registration_offset(), 0x34);
-        assert_eq!(SdkCallbackKind::PdnDisconnect.callback_id(), 36);
+        assert_eq!(SdkCallbackKind::PdnDisconnect.callback_id(), 37);
         assert_eq!(SdkCallbackKind::PdnDisconnect.registration_offset(), 0x44);
         assert_eq!(SdkCallbackKind::PlmnList.callback_id(), 45);
         assert_eq!(SdkCallbackKind::PlmnList.registration_offset(), 0x5c);

@@ -829,12 +829,12 @@ fn materialize_pdn_disconnect_callback(
     Ok(())
 }
 
-/// Materialize and broadcast stock callback 36 (`PDNDisconn`).
+/// Materialize and broadcast live-P4 stock callback 37 (`PDNDisconn`).
 ///
 /// B014 DWARF gives an exact 176-byte `_PDN_DISCONNECT_RSP_INFO`, and its
 /// callback selector maps the disconnect response to client-context offset
-/// `0x44` (`cb_rsp[8]`). The stock response handler directly passes callback
-/// ID 36 to `lted_srv_send_sdk_cb_assemble_hci`.
+/// `0x44` (`cb_rsp[8]`). Live P4 directly passes callback ID 37 to
+/// `lted_srv_send_sdk_cb_assemble_hci` (older B014 passes 36 for this family).
 /// The modem's typed `0xb108` response is converted into the historical byte
 /// image before the standard local `0x8107` envelope is emitted.
 ///
@@ -2423,7 +2423,7 @@ mod tests {
         assert_eq!(len, 12 + 0xb0);
         let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
         let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(callback.callback_id, 36);
+        assert_eq!(callback.callback_id, 37);
         assert_eq!(callback.device_id, 0x1122_3344);
         assert_eq!(callback.data.len(), 0xb0);
         let data = callback.data;
