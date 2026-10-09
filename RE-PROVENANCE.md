@@ -856,6 +856,34 @@ The extended-attach response (`0xb166`) has no recovered transaction identity.
 and rejects a second in-flight extended attach rather than inventing correlation
 metadata absent from the response.
 
+The unchanged stock-client ABI is now bridged in both directions as well. Live P4
+`liblted.so::LTED_AttachRequestEXT` at `0xaa80` sends SDK command 27 and copies
+**exactly 484 caller bytes** into the local request. `lted-bridge` therefore
+decodes the proven B014 object only at the offsets above; it does not expose the
+historical struct, and when `optional_info == 0` it deliberately leaves dead
+fixed-string storage uninterpreted just as the live encoder does. A golden test
+turns a representative 484-byte stock object into the exact 73-byte `0x3165`
+frame, while unterminated fixed strings fail before GLIF I/O.
+
+On the reverse path, live P4 `ind_attach_response_extension` at `0x210bc` passes
+callback ID **28** to `lted_srv_send_sdk_cb_assemble_hci`. The live callback
+lookup maps ID 28 to `cb_rsp[3]`, function-registration offset `0x1c`. B014 DWARF
+fixes `_ATTACH_RSP_EXT_INFO` at exactly **700 bytes**: registration results at
+0/2, requested APN-NI at 4, received APN-NI at 69, default/active EPS IDs at
+134/136, data path/IP allocation/APN class at 138/139/140, the 554-byte
+`ATTACH_PDN_RSP_INFO` at 141, and five-byte `NET_FEATURE_INFO` at 695.
+
+The live P4 modem parser independently confirms the response construction. After
+the shared 15-byte fixed prefix it consumes one fixed-order APN-class TLV, then
+requested and received APN-NI TLVs, then runs the same at-most-two contiguous
+`0xf0`/`0xf2` PDN/QoS parser already used by the normal bridge. `gct-lapi` now
+exposes this as `AttachExtResponse`; bytes after those initial containers remain
+visible as `unparsed_suffix` because the OEM ignores them. The callback
+materializer reuses the shared PDN/QoS writer at base `0x08d`, producing the
+exact 700-byte stock image. End-to-end tests verify callback 28 routing, the
+legacy offsets above, subscription gating, and release of the family-level
+pending key.
+
 ## Extended AT and PLMN-search-stop
 
 Two request families previously omitted from the typed runtime now have direct

@@ -9,13 +9,14 @@
 use std::{io, io::Write};
 
 use gct_lapi::{
-    ApnType, AttachRequest, AttachResponse, AttachTailDecodeError, AttachTailField, DetachRequest,
-    DetachResponse, EmergencyNumberDecodeError, EmptyRequest, PdnConnectRequest,
-    PdnConnectResponse, PdnConnectTailDecodeError, PdnConnectTailField, PdnConnectionControl,
-    PdnDisconnectField, PdnDisconnectFieldDecodeError, PdnDisconnectRequest, PdnDisconnectResponse,
-    PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError,
-    PlmnListResponse, PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest,
-    PlmnSearchStopResponse, Positioning, QosField, ResultResponse, ResultResponseKind,
+    ApnType, AttachExtProfile, AttachExtRequest, AttachExtResponse, AttachRequest, AttachResponse,
+    AttachTailDecodeError, AttachTailField, DetachRequest, DetachResponse,
+    EmergencyNumberDecodeError, EmptyRequest, PcoInfo, PdnConnectRequest, PdnConnectResponse,
+    PdnConnectTailDecodeError, PdnConnectTailField, PdnConnectionControl, PdnDisconnectField,
+    PdnDisconnectFieldDecodeError, PdnDisconnectRequest, PdnDisconnectResponse, PdnInfoContainers,
+    PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse,
+    PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
+    Positioning, QosField, ResultResponse, ResultResponseKind,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -44,9 +45,11 @@ pub enum HandleError {
         expected: u32,
     },
     LegacyAttach(LegacyAttachDecodeError),
+    LegacyAttachExt(LegacyAttachExtDecodeError),
     LegacyPdnConnect(LegacyPdnConnectDecodeError),
     LegacyPdnDisconnect(LegacyPdnDisconnectDecodeError),
     AttachCallback(AttachCallbackError),
+    AttachExtCallback(AttachExtCallbackError),
     PdnConnectCallback(PdnConnectCallbackError),
     PdnDisconnectCallback(PdnDisconnectCallbackError),
     TransactionIdsExhausted,
@@ -79,6 +82,9 @@ impl std::fmt::Display for HandleError {
                 "lted SDK request addressed device {requested}, expected {expected}"
             ),
             Self::LegacyAttach(error) => write!(f, "invalid stock attach request: {error:?}"),
+            Self::LegacyAttachExt(error) => {
+                write!(f, "invalid stock extended-attach request: {error:?}")
+            }
             Self::LegacyPdnConnect(error) => {
                 write!(f, "invalid stock PDN-connect request: {error:?}")
             }
@@ -86,6 +92,9 @@ impl std::fmt::Display for HandleError {
                 write!(f, "invalid stock PDN-disconnect request: {error:?}")
             }
             Self::AttachCallback(error) => write!(f, "invalid attach callback payload: {error:?}"),
+            Self::AttachExtCallback(error) => {
+                write!(f, "invalid extended-attach callback payload: {error:?}")
+            }
             Self::PdnConnectCallback(error) => {
                 write!(f, "invalid PDN-connect callback payload: {error:?}")
             }
@@ -109,9 +118,11 @@ impl std::error::Error for HandleError {
             | Self::UnexpectedParameters { .. }
             | Self::UnknownDevice { .. }
             | Self::LegacyAttach(_)
+            | Self::LegacyAttachExt(_)
             | Self::LegacyPdnConnect(_)
             | Self::LegacyPdnDisconnect(_)
             | Self::AttachCallback(_)
+            | Self::AttachExtCallback(_)
             | Self::PdnConnectCallback(_)
             | Self::PdnDisconnectCallback(_)
             | Self::TransactionIdsExhausted
@@ -142,6 +153,7 @@ impl From<SendTrackedCommandError> for HandleError {
 }
 
 pub const LEGACY_ATTACH_PARAMS_LEN: usize = 0x160;
+pub const LEGACY_ATTACH_EXT_PARAMS_LEN: usize = 0x1e4;
 pub const LEGACY_PDN_CONNECT_PARAMS_LEN: usize = 0x1a4;
 pub const LEGACY_PDN_DISCONNECT_FIXED_LEN: usize = 4;
 pub const LEGACY_PDN_DISCONNECT_MAX_LEN: usize = 0x44;
@@ -168,6 +180,132 @@ fn legacy_c_string(
         return Err(LegacyAttachDecodeError::MissingTerminator(field));
     };
     Ok(&bytes[..end])
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyAttachExtStringField {
+    PrimaryApn,
+    PrimaryUsername,
+    PrimaryPassword,
+    RetryApn,
+    RetryUsername,
+    RetryPassword,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyAttachExtDecodeError {
+    UnexpectedLength { expected: usize, actual: usize },
+    MissingTerminator(LegacyAttachExtStringField),
+}
+
+fn legacy_attach_ext_c_string(
+    bytes: &[u8],
+    field: LegacyAttachExtStringField,
+) -> Result<&[u8], LegacyAttachExtDecodeError> {
+    let Some(end) = bytes.iter().position(|&byte| byte == 0) else {
+        return Err(LegacyAttachExtDecodeError::MissingTerminator(field));
+    };
+    Ok(&bytes[..end])
+}
+
+const fn legacy_pco_info(bytes: &[u8], offset: usize) -> PcoInfo {
+    PcoInfo {
+        first_pco: bytes[offset],
+        second_pco: bytes[offset + 1],
+        n_pco: bytes[offset + 2],
+        first_os_pco: u16::from_be_bytes([bytes[offset + 3], bytes[offset + 4]]),
+        second_os_pco: u16::from_be_bytes([bytes[offset + 5], bytes[offset + 6]]),
+        third_os_pco: u16::from_be_bytes([bytes[offset + 7], bytes[offset + 8]]),
+    }
+}
+
+const fn empty_attach_ext_profile() -> AttachExtProfile<'static> {
+    AttachExtProfile {
+        ip_alloc: 0,
+        apn_class: 0,
+        apn: &[],
+        pdn_type: 0,
+        username: &[],
+        password: &[],
+        auth_flag: 0,
+        pco: PcoInfo {
+            first_pco: 0,
+            second_pco: 0,
+            n_pco: 0,
+            first_os_pco: 0,
+            second_os_pco: 0,
+            third_os_pco: 0,
+        },
+    }
+}
+
+/// Decode the exact 484-byte stock `_ATTACH_REQ_EXT_PARAM`.
+///
+/// Live P4 `LTED_AttachRequestEXT` copies the entire object into command 27.
+/// `req_apn_type@483` is SDK-local bookkeeping only and is intentionally not
+/// represented in the clean modem request. When `optional_info == 0`, the live
+/// encoder does not inspect either profile, so dead fixed-string storage is not
+/// validated here either.
+///
+/// # Errors
+/// Returns [`LegacyAttachExtDecodeError`] for a wrong object size or an
+/// unterminated fixed C string that would be serialized.
+pub fn decode_legacy_attach_ext(
+    params: &[u8],
+) -> Result<AttachExtRequest<'_>, LegacyAttachExtDecodeError> {
+    if params.len() != LEGACY_ATTACH_EXT_PARAMS_LEN {
+        return Err(LegacyAttachExtDecodeError::UnexpectedLength {
+            expected: LEGACY_ATTACH_EXT_PARAMS_LEN,
+            actual: params.len(),
+        });
+    }
+    let optional_info = params[0];
+    if optional_info == 0 {
+        let empty = empty_attach_ext_profile();
+        return Ok(AttachExtRequest {
+            optional_info,
+            primary: empty,
+            retry: empty,
+        });
+    }
+
+    let primary = AttachExtProfile {
+        ip_alloc: params[1],
+        apn_class: params[2],
+        apn: legacy_attach_ext_c_string(&params[3..103], LegacyAttachExtStringField::PrimaryApn)?,
+        pdn_type: params[103],
+        username: legacy_attach_ext_c_string(
+            &params[104..168],
+            LegacyAttachExtStringField::PrimaryUsername,
+        )?,
+        password: legacy_attach_ext_c_string(
+            &params[168..232],
+            LegacyAttachExtStringField::PrimaryPassword,
+        )?,
+        auth_flag: params[232],
+        pco: legacy_pco_info(params, 233),
+    };
+    let retry = AttachExtProfile {
+        ip_alloc: params[242],
+        apn_class: params[243],
+        apn: legacy_attach_ext_c_string(&params[244..344], LegacyAttachExtStringField::RetryApn)?,
+        pdn_type: params[344],
+        username: legacy_attach_ext_c_string(
+            &params[345..409],
+            LegacyAttachExtStringField::RetryUsername,
+        )?,
+        password: legacy_attach_ext_c_string(
+            &params[409..473],
+            LegacyAttachExtStringField::RetryPassword,
+        )?,
+        auth_flag: params[473],
+        pco: legacy_pco_info(params, 474),
+    };
+    Ok(AttachExtRequest {
+        optional_info,
+        primary,
+        retry,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -658,6 +796,95 @@ pub fn broadcast_attach_callback(
         HandleError::Ipc(io::Error::new(
             io::ErrorKind::InvalidData,
             "fixed-size Attach callback failed to encode",
+        ))
+    })?;
+
+    let mut report = BroadcastReport::default();
+    for client_id in server.client_ids() {
+        let registered = server
+            .client_context(client_id)?
+            .read_u32_be(callback_kind.registration_offset())?
+            != 0;
+        if !registered {
+            continue;
+        }
+        report.registered_clients += 1;
+        server.send_to_client(client_id, &frame[..frame_len])?;
+        report.sent_clients += 1;
+    }
+    Ok(report)
+}
+
+const STOCK_ATTACH_EXT_CALLBACK_DATA_LEN: usize = 700;
+const STOCK_ATTACH_EXT_CALLBACK_FRAME_LEN: usize = 12 + STOCK_ATTACH_EXT_CALLBACK_DATA_LEN;
+const ATTACH_EXT_PDN_OFFSET: usize = 0x08d;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachExtCallbackError {
+    PdnContainerTlv,
+    PdnInnerTlv,
+    PdnField(PdnInfoFieldLengthError),
+}
+
+fn materialize_attach_ext_callback(
+    response: AttachExtResponse<'_>,
+    data: &mut [u8; STOCK_ATTACH_EXT_CALLBACK_DATA_LEN],
+) -> Result<(), AttachExtCallbackError> {
+    data.fill(0);
+    data[0x000..0x002].copy_from_slice(&response.register_result1.to_be_bytes());
+    data[0x002..0x004].copy_from_slice(&response.register_result2.to_be_bytes());
+    data[0x004] = u8::try_from(response.requested_apn_ni.payload.len()).unwrap_or(0);
+    data[0x005..0x005 + response.requested_apn_ni.payload.len()]
+        .copy_from_slice(response.requested_apn_ni.payload);
+    data[0x045] = u8::try_from(response.received_apn_ni.payload.len()).unwrap_or(0);
+    data[0x046..0x046 + response.received_apn_ni.payload.len()]
+        .copy_from_slice(response.received_apn_ni.payload);
+    data[0x086..0x088].copy_from_slice(&response.default_eps_id.to_be_bytes());
+    data[0x088..0x08a].copy_from_slice(&response.eps_id.to_be_bytes());
+    data[0x08a] = response.data_path;
+    data[0x08b] = response.ip_alloc;
+    data[0x08c] = response.apn_class;
+    materialize_pdn_containers(response.pdn_info_containers(), data, ATTACH_EXT_PDN_OFFSET)
+        .map_err(|error| match error {
+            PdnInfoMaterializeError::ContainerTlv => AttachExtCallbackError::PdnContainerTlv,
+            PdnInfoMaterializeError::InnerTlv => AttachExtCallbackError::PdnInnerTlv,
+            PdnInfoMaterializeError::Field(error) => AttachExtCallbackError::PdnField(error),
+        })?;
+    data[0x2b7] = response.network_features.ims_voice_over_ps;
+    data[0x2b8] = response.network_features.emc_bc;
+    data[0x2b9] = response.network_features.epc_lcs;
+    data[0x2ba] = response.network_features.sc_lcs;
+    data[0x2bb] = response.network_features.ext_sr;
+    Ok(())
+}
+
+/// Materialize and broadcast live-P4 stock callback 28 (`Attach EXT`).
+///
+/// Live P4 sends the exact 700-byte `_ATTACH_RSP_EXT_INFO` image and resolves
+/// callback 28 through `cb_rsp[3]` (registration offset `0x1c`).
+///
+/// # Errors
+/// Returns [`HandleError::AttachExtCallback`] for malformed proven nested PDN
+/// fields or [`HandleError::Ipc`] for callback/shared-context/socket failures.
+pub fn broadcast_attach_ext_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: AttachExtResponse<'_>,
+) -> Result<BroadcastReport, HandleError> {
+    let mut data = [0_u8; STOCK_ATTACH_EXT_CALLBACK_DATA_LEN];
+    materialize_attach_ext_callback(response, &mut data).map_err(HandleError::AttachExtCallback)?;
+    let callback_kind = SdkCallbackKind::AttachExt;
+    let mut frame = [0_u8; STOCK_ATTACH_EXT_CALLBACK_FRAME_LEN];
+    let frame_len = SdkCallback {
+        callback_id: callback_kind.callback_id(),
+        device_id,
+        data: &data,
+    }
+    .encode(&mut frame)
+    .map_err(|_| {
+        HandleError::Ipc(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fixed-size extended-Attach callback failed to encode",
         ))
     })?;
 
@@ -1337,6 +1564,7 @@ impl DeviceBridge {
                     }
                 }
                 Ok(SdkCommand::Attach) => self.dispatch_attach(modem, request),
+                Ok(SdkCommand::AttachExt) => self.dispatch_attach_ext(modem, request),
                 Ok(SdkCommand::Detach) => self.dispatch_detach(modem, request),
                 Ok(SdkCommand::PdnConnect) => self.dispatch_pdn_connect(modem, request),
                 Ok(SdkCommand::PdnDisconnect) => self.dispatch_pdn_disconnect(modem, request),
@@ -1382,6 +1610,12 @@ impl DeviceBridge {
                     return Ok(None);
                 }
                 broadcast_attach_callback(server, self.device_id, *response).map(Some)
+            }
+            ModemEvent::AttachExt(response) => {
+                if !self.pending.remove(ResponseKey::AttachExt) {
+                    return Ok(None);
+                }
+                broadcast_attach_ext_callback(server, self.device_id, *response).map(Some)
             }
             ModemEvent::Detach(response) => {
                 if !self.pending.remove(ResponseKey::Detach) {
@@ -1586,6 +1820,22 @@ impl DeviceBridge {
         })
     }
 
+    fn dispatch_attach_ext<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let attach =
+            decode_legacy_attach_ext(request.params).map_err(HandleError::LegacyAttachExt)?;
+        let bytes_written =
+            modem.send_tracked_command(&mut self.pending, ModemCommand::AttachExt(attach))?;
+        Ok(HandledCall {
+            command: SdkCommand::AttachExt,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
     fn dispatch_attach<T: Write>(
         &mut self,
         modem: &mut Modem<T>,
@@ -1661,9 +1911,10 @@ mod tests {
 
     use super::{
         BroadcastReport, DeviceBridge, HandleError, LTE_API_RET_OFFSET, LegacyAttachDecodeError,
-        LegacyAttachStringField, LegacyPdnConnectDecodeError, LegacyPdnConnectStringField,
-        LegacyPdnDisconnectDecodeError, PS_INIT_COMPLETE_OFFSET, StartupPhase,
-        broadcast_result_callback, decode_legacy_attach, decode_legacy_pdn_disconnect,
+        LegacyAttachExtDecodeError, LegacyAttachExtStringField, LegacyAttachStringField,
+        LegacyPdnConnectDecodeError, LegacyPdnConnectStringField, LegacyPdnDisconnectDecodeError,
+        PS_INIT_COMPLETE_OFFSET, StartupPhase, broadcast_result_callback, decode_legacy_attach,
+        decode_legacy_attach_ext, decode_legacy_pdn_disconnect,
     };
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -2254,6 +2505,191 @@ mod tests {
             modem.into_transport().into_inner().into_inner(),
             [0x31, 0x01, 0x00, 0x01, 0x00]
         );
+    }
+
+    fn stock_attach_ext_params() -> [u8; 484] {
+        let mut params = [0_u8; 484];
+        params[0] = 1;
+        params[1] = 2;
+        params[2] = 3;
+        params[3..6].copy_from_slice(b"ims");
+        params[103] = 4;
+        params[104] = b'u';
+        params[168] = b'p';
+        params[232] = 5;
+        params[233..242].copy_from_slice(&[1, 2, 3, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        params[242] = 6;
+        params[243] = 7;
+        params[244..247].copy_from_slice(b"net");
+        params[344] = 8;
+        params[345] = b'r';
+        params[409] = b's';
+        params[473] = 9;
+        params[474..483].copy_from_slice(&[10, 11, 12, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc]);
+        params[483] = 0xee;
+        params
+    }
+
+    #[test]
+    fn stock_attach_ext_layout_translates_to_exact_live_p4_hci() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let params = stock_attach_ext_params();
+        let request = SdkApiRequest {
+            command: SdkCommand::AttachExt as u16,
+            device_id: 1,
+            params: &params,
+        };
+        let call = bridge
+            .handle_sdk_api(&mut server, &mut modem, id, request)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.command, SdkCommand::AttachExt);
+        assert_eq!(call.bytes_written, 73);
+        assert_eq!(read_api_ret(&mut server, id), 0);
+        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            [
+                0x31, 0x65, 0x00, 0x45, 0x01, 0x01, 0x01, 0x02, 0x20, 0x01, 0x03, 0x04, 0x03, b'i',
+                b'm', b's', 0x05, 0x01, 0x04, 0x02, 0x01, b'u', 0x03, 0x01, b'p', 0x1e, 0x01, 0x05,
+                0x21, 0x09, 1, 2, 3, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x01, 0x01, 0x06, 0x20,
+                0x01, 0x07, 0x04, 0x03, b'n', b'e', b't', 0x05, 0x01, 0x08, 0x02, 0x01, b'r', 0x03,
+                0x01, b's', 0x1e, 0x01, 0x09, 0x21, 0x09, 10, 11, 12, 0x77, 0x88, 0x99, 0xaa, 0xbb,
+                0xcc,
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_stock_attach_ext_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let mut params = stock_attach_ext_params();
+        params[3..103].fill(b'a');
+        let request = SdkApiRequest {
+            command: SdkCommand::AttachExt as u16,
+            device_id: 1,
+            params: &params,
+        };
+        assert!(matches!(
+            bridge.handle_sdk_api(&mut server, &mut modem, id, request),
+            Err(HandleError::LegacyAttachExt(
+                LegacyAttachExtDecodeError::MissingTerminator(
+                    LegacyAttachExtStringField::PrimaryApn
+                )
+            ))
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
+
+        assert_eq!(
+            decode_legacy_attach_ext(&[0_u8; 483]),
+            Err(LegacyAttachExtDecodeError::UnexpectedLength {
+                expected: 484,
+                actual: 483
+            })
+        );
+    }
+
+    #[test]
+    fn attach_ext_response_materializes_exact_stock_callback_and_subscription_gate() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, subscribed_id) = open_client(&mut server, &dir, 0);
+        let (unsubscribed, _unsubscribed_id) = open_client(&mut server, &dir, 1);
+        server
+            .client_context(subscribed_id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::AttachExt.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        let mut params = [0_u8; 484];
+        params[0] = 0;
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                subscribed_id,
+                SdkApiRequest {
+                    command: SdkCommand::AttachExt as u16,
+                    device_id: 0x1122_3344,
+                    params: &params,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.pending_count(), 1);
+
+        let payload = [
+            0x00, 0x01, 0x00, 0x02, 0x12, 0x34, 0x56, 0x78, 0x09, 0x0a, 1, 2, 3, 4, 5, 0x20, 0x01,
+            0x07, 0x57, 0x03, b'i', b'm', b's', 0x58, 0x03, b'n', b'e', b't', 0xf0, 0x14, 0x04,
+            0x03, b'p', b'd', b'n', 0x05, 0x01, 0x02, 0x07, 0x04, 192, 168, 1, 2, 0x40, 0x04, 0, 0,
+            0, 9, 0xaa, 0x00,
+        ];
+        let mut hci = Vec::with_capacity(payload.len() + 4);
+        hci.extend_from_slice(&[0xb1, 0x66]);
+        hci.extend_from_slice(
+            &u16::try_from(payload.len())
+                .unwrap_or_else(|_| std::process::abort())
+                .to_be_bytes(),
+        );
+        hci.extend_from_slice(&payload);
+        assert_eq!(
+            route_one_hci(&mut bridge, &mut server, hci),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 720];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(len, 12 + 700);
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 28);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(callback.data.len(), 700);
+        let data = callback.data;
+        assert_eq!(&data[0..4], &[0, 1, 0, 2]);
+        assert_eq!(data[4], 3);
+        assert_eq!(&data[5..8], b"ims");
+        assert_eq!(data[69], 3);
+        assert_eq!(&data[70..73], b"net");
+        assert_eq!(&data[134..136], &0x1234_u16.to_be_bytes());
+        assert_eq!(&data[136..138], &0x5678_u16.to_be_bytes());
+        assert_eq!(&data[138..141], &[9, 10, 7]);
+        assert_eq!(&data[141..144], b"pdn");
+        assert_eq!(data[141 + 0x80], 2);
+        assert_eq!(&data[141 + 0x85..141 + 0x89], &[192, 168, 1, 2]);
+        assert_eq!(&data[141 + 0x216..141 + 0x21a], &9_u32.to_be_bytes());
+        assert_eq!(&data[695..700], &[1, 2, 3, 4, 5]);
+
+        unsubscribed
+            .set_nonblocking(true)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut no_frame = [0_u8; 1];
+        let Err(error) = unsubscribed.recv(&mut no_frame) else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     }
 
     #[test]

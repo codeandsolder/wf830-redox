@@ -798,6 +798,87 @@ impl<'a> AttachResponsePrefix<'a> {
     }
 }
 
+/// Fully split extended-attach response `0xb166`.
+///
+/// Live P4 consumes three fixed-order TLVs after the common 15-byte attach
+/// prefix: APN class, requested APN-NI and received APN-NI. It then runs the
+/// shared at-most-two `0xf0`/`0xf2` nested PDN/QoS parser and ignores any
+/// suffix after those initial containers. The clean representation preserves
+/// that ignored suffix for diagnostics rather than silently discarding it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttachExtResponse<'a> {
+    pub register_result1: u16,
+    pub register_result2: u16,
+    pub default_eps_id: u16,
+    pub eps_id: u16,
+    pub data_path: u8,
+    pub ip_alloc: u8,
+    pub network_features: NetworkFeatureInfo,
+    pub apn_class_kind: u8,
+    pub apn_class: u8,
+    pub requested_apn_ni: OrderedPdnTlv<'a>,
+    pub received_apn_ni: OrderedPdnTlv<'a>,
+    initial_pdn_info: &'a [u8],
+    pub unparsed_suffix: &'a [u8],
+}
+
+impl<'a> AttachExtResponse<'a> {
+    /// Decode the complete recovered live-P4 extended-attach response layout.
+    ///
+    /// # Errors
+    /// Returns [`PdnResponseDecodeError`] for malformed ordered TLVs or nested
+    /// container framing.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, PdnResponseDecodeError> {
+        let prefix = AttachResponsePrefix::parse(AttachResponseKind::Extended, packet)?;
+        let mut cursor = TlvCursor::new(prefix.optional_fields);
+
+        let apn_class = required_pdn_tlv(&mut cursor, PdnResponseField::ApnClass)?;
+        exact_pdn_field(PdnResponseField::ApnClass, apn_class.payload, 1)?;
+        let requested =
+            required_pdn_tlv(&mut cursor, PdnResponseField::RequestedApnNetworkIdentifier)?;
+        bounded_pdn_field(
+            PdnResponseField::RequestedApnNetworkIdentifier,
+            requested.payload,
+            64,
+        )?;
+        let received =
+            required_pdn_tlv(&mut cursor, PdnResponseField::ReceivedApnNetworkIdentifier)?;
+        bounded_pdn_field(
+            PdnResponseField::ReceivedApnNetworkIdentifier,
+            received.payload,
+            64,
+        )?;
+        let (initial_pdn_info, unparsed_suffix) = split_initial_pdn_info(cursor.remaining())?;
+
+        Ok(Self {
+            register_result1: prefix.register_result1,
+            register_result2: prefix.register_result2,
+            default_eps_id: prefix.default_eps_id,
+            eps_id: prefix.eps_id,
+            data_path: prefix.data_path,
+            ip_alloc: prefix.ip_alloc,
+            network_features: prefix.network_features,
+            apn_class_kind: apn_class.kind,
+            apn_class: apn_class.payload[0],
+            requested_apn_ni: OrderedPdnTlv {
+                kind: requested.kind,
+                payload: requested.payload,
+            },
+            received_apn_ni: OrderedPdnTlv {
+                kind: received.kind,
+                payload: received.payload,
+            },
+            initial_pdn_info,
+            unparsed_suffix,
+        })
+    }
+
+    #[must_use]
+    pub const fn pdn_info_containers(&self) -> PdnInfoContainers<'a> {
+        PdnInfoContainers::new(self.initial_pdn_info)
+    }
+}
+
 /// Proven ten-byte fixed prefix of normal PDN-connect response `0xb106`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PdnConnectResponsePrefix<'a> {
@@ -3339,9 +3420,9 @@ impl<'a> AtCommandFromDeviceExt<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApnType, AtCommand, AttachEncodeError, AttachField, AttachRequest, AttachResponse,
-        AttachResponseDecodeError, AttachResponseKind, AttachResponsePrefix, AttachTailField,
-        DetachRequest, DetachResponse, EmptyRequest, NetworkFeatureInfo, PcoInfo,
+        ApnType, AtCommand, AttachEncodeError, AttachExtResponse, AttachField, AttachRequest,
+        AttachResponse, AttachResponseDecodeError, AttachResponseKind, AttachResponsePrefix,
+        AttachTailField, DetachRequest, DetachResponse, EmptyRequest, NetworkFeatureInfo, PcoInfo,
         PdnConnectExtRequest, PdnConnectExtResponsePrefix, PdnConnectRequest,
         PdnConnectResponsePrefix, PdnConnectionControl, PdnDisconnectRequest,
         PdnDisconnectResponsePrefix, PdnEncodeError, PdnField, PdnInfoContainerKind,
@@ -3805,6 +3886,69 @@ mod tests {
                 payload: &[0x7f],
             }))
         );
+    }
+
+    #[test]
+    fn extended_attach_response_splits_ordered_apns_nested_pdn_and_ignored_suffix() {
+        let payload = [
+            0x00, 0x01, 0x00, 0x02, 0x12, 0x34, 0x56, 0x78, 0x09, 0x0a, 1, 2, 3, 4, 5, 0x20, 0x01,
+            0x07, 0x57, 0x03, b'i', b'm', b's', 0x58, 0x03, b'n', b'e', b't', 0xf0, 0x14, 0x04,
+            0x03, b'p', b'd', b'n', 0x05, 0x01, 0x02, 0x07, 0x04, 192, 168, 1, 2, 0x40, 0x04, 0, 0,
+            0, 9, 0xaa, 0x00,
+        ];
+        let Ok(response) = AttachExtResponse::parse(packet(0xb166, &payload)) else {
+            return;
+        };
+        assert_eq!(response.register_result1, 1);
+        assert_eq!(response.register_result2, 2);
+        assert_eq!(response.default_eps_id, 0x1234);
+        assert_eq!(response.eps_id, 0x5678);
+        assert_eq!(response.data_path, 9);
+        assert_eq!(response.ip_alloc, 10);
+        assert_eq!(response.apn_class_kind, 0x20);
+        assert_eq!(response.apn_class, 7);
+        assert_eq!(response.requested_apn_ni.kind, 0x57);
+        assert_eq!(response.requested_apn_ni.payload, b"ims");
+        assert_eq!(response.received_apn_ni.kind, 0x58);
+        assert_eq!(response.received_apn_ni.payload, b"net");
+        assert_eq!(response.unparsed_suffix, &[0xaa, 0x00]);
+
+        let mut containers = response.pdn_info_containers();
+        let Ok(Some(container)) = containers.next_container() else {
+            return;
+        };
+        assert_eq!(container.kind, PdnInfoContainerKind::F0);
+        let mut fields = container.fields();
+        let Ok(Some(apn)) = fields.next_tlv() else {
+            return;
+        };
+        let Ok(Some(pdn_type)) = fields.next_tlv() else {
+            return;
+        };
+        let Ok(Some(ipv4)) = fields.next_tlv() else {
+            return;
+        };
+        let Ok(Some(qos)) = fields.next_tlv() else {
+            return;
+        };
+        assert_eq!(
+            PdnInfoField::parse(apn),
+            Ok(PdnInfoField::AccessPointName(b"pdn"))
+        );
+        assert_eq!(PdnInfoField::parse(pdn_type), Ok(PdnInfoField::PdnType(2)));
+        assert_eq!(
+            PdnInfoField::parse(ipv4),
+            Ok(PdnInfoField::Ipv4Address([192, 168, 1, 2]))
+        );
+        assert_eq!(
+            PdnInfoField::parse(qos),
+            Ok(PdnInfoField::Qos {
+                field: QosField::Qci,
+                value: 9
+            })
+        );
+        assert_eq!(fields.next_tlv(), Ok(None));
+        assert!(matches!(containers.next_container(), Ok(None)));
     }
 
     #[test]

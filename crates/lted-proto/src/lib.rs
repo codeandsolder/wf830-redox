@@ -22,6 +22,7 @@ pub const CALLBACK_REGISTRATION_COUNT: usize = 164;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SdkCallbackKind {
     Attach,
+    AttachExt,
     Detach,
     PdnConnect,
     PdnDisconnect,
@@ -38,6 +39,7 @@ impl SdkCallbackKind {
     pub const fn callback_id(self) -> u16 {
         match self {
             Self::Attach => 26,
+            Self::AttachExt => 28,
             Self::Detach => 30,
             Self::PdnConnect => 33,
             Self::PdnDisconnect => 37,
@@ -54,6 +56,7 @@ impl SdkCallbackKind {
     pub const fn registration_index(self) -> usize {
         match self {
             Self::Attach => 2,
+            Self::AttachExt => 3,
             Self::Detach => 4,
             Self::PdnConnect => 6,
             Self::PdnDisconnect => 8,
@@ -697,6 +700,8 @@ mod tests {
     fn recovered_callback_registration_slots_match_oem_jump_table() {
         assert_eq!(SdkCallbackKind::Attach.callback_id(), 26);
         assert_eq!(SdkCallbackKind::Attach.registration_offset(), 0x14);
+        assert_eq!(SdkCallbackKind::AttachExt.callback_id(), 28);
+        assert_eq!(SdkCallbackKind::AttachExt.registration_offset(), 0x1c);
         assert_eq!(SdkCallbackKind::Detach.callback_id(), 30);
         assert_eq!(SdkCallbackKind::Detach.registration_offset(), 0x24);
         assert_eq!(SdkCallbackKind::PdnConnect.callback_id(), 33);

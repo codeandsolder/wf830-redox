@@ -14,16 +14,15 @@ use std::{
 use gct_hci::{EncodeError, Header, Packet, public_opcode, recovered_opcode};
 use gct_lapi::{
     AtCommand, AtCommandExt, AtCommandFromDevice, AtCommandFromDeviceExt, AttachEncodeError,
-    AttachExtEncodeError, AttachExtRequest, AttachRequest, AttachResponse,
-    AttachResponseDecodeError, AttachResponseKind, AttachResponsePrefix, DetachRequest,
-    DetachRequiredIndication, DetachResponse, EmptyRequest, PdnConnectExtRequest,
-    PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse, PdnDisconnectRequest,
-    PdnDisconnectResponse, PdnEncodeError, PdnResponseDecodeError, PlmnListResponse,
-    PlmnSearchDecodeError, PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest,
-    PlmnSearchStopResponse, ResponseDecodeError, ResultResponse, ResultResponseKind,
-    UiccAuthenticateEncodeError, UiccAuthenticateRequest, UiccPinCommandRequest,
-    UiccPinEncodeError, UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest,
-    UiccResponse, UiccResponseDecodeError, UiccStatusRequest, uicc_control,
+    AttachExtEncodeError, AttachExtRequest, AttachExtResponse, AttachRequest, AttachResponse,
+    AttachResponseDecodeError, DetachRequest, DetachRequiredIndication, DetachResponse,
+    EmptyRequest, PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest,
+    PdnConnectResponse, PdnDisconnectRequest, PdnDisconnectResponse, PdnEncodeError,
+    PdnResponseDecodeError, PlmnListResponse, PlmnSearchDecodeError, PlmnSearchRequest,
+    PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse, ResponseDecodeError,
+    ResultResponse, ResultResponseKind, UiccAuthenticateEncodeError, UiccAuthenticateRequest,
+    UiccPinCommandRequest, UiccPinEncodeError, UiccPinStatusRequest, UiccReadBinaryRequest,
+    UiccReadRecordRequest, UiccResponse, UiccResponseDecodeError, UiccStatusRequest, uicc_control,
 };
 use gct_transport::{
     GlifTransport, HciIo, HciStreamDecoder, MAX_HCI_FRAME_LEN, OEM_READ_BUFFER_LEN,
@@ -141,7 +140,7 @@ pub struct PollOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModemEvent<'a> {
     Attach(AttachResponse<'a>),
-    AttachExt(AttachResponsePrefix<'a>),
+    AttachExt(AttachExtResponse<'a>),
     Detach(DetachResponse),
     DetachRequired(DetachRequiredIndication),
     PdnConnect(PdnConnectResponse<'a>),
@@ -507,9 +506,9 @@ impl From<UiccResponseDecodeError> for EventDecodeError {
 pub fn decode_event(packet: Packet<'_>) -> Result<ModemEvent<'_>, EventDecodeError> {
     match packet.header.command {
         recovered_opcode::ATTACH_RESPONSE => Ok(ModemEvent::Attach(AttachResponse::parse(packet)?)),
-        recovered_opcode::ATTACH_RESPONSE_EXT => Ok(ModemEvent::AttachExt(
-            AttachResponsePrefix::parse(AttachResponseKind::Extended, packet)?,
-        )),
+        recovered_opcode::ATTACH_RESPONSE_EXT => {
+            Ok(ModemEvent::AttachExt(AttachExtResponse::parse(packet)?))
+        }
         recovered_opcode::DETACH_RESPONSE => Ok(ModemEvent::Detach(DetachResponse::parse(packet)?)),
         recovered_opcode::DETACH_REQUIRED_INDICATION => Ok(ModemEvent::DetachRequired(
             DetachRequiredIndication::parse(packet)?,
@@ -875,11 +874,13 @@ mod tests {
 
     #[test]
     fn extended_attach_response_matches_family_key() {
-        let payload = [0, 1, 0, 2, 0x12, 0x34, 0x56, 0x78, 9, 10, 1, 2, 3, 4, 5];
+        let payload = [
+            0, 1, 0, 2, 0x12, 0x34, 0x56, 0x78, 9, 10, 1, 2, 3, 4, 5, 0x20, 1, 7, 0x57, 0, 0x58, 0,
+        ];
         let packet = Packet {
             header: Header {
                 command: recovered_opcode::ATTACH_RESPONSE_EXT,
-                payload_len: 15,
+                payload_len: 22,
             },
             payload: &payload,
         };
