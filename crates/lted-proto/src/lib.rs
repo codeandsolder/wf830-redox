@@ -35,6 +35,7 @@ pub enum SdkCallbackKind {
     Offline,
     PsInit,
     MobileIdRead,
+    IccidRead,
     MsisdnRead,
     AtCommandFromDevice,
     AtCommandFromDeviceExt,
@@ -62,6 +63,7 @@ impl SdkCallbackKind {
             Self::Offline => 62,
             Self::PsInit => 68,
             Self::MobileIdRead => 77,
+            Self::IccidRead => 79,
             Self::MsisdnRead => 81,
             Self::AtCommandFromDevice => 126,
             Self::AtCommandFromDeviceExt => 128,
@@ -89,6 +91,7 @@ impl SdkCallbackKind {
             Self::Offline => 19,
             Self::PsInit => 22,
             Self::MobileIdRead => 26,
+            Self::IccidRead => 27,
             Self::MsisdnRead => 28,
             Self::AtCommandFromDevice => 60,
             Self::AtCommandFromDeviceExt => 61,
@@ -160,6 +163,7 @@ pub enum SdkCommand {
     PlmnSearchStop = 63,
     PsInit = 67,
     MobileIdRead = 76,
+    IccidRead = 78,
     MsisdnRead = 80,
     AtCommand = 125,
     AtCommandExt = 127,
@@ -193,6 +197,7 @@ impl TryFrom<u16> for SdkCommand {
             63 => Ok(Self::PlmnSearchStop),
             67 => Ok(Self::PsInit),
             76 => Ok(Self::MobileIdRead),
+            78 => Ok(Self::IccidRead),
             80 => Ok(Self::MsisdnRead),
             125 => Ok(Self::AtCommand),
             127 => Ok(Self::AtCommandExt),
@@ -608,6 +613,7 @@ mod tests {
         assert_eq!(SdkCommand::try_from(42), Ok(SdkCommand::PlmnSearchExt));
         assert_eq!(SdkCommand::try_from(67), Ok(SdkCommand::PsInit));
         assert_eq!(SdkCommand::try_from(76), Ok(SdkCommand::MobileIdRead));
+        assert_eq!(SdkCommand::try_from(78), Ok(SdkCommand::IccidRead));
         assert_eq!(SdkCommand::try_from(80), Ok(SdkCommand::MsisdnRead));
         assert_eq!(SdkCommand::try_from(125), Ok(SdkCommand::AtCommand));
         assert_eq!(SdkCommand::try_from(147), Ok(SdkCommand::UiccRequest));
@@ -789,6 +795,8 @@ mod tests {
         assert_eq!(SdkCallbackKind::PsInit.registration_offset(), 0xb4);
         assert_eq!(SdkCallbackKind::MobileIdRead.callback_id(), 77);
         assert_eq!(SdkCallbackKind::MobileIdRead.registration_offset(), 0xd4);
+        assert_eq!(SdkCallbackKind::IccidRead.callback_id(), 79);
+        assert_eq!(SdkCallbackKind::IccidRead.registration_offset(), 0xdc);
         assert_eq!(SdkCallbackKind::MsisdnRead.callback_id(), 81);
         assert_eq!(SdkCallbackKind::MsisdnRead.registration_offset(), 0xe4);
         assert_eq!(SdkCallbackKind::AtCommandFromDevice.callback_id(), 126);

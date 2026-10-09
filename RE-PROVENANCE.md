@@ -1386,3 +1386,35 @@ four-byte callback prefix, subscription gating, local input rejection before
 GLIF, count > 3 rejection, and truncated-record rejection. The callback
 builder also independently rejects raw record blocks that are not an exact
 multiple of 256 bytes or exceed the three proven slots.
+
+## Live P4 ICCID Read
+
+The live import audit found two shipped users of `LTED_ICCIDReadRequest`.
+Live `liblted.so::LTED_ICCIDReadRequest@0xd0b8` emits SDK command **78** with
+**zero local parameter bytes**. Live `libltesdk.so::LAPI_ICCIDReadRequest`
+at `0x4adb8` serializes the exact shared-read request
+`0x3145 | len 4 | 00 02 00 00`, i.e. subtype **2** with an empty subtype body.
+
+The live shared `0xb146` response dispatcher routes subtype 2 to handler
+`0x16384`. That handler obtains SDK response slot **27**, zeroes an exact
+13-byte object, converts/stores `read_result:u16@0`, stores subtype-local
+`result:u8@2`, and copies exactly ten bytes from the subtype body into offset 3.
+B014 DWARF independently proves `_ICCID_READ_RSP_INFO` is **0x0d / 13 bytes**
+with exactly `read_result:u16@0 | result:u8@2 | iccid:u8[10]@3`.
+
+Live daemon `ind_iccid_read_response@0x286d8` emits stock callback **79** and
+always assembles exactly 13 response bytes after the generic callback envelope.
+The live registration is exact rather than inferred by adjacency: SDK slot 27
+loads literal `0xfffef124` from `0x39b3c`; resolving that PC-relative value at
+the registration site yields `0x286d8`. Live stock `liblted.so` callback
+routing for the same slot reads the callback pointer from **offset `0xdc`**,
+i.e. `cb_rsp[27]`.
+
+Rust models ICCID as another member of family-level `ResponseKey::MiscRead`, so
+ICCID, Mobile ID, and MSISDN cannot overlap when the shared top-level failure
+path carries no subtype identity. The shared-read parser was refactored into
+subtype-specific helpers while adding ICCID rather than weakening the strict
+100-line Clippy limit. Tests cover exact command-78/HCI request bytes, exact
+13-byte subtype-2 parsing, truncated ICCID rejection, shared-family collision,
+callback 79 / slot `0xdc`, subscription gating, and local nonzero-parameter
+rejection before GLIF I/O.

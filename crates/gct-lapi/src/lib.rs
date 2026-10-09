@@ -2027,6 +2027,34 @@ impl MobileIdReadRequest {
     }
 }
 
+/// ICCID read request carried by the shared `0x3145` read-info command.
+///
+/// Live P4 `LAPI_ICCIDReadRequest` emits subtype 2 with an empty subtype body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IccidReadRequest;
+
+impl IccidReadRequest {
+    /// Encode exact live-P4 bytes `31 45 00 04 00 02 00 00`.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than eight bytes.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        encode_packet(
+            recovered_opcode::MISC_READ_REQUEST,
+            &[0x00, 0x02, 0x00, 0x00],
+            output,
+        )
+    }
+}
+
+/// ICCID response recovered from shared response `0xb146` subtype 2.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IccidReadResponse<'a> {
+    pub read_result: u16,
+    pub result: u8,
+    pub iccid: &'a [u8],
+}
+
 /// MSISDN read request carried by the shared `0x3145` read-info command.
 ///
 /// Live P4 `LAPI_MSISDNReadRequest` emits subtype 3 with an empty subtype body.
@@ -2091,6 +2119,7 @@ pub enum MiscReadResponse<'a> {
         read_result: u16,
     },
     MobileId(MobileIdReadResponse<'a>),
+    Iccid(IccidReadResponse<'a>),
     Msisdn(MsisdnReadResponse<'a>),
     /// Successful response containing only not-yet-modeled read subtypes.
     UnsupportedSuccess,
@@ -2118,6 +2147,10 @@ pub enum MiscReadDecodeError {
         declared: usize,
         available: usize,
     },
+    IccidBodyTooShort {
+        minimum: usize,
+        actual: usize,
+    },
     MsisdnBodyTooShort {
         minimum: usize,
         actual: usize,
@@ -2138,19 +2171,108 @@ impl From<ResponseDecodeError> for MiscReadDecodeError {
     }
 }
 
+fn parse_mobile_id_chunk(
+    read_result: u16,
+    body: &[u8],
+) -> Result<MiscReadResponse<'_>, MiscReadDecodeError> {
+    if body.len() < 3 {
+        return Err(MiscReadDecodeError::MobileIdBodyTooShort { actual: body.len() });
+    }
+    let slot_payload = body.len() - 3;
+    if slot_payload > 16 {
+        return Err(MiscReadDecodeError::MobileIdChunkTooLong {
+            actual: slot_payload,
+        });
+    }
+    let id_len = usize::from(body[2]);
+    if id_len > slot_payload || id_len > 16 {
+        return Err(MiscReadDecodeError::MobileIdEmbeddedLength {
+            declared: id_len,
+            available: slot_payload.min(16),
+        });
+    }
+    Ok(MiscReadResponse::MobileId(MobileIdReadResponse {
+        read_result,
+        id_type: body[0],
+        result: body[1],
+        id: &body[3..3 + id_len],
+    }))
+}
+
+fn parse_iccid_chunk(
+    read_result: u16,
+    body: &[u8],
+) -> Result<MiscReadResponse<'_>, MiscReadDecodeError> {
+    const ICCID_BODY_LEN: usize = 11;
+    if body.len() < ICCID_BODY_LEN {
+        return Err(MiscReadDecodeError::IccidBodyTooShort {
+            minimum: ICCID_BODY_LEN,
+            actual: body.len(),
+        });
+    }
+    Ok(MiscReadResponse::Iccid(IccidReadResponse {
+        read_result,
+        result: body[0],
+        iccid: &body[1..ICCID_BODY_LEN],
+    }))
+}
+
+fn parse_msisdn_chunk(
+    read_result: u16,
+    body: &[u8],
+) -> Result<MiscReadResponse<'_>, MiscReadDecodeError> {
+    if body.is_empty() {
+        return Err(MiscReadDecodeError::MsisdnBodyTooShort {
+            minimum: 1,
+            actual: 0,
+        });
+    }
+    let result = body[0];
+    if result != 0 {
+        return Ok(MiscReadResponse::Msisdn(MsisdnReadResponse {
+            read_result,
+            result,
+            records: &[],
+        }));
+    }
+    if body.len() < 2 {
+        return Err(MiscReadDecodeError::MsisdnBodyTooShort {
+            minimum: 2,
+            actual: body.len(),
+        });
+    }
+    let num_msisdn = usize::from(body[1]);
+    if num_msisdn > MAX_MSISDN_RECORDS {
+        return Err(MiscReadDecodeError::TooManyMsisdnRecords {
+            maximum: MAX_MSISDN_RECORDS,
+            actual: num_msisdn,
+        });
+    }
+    let records_len = num_msisdn * MSISDN_RECORD_LEN;
+    let expected = 2 + records_len;
+    if body.len() < expected {
+        return Err(MiscReadDecodeError::TruncatedMsisdnRecords {
+            expected: records_len,
+            actual: body.len().saturating_sub(2),
+        });
+    }
+    Ok(MiscReadResponse::Msisdn(MsisdnReadResponse {
+        read_result,
+        result,
+        records: &body[2..expected],
+    }))
+}
+
 impl<'a> MiscReadResponse<'a> {
     /// Decode the live-P4 shared read response and extract proven subtypes.
     ///
     /// Wire grammar on success is `read_result:u16 == 0`, followed by zero or
-    /// more chunks `subtype:u16 | len:u16 | body[len]`. Mobile ID is subtype 1
-    /// and MSISDN is subtype 3. Mobile ID body is
-    /// `id_type:u8 | result:u8 | len:u8 | id...`. The SDK's
-    /// historical object has a 16-byte ID array; overlong or truncated bodies
-    /// are rejected before they can become stock callbacks.
+    /// more chunks `subtype:u16 | len:u16 | body[len]`. Mobile ID is subtype 1,
+    /// ICCID is subtype 2, and MSISDN is subtype 3.
     ///
     /// # Errors
     /// Returns [`MiscReadDecodeError`] for the wrong opcode, a truncated chunk
-    /// envelope/body, or an unsafe Mobile-ID length.
+    /// envelope/body, or an unsafe proven subtype payload.
     pub fn parse(packet: Packet<'a>) -> Result<Self, MiscReadDecodeError> {
         let payload = prefix_payload(packet, recovered_opcode::MISC_READ_RESPONSE, 2)?;
         let read_result = be_u16(payload, 0);
@@ -2179,73 +2301,12 @@ impl<'a> MiscReadResponse<'a> {
                 });
             }
             let body = &payload[body_start..body_start + declared];
-            if subtype == 1 {
-                if body.len() < 3 {
-                    return Err(MiscReadDecodeError::MobileIdBodyTooShort { actual: body.len() });
-                }
-                let slot_payload = body.len() - 3;
-                if slot_payload > 16 {
-                    return Err(MiscReadDecodeError::MobileIdChunkTooLong {
-                        actual: slot_payload,
-                    });
-                }
-                let id_len = usize::from(body[2]);
-                if id_len > slot_payload || id_len > 16 {
-                    return Err(MiscReadDecodeError::MobileIdEmbeddedLength {
-                        declared: id_len,
-                        available: slot_payload.min(16),
-                    });
-                }
-                return Ok(Self::MobileId(MobileIdReadResponse {
-                    read_result,
-                    id_type: body[0],
-                    result: body[1],
-                    id: &body[3..3 + id_len],
-                }));
+            match subtype {
+                1 => return parse_mobile_id_chunk(read_result, body),
+                2 => return parse_iccid_chunk(read_result, body),
+                3 => return parse_msisdn_chunk(read_result, body),
+                _ => offset = body_start + declared,
             }
-            if subtype == 3 {
-                if body.is_empty() {
-                    return Err(MiscReadDecodeError::MsisdnBodyTooShort {
-                        minimum: 1,
-                        actual: 0,
-                    });
-                }
-                let result = body[0];
-                if result != 0 {
-                    return Ok(Self::Msisdn(MsisdnReadResponse {
-                        read_result,
-                        result,
-                        records: &[],
-                    }));
-                }
-                if body.len() < 2 {
-                    return Err(MiscReadDecodeError::MsisdnBodyTooShort {
-                        minimum: 2,
-                        actual: body.len(),
-                    });
-                }
-                let num_msisdn = usize::from(body[1]);
-                if num_msisdn > MAX_MSISDN_RECORDS {
-                    return Err(MiscReadDecodeError::TooManyMsisdnRecords {
-                        maximum: MAX_MSISDN_RECORDS,
-                        actual: num_msisdn,
-                    });
-                }
-                let records_len = num_msisdn * MSISDN_RECORD_LEN;
-                let expected = 2 + records_len;
-                if body.len() < expected {
-                    return Err(MiscReadDecodeError::TruncatedMsisdnRecords {
-                        expected: records_len,
-                        actual: body.len().saturating_sub(2),
-                    });
-                }
-                return Ok(Self::Msisdn(MsisdnReadResponse {
-                    read_result,
-                    result,
-                    records: &body[2..expected],
-                }));
-            }
-            offset = body_start + declared;
         }
         Ok(Self::UnsupportedSuccess)
     }
@@ -5527,7 +5588,7 @@ mod tests {
             Ok(super::MiscReadResponse::Failure { read_result: 7 })
         );
 
-        let unsupported = [0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xaa];
+        let unsupported = [0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0xaa];
         assert_eq!(
             super::MiscReadResponse::parse(packet(
                 super::recovered_opcode::MISC_READ_RESPONSE,
@@ -5561,6 +5622,40 @@ mod tests {
                 subtype: 1,
                 declared: 5,
                 actual: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn iccid_read_matches_shared_live_p4_request_and_exact_response() {
+        let mut request = [0_u8; 8];
+        assert_eq!(super::IccidReadRequest.encode(&mut request), Ok(8));
+        assert_eq!(request, [0x31, 0x45, 0, 4, 0, 2, 0, 0]);
+
+        let payload = [
+            0, 0, 0, 2, 0, 11, 0, 0x89, 0x10, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x54, 0xf6,
+        ];
+        assert_eq!(
+            super::MiscReadResponse::parse(packet(
+                super::recovered_opcode::MISC_READ_RESPONSE,
+                &payload,
+            )),
+            Ok(super::MiscReadResponse::Iccid(super::IccidReadResponse {
+                read_result: 0,
+                result: 0,
+                iccid: &[0x89, 0x10, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x54, 0xf6],
+            }))
+        );
+
+        let truncated = [0, 0, 0, 2, 0, 10, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        assert_eq!(
+            super::MiscReadResponse::parse(packet(
+                super::recovered_opcode::MISC_READ_RESPONSE,
+                &truncated,
+            )),
+            Err(super::MiscReadDecodeError::IccidBodyTooShort {
+                minimum: 11,
+                actual: 10,
             })
         );
     }

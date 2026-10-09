@@ -13,16 +13,17 @@ use gct_lapi::{
     AttachRequest, AttachResponse, AttachTailDecodeError, AttachTailField, DetachRequest,
     DetachRequiredIndication, DetachResponse, EmergencyNumberDecodeError,
     EmmNiReattachControlRequest, EmmReattachControlReport, EmmTimerControlRequest,
-    EmmTimerStartRequest, EmptyRequest, LcsControlRequest, LppControlRequest, MobileIdReadRequest,
-    MobileIdReadResponse, MsisdnReadRequest, MsisdnReadResponse, PcoInfo, PdnConnectExtRequest,
-    PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse, PdnConnectTailDecodeError,
-    PdnConnectTailField, PdnConnectionControl, PdnDisconnectField, PdnDisconnectFieldDecodeError,
-    PdnDisconnectRequest, PdnDisconnectResponse, PdnInfoContainers, PdnInfoField,
-    PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse, PlmnSearchExtRequest,
-    PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
-    Positioning, PsmControlRequest, QosField, ResultResponse, ResultResponseKind,
-    UeModeChangeRequest, UeModeChangeResponse, UiccFixedRequest, UiccPinStatusRequest,
-    UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse, UiccStatusRequest, uicc_control,
+    EmmTimerStartRequest, EmptyRequest, IccidReadRequest, IccidReadResponse, LcsControlRequest,
+    LppControlRequest, MobileIdReadRequest, MobileIdReadResponse, MsisdnReadRequest,
+    MsisdnReadResponse, PcoInfo, PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest,
+    PdnConnectResponse, PdnConnectTailDecodeError, PdnConnectTailField, PdnConnectionControl,
+    PdnDisconnectField, PdnDisconnectFieldDecodeError, PdnDisconnectRequest, PdnDisconnectResponse,
+    PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError,
+    PlmnListResponse, PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchResponse,
+    PlmnSearchStopRequest, PlmnSearchStopResponse, Positioning, PsmControlRequest, QosField,
+    ResultResponse, ResultResponseKind, UeModeChangeRequest, UeModeChangeResponse,
+    UiccFixedRequest, UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest,
+    UiccResponse, UiccStatusRequest, uicc_control,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -1682,6 +1683,31 @@ pub fn broadcast_mobile_id_callback(
     broadcast_variable_callback(server, device_id, SdkCallbackKind::MobileIdRead, &data)
 }
 
+/// Broadcast stock callback 79 (`ICCID_READ_RSP`) through `cb_rsp[27]`.
+///
+/// Live P4 forwards the exact 13-byte historical object
+/// `read_result:u16 | result:u8 | iccid[10]`.
+///
+/// # Errors
+/// Returns [`HandleError::Ipc`] for a malformed typed response or IPC failure.
+pub fn broadcast_iccid_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: IccidReadResponse<'_>,
+) -> Result<BroadcastReport, HandleError> {
+    if response.iccid.len() != 10 {
+        return Err(HandleError::Ipc(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ICCID callback requires the recovered fixed 10-byte ICCID",
+        )));
+    }
+    let mut data = [0_u8; 13];
+    data[..2].copy_from_slice(&response.read_result.to_be_bytes());
+    data[2] = response.result;
+    data[3..].copy_from_slice(response.iccid);
+    broadcast_variable_callback(server, device_id, SdkCallbackKind::IccidRead, &data)
+}
+
 /// Broadcast stock callback 81 (`MSISDN_READ_RSP`) through `cb_rsp[28]`.
 ///
 /// Live P4 `lted` sends `read_result:u16 | result:u8 | num_msisdn:u8`
@@ -2325,6 +2351,7 @@ impl DeviceBridge {
                 Ok(SdkCommand::PlmnSearchExt) => self.dispatch_plmn_search_ext(modem, request),
                 Ok(SdkCommand::PlmnSearchStop) => self.dispatch_plmn_search_stop(modem, request),
                 Ok(SdkCommand::MobileIdRead) => self.dispatch_mobile_id_read(modem, request),
+                Ok(SdkCommand::IccidRead) => self.dispatch_iccid_read(modem, request),
                 Ok(SdkCommand::MsisdnRead) => self.dispatch_msisdn_read(modem, request),
                 Ok(SdkCommand::AtCommand) => Self::dispatch_at(modem, request),
                 Ok(SdkCommand::AtCommandExt) => Self::dispatch_at_ext(modem, request),
@@ -2376,6 +2403,14 @@ impl DeviceBridge {
         event: &ModemEvent<'_>,
     ) -> Result<Option<BroadcastReport>, HandleError> {
         match event {
+            ModemEvent::IccidRead(response) => {
+                if !self.pending.contains(ResponseKey::MiscRead) {
+                    return Ok(None);
+                }
+                let report = broadcast_iccid_callback(server, self.device_id, *response)?;
+                self.pending.remove(ResponseKey::MiscRead);
+                Ok(Some(report))
+            }
             ModemEvent::MobileIdRead(response) => {
                 if !self.pending.remove(ResponseKey::MiscRead) {
                     return Ok(None);
@@ -2529,6 +2564,7 @@ impl DeviceBridge {
                 broadcast_plmn_search_callback(server, self.device_id, *response).map(Some)
             }
             ModemEvent::MobileIdRead(_)
+            | ModemEvent::IccidRead(_)
             | ModemEvent::MsisdnRead(_)
             | ModemEvent::MiscReadFailure { .. } => self.handle_misc_read_event(server, event),
             ModemEvent::PlmnList(response) => {
@@ -2997,6 +3033,27 @@ impl DeviceBridge {
             modem.send_command(ModemCommand::AtExt(AtCommandExt::new(channel, command)))?;
         Ok(HandledCall {
             command: SdkCommand::AtCommandExt,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_iccid_read<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        if !request.params.is_empty() {
+            return Err(HandleError::UnexpectedParameters {
+                command: request.command,
+                expected: 0,
+                actual: request.params.len(),
+            });
+        }
+        let bytes_written = modem
+            .send_tracked_command(&mut self.pending, ModemCommand::IccidRead(IccidReadRequest))?;
+        Ok(HandledCall {
+            command: SdkCommand::IccidRead,
             device_id: request.device_id,
             bytes_written,
         })
@@ -4886,6 +4943,108 @@ mod tests {
             std::process::abort();
         };
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn stock_iccid_read_matches_live_p4_hci_and_callback_79() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, subscribed_id) = open_client(&mut server, &dir, 0);
+        let (unsubscribed, _unsubscribed_id) = open_client(&mut server, &dir, 1);
+        server
+            .client_context(subscribed_id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::IccidRead.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                subscribed_id,
+                SdkApiRequest {
+                    command: SdkCommand::IccidRead as u16,
+                    device_id: 1,
+                    params: &[],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.bytes_written, 8);
+        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            [0x31, 0x45, 0, 4, 0, 2, 0, 0]
+        );
+        let iccid = [0x89, 0x10, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x54, 0xf6];
+        let mut response = vec![0xb1, 0x46, 0, 17, 0, 0, 0, 2, 0, 11, 0];
+        response.extend_from_slice(&iccid);
+        assert_eq!(
+            route_one_hci(&mut bridge, &mut server, response),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        let mut frame = [0_u8; 32];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(len, 25);
+        let callback = SdkCallback::parse(
+            Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 79);
+        assert_eq!(
+            callback.data,
+            &[
+                0, 0, 0, 0x89, 0x10, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x54, 0xf6
+            ]
+        );
+
+        unsubscribed
+            .set_nonblocking(true)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut no_frame = [0_u8; 1];
+        let Err(error) = unsubscribed.recv(&mut no_frame) else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn malformed_stock_iccid_read_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::IccidRead as u16,
+                    device_id: 1,
+                    params: &[0],
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                command: 78,
+                expected: 0,
+                actual: 1,
+            })
+        ));
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]

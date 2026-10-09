@@ -18,14 +18,14 @@ use gct_lapi::{
     AttachResponseDecodeError, DetachRequest, DetachRequiredIndication, DetachResponse,
     EmmControlDecodeError, EmmControlReport, EmmControlResponse, EmmNiReattachControlRequest,
     EmmReattachControlReport, EmmTimerControlRequest, EmmTimerStartRequest, EmptyRequest,
-    LcsControlRequest, LppControlRequest, MiscReadDecodeError, MiscReadResponse,
-    MobileIdReadRequest, MobileIdReadResponse, MsisdnReadRequest, MsisdnReadResponse,
-    PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse,
-    PdnDisconnectRequest, PdnDisconnectResponse, PdnEncodeError, PdnResponseDecodeError,
-    PlmnListResponse, PlmnSearchDecodeError, PlmnSearchExtEncodeError, PlmnSearchExtRequest,
-    PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
-    PsmControlRequest, ResponseDecodeError, ResultResponse, ResultResponseKind,
-    UeModeChangeRequest, UeModeChangeResponse, UiccAuthenticateEncodeError,
+    IccidReadRequest, IccidReadResponse, LcsControlRequest, LppControlRequest, MiscReadDecodeError,
+    MiscReadResponse, MobileIdReadRequest, MobileIdReadResponse, MsisdnReadRequest,
+    MsisdnReadResponse, PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest,
+    PdnConnectResponse, PdnDisconnectRequest, PdnDisconnectResponse, PdnEncodeError,
+    PdnResponseDecodeError, PlmnListResponse, PlmnSearchDecodeError, PlmnSearchExtEncodeError,
+    PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest,
+    PlmnSearchStopResponse, PsmControlRequest, ResponseDecodeError, ResultResponse,
+    ResultResponseKind, UeModeChangeRequest, UeModeChangeResponse, UiccAuthenticateEncodeError,
     UiccAuthenticateRequest, UiccFixedRequest, UiccFixedRequestError, UiccPinCommandRequest,
     UiccPinEncodeError, UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest,
     UiccResponse, UiccResponseDecodeError, UiccStatusRequest, uicc_control,
@@ -156,6 +156,7 @@ pub enum ModemEvent<'a> {
     PlmnSearchStop(PlmnSearchStopResponse),
     PlmnList(PlmnListResponse<'a>),
     MobileIdRead(MobileIdReadResponse<'a>),
+    IccidRead(IccidReadResponse<'a>),
     MsisdnRead(MsisdnReadResponse<'a>),
     UeModeChange(UeModeChangeResponse),
     EmmNiReattachControl {
@@ -204,6 +205,7 @@ pub enum ModemCommand<'a> {
     PlmnSearchExt(PlmnSearchExtRequest<'a>),
     PlmnSearchStop(PlmnSearchStopRequest),
     MobileIdRead(MobileIdReadRequest),
+    IccidRead(IccidReadRequest),
     MsisdnRead(MsisdnReadRequest),
     UeModeChange(UeModeChangeRequest),
     EmmTimerControl(EmmTimerControlRequest),
@@ -267,7 +269,9 @@ impl ModemCommand<'_> {
             }
             Self::PlmnSearch(_) | Self::PlmnSearchExt(_) => Some(ResponseKey::PlmnSearch),
             Self::PlmnSearchStop(request) => Some(ResponseKey::PlmnSearchStop(request.search_type)),
-            Self::MobileIdRead(_) | Self::MsisdnRead(_) => Some(ResponseKey::MiscRead),
+            Self::MobileIdRead(_) | Self::IccidRead(_) | Self::MsisdnRead(_) => {
+                Some(ResponseKey::MiscRead)
+            }
             Self::UeModeChange(_) => Some(ResponseKey::UeModeChange),
             Self::EmmNiReattachControl(_) => Some(ResponseKey::EmmNiReattachControl),
             Self::Empty(EmptyRequest::PlmnList) => Some(ResponseKey::PlmnList),
@@ -324,9 +328,10 @@ impl ModemEvent<'_> {
                 Some(ResponseKey::PlmnSearchStop(response.search_type))
             }
             Self::PlmnList(_) => Some(ResponseKey::PlmnList),
-            Self::MobileIdRead(_) | Self::MsisdnRead(_) | Self::MiscReadFailure { .. } => {
-                Some(ResponseKey::MiscRead)
-            }
+            Self::MobileIdRead(_)
+            | Self::IccidRead(_)
+            | Self::MsisdnRead(_)
+            | Self::MiscReadFailure { .. } => Some(ResponseKey::MiscRead),
             Self::UeModeChange(_) => Some(ResponseKey::UeModeChange),
             Self::EmmNiReattachControl { .. } => Some(ResponseKey::EmmNiReattachControl),
             Self::Result { kind, .. } => Some(ResponseKey::Result(*kind)),
@@ -520,6 +525,7 @@ pub fn encode_command(
         ModemCommand::PlmnSearchExt(request) => Ok(request.encode(output)?),
         ModemCommand::PlmnSearchStop(request) => Ok(request.encode(output)?),
         ModemCommand::MobileIdRead(request) => Ok(request.encode(output)?),
+        ModemCommand::IccidRead(request) => Ok(request.encode(output)?),
         ModemCommand::MsisdnRead(request) => Ok(request.encode(output)?),
         ModemCommand::UeModeChange(request) => Ok(request.encode(output)?),
         ModemCommand::EmmTimerControl(request) => Ok(request.encode(output)?),
@@ -651,6 +657,7 @@ pub fn decode_event(packet: Packet<'_>) -> Result<ModemEvent<'_>, EventDecodeErr
         },
         recovered_opcode::MISC_READ_RESPONSE => match MiscReadResponse::parse(packet)? {
             MiscReadResponse::MobileId(response) => Ok(ModemEvent::MobileIdRead(response)),
+            MiscReadResponse::Iccid(response) => Ok(ModemEvent::IccidRead(response)),
             MiscReadResponse::Msisdn(response) => Ok(ModemEvent::MsisdnRead(response)),
             MiscReadResponse::Failure { read_result } => {
                 Ok(ModemEvent::MiscReadFailure { read_result })
@@ -843,9 +850,10 @@ mod tests {
     use gct_lapi::{
         AtCommand, AtCommandExt, AtCommandFromDevice, AttachExtProfile, AttachExtRequest,
         EmmNiReattachControlRequest, EmmTimerControlRequest, EmmTimerStartRequest, EmptyRequest,
-        LcsControlRequest, LppControlRequest, MobileIdReadRequest, MsisdnReadRequest, PcoInfo,
-        PinData, PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchStopRequest, PsmControlRequest,
-        ResponseDecodeError, ResultResponseKind, UiccPinCommandRequest,
+        IccidReadRequest, LcsControlRequest, LppControlRequest, MobileIdReadRequest,
+        MsisdnReadRequest, PcoInfo, PinData, PlmnSearchExtRequest, PlmnSearchRequest,
+        PlmnSearchStopRequest, PsmControlRequest, ResponseDecodeError, ResultResponseKind,
+        UiccPinCommandRequest,
     };
     use gct_transport::HciIo;
 
@@ -1351,6 +1359,12 @@ mod tests {
             Ok(8)
         ));
         assert!(pending.contains(ResponseKey::MiscRead));
+        assert!(matches!(
+            modem.send_tracked_command(&mut pending, ModemCommand::IccidRead(IccidReadRequest)),
+            Err(SendTrackedCommandError::Pending(
+                PendingError::AlreadyPending(ResponseKey::MiscRead)
+            ))
+        ));
         assert!(matches!(
             modem.send_tracked_command(
                 &mut pending,
