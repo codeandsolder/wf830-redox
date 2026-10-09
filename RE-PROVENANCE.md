@@ -458,6 +458,64 @@ callback 64 only to clients registered in that slot. Tests cover exact local and
 modem wire bytes, malformed request length before I/O, callback materialization,
 subscription gating, search-type correlation, and pending release.
 
+## Shared EMM control — timer control, NI reattach, and live widened callbacks
+
+This family is heavily used by the shipping P4 userspace: recovered LTE clients
+import both `LTED_EMMtimerCtrlRequest` and `LTED_EMMNIREATTACHctrlRequest` seven
+times each. Live `liblted.so` fixes the local stock request IDs and lengths:
+
+- **207** (`LTED_EMMtimerCtrlRequest`): exactly four caller bytes.
+- **211** (`LTED_EMMNIREATTACHctrlRequest`): exactly four caller bytes.
+
+B014 DWARF independently fixes the four-byte timer object as
+`timerID:u16 @0 | timerValUnit:u8 @2 | timerVal:u8 @3`; the NI-reattach request is
+a single four-byte control value. The live SDK serializes both through shared
+HCI command **`0x3155`** with an eight-byte payload:
+
+- timer control: `00 07 00 04 <timer_id:u16> <unit:u8> <value:u8>`;
+- NI reattach: `00 0b 00 04 <control:u32>`.
+
+The live SDK receive dispatch table at `0x8e704` maps **`0xb156`** to handler
+`0x3319c` and **`0xb164`** to handler `0x33898`. The handler calling convention is
+independently calibrated against the known `0xb14f` UE-mode path: `r1` points at
+the HCI payload. Both EMM handlers therefore expose the same recovered envelope
+`prefix:u16 @0 | kind:u16 @2 | value_len:u16 @4 | value @6`.
+
+For solicited **`0xb156`**, the live switch handles kind **11** by calling
+`0x32fc8`, which looks up SDK callback **159**, reads/converts four bytes from
+payload offset 6, and materializes a four-byte callback object. Kind **7**
+(timer control) falls through the SDK's unsupported/default branch. Rust therefore
+sends timer control **untracked** and deliberately treats a kind-7 acknowledgement
+as unknown instead of inventing a stock callback.
+
+For unsolicited **`0xb164`**, kind **11** calls `0x33678`, which looks up SDK
+callback **160** and materializes a six-byte object: the converted first envelope
+word plus the converted four-byte value. The friendly semantics of those widened
+live fields are not proven, so Rust preserves them as raw `prefix:u16` and
+`value:u32` instead of reusing B014's obsolete one-byte field names.
+
+This is another large firmware-generation ABI delta. Older B014 DWARF describes
+the NI response and reattach report as one byte each, but live P4 widens them and
+uses very different stock callback selectors. Live `lted::ind_regist` proves the
+bindings directly:
+
+- SDK callback **159** -> `ind_emm_nireattach_response` at `0x38114`;
+- SDK callback **160** -> `ind_emm_reattach_ctrl_rpt_indication` at `0x3343c`.
+
+Those live daemon handlers emit stock callback selectors **308 (`0x134`)** and
+**309 (`0x135`)**, carrying four and six bytes respectively. Live `liblted.so`
+then resolves selector 308 to **`cb_rsp[159]` at registration offset `0x4fc`**
+(user pointer `0x500`) and selector 309 to **`cb_rsp[160]` at `0x504`** (user
+pointer `0x508`). Earlier one-byte / 212-ish interpretations are explicitly
+superseded by this direct live-P4 evidence.
+
+Rust mirrors the live behavior conservatively: timer-control is request-only;
+NI reattach is a single family-level tracked request; the NI response retires its
+pending key even when no client is subscribed; and the six-byte reattach report
+is unsolicited. Tests lock exact local->HCI bytes, strict shared-envelope length
+validation, duplicate NI request rejection, malformed local requests before GLIF,
+callback-308 subscription gating, and exact unsolicited callback-309 bytes.
+
 ## UE mode change — live P4 command/response and callback-generation delta
 
 This is a high-value live-client path: eight recovered P4 LTE binaries import

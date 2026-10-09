@@ -2150,6 +2150,148 @@ impl<'a> MiscReadResponse<'a> {
     }
 }
 
+/// EMM timer-control request carried by shared command `0x3155` discriminator 7.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmmTimerControlRequest {
+    pub timer_id: u16,
+    pub timer_value_unit: u8,
+    pub timer_value: u8,
+}
+
+impl EmmTimerControlRequest {
+    /// Encode the exact eight-byte live-P4 payload
+    /// `00 07 00 04 <timer_id:u16> <unit:u8> <value:u8>`.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than 12 bytes.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        let timer_id = self.timer_id.to_be_bytes();
+        encode_packet(
+            recovered_opcode::EMM_CONTROL_REQUEST,
+            &[
+                0x00,
+                0x07,
+                0x00,
+                0x04,
+                timer_id[0],
+                timer_id[1],
+                self.timer_value_unit,
+                self.timer_value,
+            ],
+            output,
+        )
+    }
+}
+
+/// Network-initiated reattach-control request carried by shared command
+/// `0x3155` discriminator 11.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmmNiReattachControlRequest {
+    pub control: u32,
+}
+
+impl EmmNiReattachControlRequest {
+    /// Encode exact live-P4 bytes `00 0b 00 04 <control:u32>`.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than 12 bytes.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        let control = self.control.to_be_bytes();
+        encode_packet(
+            recovered_opcode::EMM_CONTROL_REQUEST,
+            &[
+                0x00, 0x0b, 0x00, 0x04, control[0], control[1], control[2], control[3],
+            ],
+            output,
+        )
+    }
+}
+
+/// Malformed shared EMM-control response/report envelope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmmControlDecodeError {
+    Response(ResponseDecodeError),
+    UnexpectedValueLength { expected: u16, actual: u16 },
+}
+
+impl From<ResponseDecodeError> for EmmControlDecodeError {
+    fn from(value: ResponseDecodeError) -> Self {
+        Self::Response(value)
+    }
+}
+
+fn parse_emm_control_envelope(
+    packet: Packet<'_>,
+    opcode: u16,
+) -> Result<(u16, u16, u32), EmmControlDecodeError> {
+    let payload = exact_payload(packet, opcode, 10)?;
+    let value_len = be_u16(payload, 4);
+    if value_len != 4 {
+        return Err(EmmControlDecodeError::UnexpectedValueLength {
+            expected: 4,
+            actual: value_len,
+        });
+    }
+    Ok((be_u16(payload, 0), be_u16(payload, 2), be_u32(payload, 6)))
+}
+
+/// Shared `0xb156` control response. Live P4 only wires discriminator 11 to the
+/// NI-reattach stock callback; discriminator 7 (timer control) is deliberately
+/// dropped by the SDK switch and remains [`Self::Unsupported`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmmControlResponse {
+    NiReattach { result: u32 },
+    Unsupported { kind: u16 },
+}
+
+impl EmmControlResponse {
+    /// Decode the exact ten-byte shared response envelope.
+    ///
+    /// # Errors
+    /// Returns [`EmmControlDecodeError`] for a malformed opcode/length envelope.
+    pub fn parse(packet: Packet<'_>) -> Result<Self, EmmControlDecodeError> {
+        let (_prefix, kind, value) =
+            parse_emm_control_envelope(packet, recovered_opcode::EMM_CONTROL_RESPONSE)?;
+        Ok(if kind == 11 {
+            Self::NiReattach { result: value }
+        } else {
+            Self::Unsupported { kind }
+        })
+    }
+}
+
+/// Live P4 reattach-control report materialized from shared `0xb164`
+/// discriminator 11. The SDK callback object is exactly six bytes: the first
+/// envelope word followed by the converted four-byte value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmmReattachControlReport {
+    pub prefix: u16,
+    pub value: u32,
+}
+
+/// Shared `0xb164` report decoder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmmControlReport {
+    Reattach(EmmReattachControlReport),
+    Unsupported { kind: u16 },
+}
+
+impl EmmControlReport {
+    /// Decode the exact ten-byte shared report envelope.
+    ///
+    /// # Errors
+    /// Returns [`EmmControlDecodeError`] for a malformed opcode/length envelope.
+    pub fn parse(packet: Packet<'_>) -> Result<Self, EmmControlDecodeError> {
+        let (prefix, kind, value) =
+            parse_emm_control_envelope(packet, recovered_opcode::EMM_CONTROL_REPORT)?;
+        Ok(if kind == 11 {
+            Self::Reattach(EmmReattachControlReport { prefix, value })
+        } else {
+            Self::Unsupported { kind }
+        })
+    }
+}
+
 /// UE-mode-change request `0x3118`.
 ///
 /// Live P4 `LAPI_UeModeChangeRequest` allocates a five-byte HCI frame and copies
@@ -5724,6 +5866,83 @@ mod tests {
                 expected: 4,
                 actual: 3,
             })
+        );
+    }
+
+    #[test]
+    fn emm_control_requests_and_live_envelopes_match_exact_bytes() {
+        let mut timer = [0_u8; 12];
+        assert_eq!(
+            super::EmmTimerControlRequest {
+                timer_id: 0x1234,
+                timer_value_unit: 5,
+                timer_value: 6,
+            }
+            .encode(&mut timer),
+            Ok(12)
+        );
+        assert_eq!(
+            timer,
+            [
+                0x31, 0x55, 0x00, 0x08, 0x00, 0x07, 0x00, 0x04, 0x12, 0x34, 5, 6
+            ]
+        );
+
+        let mut ni = [0_u8; 12];
+        assert_eq!(
+            super::EmmNiReattachControlRequest {
+                control: 0x1122_3344
+            }
+            .encode(&mut ni),
+            Ok(12)
+        );
+        assert_eq!(
+            ni,
+            [
+                0x31, 0x55, 0x00, 0x08, 0x00, 0x0b, 0x00, 0x04, 0x11, 0x22, 0x33, 0x44
+            ]
+        );
+
+        let ni_response = [0x00, 0x00, 0x00, 0x0b, 0x00, 0x04, 0x11, 0x22, 0x33, 0x44];
+        assert_eq!(
+            super::EmmControlResponse::parse(packet(0xb156, &ni_response)),
+            Ok(super::EmmControlResponse::NiReattach {
+                result: 0x1122_3344
+            })
+        );
+        let timer_response = [0x00, 0x00, 0x00, 0x07, 0x00, 0x04, 0, 0, 0, 1];
+        assert_eq!(
+            super::EmmControlResponse::parse(packet(0xb156, &timer_response)),
+            Ok(super::EmmControlResponse::Unsupported { kind: 7 })
+        );
+
+        let report = [0x12, 0x34, 0x00, 0x0b, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd];
+        assert_eq!(
+            super::EmmControlReport::parse(packet(0xb164, &report)),
+            Ok(super::EmmControlReport::Reattach(
+                super::EmmReattachControlReport {
+                    prefix: 0x1234,
+                    value: 0xaabb_ccdd,
+                }
+            ))
+        );
+
+        let bad_value_len = [0x00, 0x00, 0x00, 0x0b, 0x00, 0x03, 1, 2, 3, 4];
+        assert_eq!(
+            super::EmmControlResponse::parse(packet(0xb156, &bad_value_len)),
+            Err(super::EmmControlDecodeError::UnexpectedValueLength {
+                expected: 4,
+                actual: 3,
+            })
+        );
+        assert_eq!(
+            super::EmmControlResponse::parse(packet(0xb156, &ni_response[..9])),
+            Err(super::EmmControlDecodeError::Response(
+                super::ResponseDecodeError::UnexpectedLength {
+                    expected: 10,
+                    actual: 9,
+                }
+            ))
         );
     }
 

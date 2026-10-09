@@ -11,7 +11,8 @@ use std::{io, io::Write};
 use gct_lapi::{
     ApnType, AtCommand, AtCommandExt, AttachExtProfile, AttachExtRequest, AttachExtResponse,
     AttachRequest, AttachResponse, AttachTailDecodeError, AttachTailField, DetachRequest,
-    DetachRequiredIndication, DetachResponse, EmergencyNumberDecodeError, EmptyRequest,
+    DetachRequiredIndication, DetachResponse, EmergencyNumberDecodeError,
+    EmmNiReattachControlRequest, EmmReattachControlReport, EmmTimerControlRequest, EmptyRequest,
     MobileIdReadRequest, MobileIdReadResponse, PcoInfo, PdnConnectExtRequest,
     PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse, PdnConnectTailDecodeError,
     PdnConnectTailField, PdnConnectionControl, PdnDisconnectField, PdnDisconnectFieldDecodeError,
@@ -1900,6 +1901,45 @@ pub fn broadcast_result_callback(
     Ok(report)
 }
 
+/// Broadcast live-P4 callback 308 (`EMM_NI_REATTACH_CTRL_RSP`) through
+/// `cb_rsp[159]` as the exact four-byte result object.
+///
+/// # Errors
+/// Returns [`HandleError::Ipc`] for local IPC failures.
+pub fn broadcast_emm_ni_reattach_callback(
+    server: &mut Server,
+    device_id: u32,
+    result: u32,
+) -> Result<BroadcastReport, HandleError> {
+    broadcast_variable_callback(
+        server,
+        device_id,
+        SdkCallbackKind::EmmNiReattachControl,
+        &result.to_be_bytes(),
+    )
+}
+
+/// Broadcast unsolicited live-P4 callback 309 (`EMM_REATTACH_CTRL_RPT`) through
+/// `cb_rsp[160]`. The SDK callback object is exactly six bytes.
+///
+/// # Errors
+/// Returns [`HandleError::Ipc`] for local IPC failures.
+pub fn broadcast_emm_reattach_report_callback(
+    server: &mut Server,
+    device_id: u32,
+    report: EmmReattachControlReport,
+) -> Result<BroadcastReport, HandleError> {
+    let mut data = [0_u8; 6];
+    data[..2].copy_from_slice(&report.prefix.to_be_bytes());
+    data[2..].copy_from_slice(&report.value.to_be_bytes());
+    broadcast_variable_callback(
+        server,
+        device_id,
+        SdkCallbackKind::EmmReattachControlReport,
+        &data,
+    )
+}
+
 /// Broadcast the exact live-P4 one-byte UE-mode-change callback 162.
 ///
 /// # Errors
@@ -2250,6 +2290,10 @@ impl DeviceBridge {
                 Ok(SdkCommand::AtCommandExt) => Self::dispatch_at_ext(modem, request),
                 Ok(SdkCommand::UiccRequest) => self.dispatch_uicc(modem, request),
                 Ok(SdkCommand::UeModeChange) => self.dispatch_ue_mode_change(modem, request),
+                Ok(SdkCommand::EmmTimerControl) => Self::dispatch_emm_timer_control(modem, request),
+                Ok(SdkCommand::EmmNiReattachControl) => {
+                    self.dispatch_emm_ni_reattach_control(modem, request)
+                }
                 Ok(_) => self.dispatch_zero_parameter(modem, request),
                 Err(_) => Err(HandleError::UnsupportedCommand(request.command)),
             }
@@ -2407,6 +2451,15 @@ impl DeviceBridge {
             ModemEvent::UeModeChange(response) => {
                 self.handle_ue_mode_change_event(server, *response)
             }
+            ModemEvent::EmmNiReattachControl { result } => {
+                if !self.pending.remove(ResponseKey::EmmNiReattachControl) {
+                    return Ok(None);
+                }
+                broadcast_emm_ni_reattach_callback(server, self.device_id, *result).map(Some)
+            }
+            ModemEvent::EmmReattachControlReport(report) => {
+                broadcast_emm_reattach_report_callback(server, self.device_id, *report).map(Some)
+            }
             ModemEvent::Result { kind, response } => {
                 self.handle_result_event(server, *kind, *response)
             }
@@ -2455,6 +2508,60 @@ impl DeviceBridge {
             }
         }
         Err(HandleError::TransactionIdsExhausted)
+    }
+
+    fn dispatch_emm_timer_control<T: Write>(
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let bytes: [u8; 4] =
+            request
+                .params
+                .try_into()
+                .map_err(|_| HandleError::UnexpectedParameters {
+                    command: request.command,
+                    expected: 4,
+                    actual: request.params.len(),
+                })?;
+        let modem_request = EmmTimerControlRequest {
+            timer_id: u16::from_be_bytes([bytes[0], bytes[1]]),
+            timer_value_unit: bytes[2],
+            timer_value: bytes[3],
+        };
+        let bytes_written = modem.send_command(ModemCommand::EmmTimerControl(modem_request))?;
+        Ok(HandledCall {
+            command: SdkCommand::EmmTimerControl,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_emm_ni_reattach_control<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let bytes: [u8; 4] =
+            request
+                .params
+                .try_into()
+                .map_err(|_| HandleError::UnexpectedParameters {
+                    command: request.command,
+                    expected: 4,
+                    actual: request.params.len(),
+                })?;
+        let modem_request = EmmNiReattachControlRequest {
+            control: u32::from_be_bytes(bytes),
+        };
+        let bytes_written = modem.send_tracked_command(
+            &mut self.pending,
+            ModemCommand::EmmNiReattachControl(modem_request),
+        )?;
+        Ok(HandledCall {
+            command: SdkCommand::EmmNiReattachControl,
+            device_id: request.device_id,
+            bytes_written,
+        })
     }
 
     fn dispatch_ue_mode_change<T: Write>(
@@ -5525,6 +5632,251 @@ mod tests {
             std::process::abort();
         };
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn stock_emm_timer_control_is_exact_and_deliberately_untracked() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::EmmTimerControl as u16,
+                    device_id: 1,
+                    params: &[0x12, 0x34, 5, 6],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.bytes_written, 12);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![
+                0x31, 0x55, 0x00, 0x08, 0x00, 0x07, 0x00, 0x04, 0x12, 0x34, 5, 6
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_stock_emm_timer_control_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::EmmTimerControl as u16,
+                    device_id: 1,
+                    params: &[0; 3],
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                command: 207,
+                expected: 4,
+                actual: 3,
+            })
+        ));
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn malformed_stock_emm_ni_reattach_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::EmmNiReattachControl as u16,
+                    device_id: 1,
+                    params: &[0; 3],
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                command: 211,
+                expected: 4,
+                actual: 3,
+            })
+        ));
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn unsubscribed_emm_ni_reattach_retires_pending_without_callback() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::EmmNiReattachControl as u16,
+                    device_id: 1,
+                    params: &[0, 0, 0, 1],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                vec![
+                    0xb1, 0x56, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x04, 0, 0, 0, 0,
+                ],
+            ),
+            Some(BroadcastReport {
+                registered_clients: 0,
+                sent_clients: 0,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        client
+            .set_nonblocking(true)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut frame = [0_u8; 32];
+        let Err(error) = client.recv(&mut frame) else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn stock_emm_ni_reattach_round_trips_callback_308() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, id) = open_client(&mut server, &dir, 0);
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(
+                SdkCallbackKind::EmmNiReattachControl.registration_offset(),
+                1,
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::EmmNiReattachControl as u16,
+                    device_id: 0x1122_3344,
+                    params: &[0x11, 0x22, 0x33, 0x44],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.bytes_written, 12);
+        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![
+                0x31, 0x55, 0x00, 0x08, 0x00, 0x0b, 0x00, 0x04, 0x11, 0x22, 0x33, 0x44
+            ]
+        );
+
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                vec![
+                    0xb1, 0x56, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x04, 0xaa, 0xbb, 0xcc,
+                    0xdd,
+                ],
+            ),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        let mut frame = [0_u8; 32];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(len, 16);
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 308);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(callback.data, &[0xaa, 0xbb, 0xcc, 0xdd]);
+    }
+
+    #[test]
+    fn emm_reattach_report_is_unsolicited_callback_309() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, id) = open_client(&mut server, &dir, 0);
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(
+                SdkCallbackKind::EmmReattachControlReport.registration_offset(),
+                1,
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                vec![
+                    0xb1, 0x64, 0x00, 0x0a, 0x12, 0x34, 0x00, 0x0b, 0x00, 0x04, 0xaa, 0xbb, 0xcc,
+                    0xdd,
+                ],
+            ),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        let mut frame = [0_u8; 32];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(len, 18);
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 309);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(callback.data, &[0x12, 0x34, 0xaa, 0xbb, 0xcc, 0xdd]);
     }
 
     #[test]
