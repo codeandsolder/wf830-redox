@@ -44,15 +44,25 @@ use state::{ApnState, NicState, SpecialTidRecord};
 pub use state::{ApnStateError, ConnectionStateError};
 
 use gct_lapi::{
-    AtCommand, AtCommandExt, AttachExtResponse, AttachResponse, DetachRequest,
-    DeviceInformationRequest, DeviceInformationResponse, EmmNiReattachControlRequest,
-    EmmTimerControlRequest, EmmTimerStartRequest, EmptyRequest, IccidReadRequest,
-    LcsControlRequest, LppControlRequest, MobileIdReadRequest, MsisdnReadRequest,
-    NasConfigGetRequest, NasConfigSetRequest, PdnConnectResponse, PdnDisconnectResponse,
-    PlmnInfoDecodeError, PlmnListResponse, PlmnSearchExtRequest, PlmnSearchRequest,
-    PlmnSearchStopRequest, PsmControlRequest, ResultResponse, ResultResponseKind,
-    RrcCapabilityGetResponse, RrcCapabilitySetResponse, SetProtocolInfoResponse,
-    TemperatureReadRequest, UeModeChangeRequest, UeModeChangeResponse, UiccResponse,
+    at::{AtCommand, AtCommandExt},
+    attach::{AttachExtResponse, AttachResponse, DetachRequest},
+    common::{EmptyRequest, ResultResponse, ResultResponseKind},
+    emm::{
+        EmmNiReattachControlRequest, EmmTimerControlRequest, EmmTimerStartRequest,
+        LcsControlRequest, LppControlRequest, NasConfigGetRequest, NasConfigSetRequest,
+        PsmControlRequest, UeModeChangeRequest, UeModeChangeResponse,
+    },
+    misc::{
+        DeviceInformationRequest, DeviceInformationResponse, IccidReadRequest, MobileIdReadRequest,
+        MsisdnReadRequest, TemperatureReadRequest,
+    },
+    pdn::{PdnConnectResponse, PdnDisconnectResponse},
+    plmn::{
+        PlmnInfoDecodeError, PlmnListResponse, PlmnSearchExtRequest, PlmnSearchRequest,
+        PlmnSearchStopRequest,
+    },
+    rrc::{RrcCapabilityGetResponse, RrcCapabilitySetResponse, SetProtocolInfoResponse},
+    uicc::UiccResponse,
 };
 use gct_runtime::{
     EventDecodeError, Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey,
@@ -1740,8 +1750,10 @@ mod tests {
     };
 
     use gct_lapi::{
-        DetachRequiredIndication, DeviceInformationDecodeError, ResultResponse, ResultResponseKind,
-        UiccResponse,
+        attach::DetachRequiredIndication,
+        common::{ResultResponse, ResultResponseKind},
+        misc::DeviceInformationDecodeError,
+        uicc::UiccResponse,
     };
     use gct_runtime::{EventDecodeError, Modem, ModemEvent, ResponseKey};
     use gct_transport::HciIo;

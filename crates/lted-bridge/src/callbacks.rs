@@ -7,12 +7,14 @@
 use std::io;
 
 use gct_lapi::{
-    AttachExtResponse, AttachResponse, DetachRequiredIndication, DetachResponse,
-    EmmReattachControlReport, IccidReadResponse, MobileIdReadResponse, MsisdnReadResponse,
-    PdnConnectExtResponse, PdnConnectResponse, PdnDisconnectResponse, PlmnListResponse,
-    PlmnSearchResponse, PlmnSearchStopResponse, ResultResponse, ResultResponseKind,
-    RrcCapabilityGetResponse, RrcCapabilitySetResponse, SetProtocolInfoResponse,
-    TemperatureReadResponse, UeModeChangeResponse, UiccResponse, uicc_control,
+    attach::{AttachExtResponse, AttachResponse, DetachRequiredIndication, DetachResponse},
+    common::{ResultResponse, ResultResponseKind},
+    emm::{EmmReattachControlReport, UeModeChangeResponse},
+    misc::{IccidReadResponse, MobileIdReadResponse, MsisdnReadResponse, TemperatureReadResponse},
+    pdn::{PdnConnectExtResponse, PdnConnectResponse, PdnDisconnectResponse},
+    plmn::{PlmnListResponse, PlmnSearchResponse, PlmnSearchStopResponse},
+    rrc::{RrcCapabilityGetResponse, RrcCapabilitySetResponse, SetProtocolInfoResponse},
+    uicc::{UiccResponse, uicc_control},
 };
 use lted_compat::Server;
 use lted_proto::{SdkCallback, SdkCallbackKind};
@@ -591,8 +593,9 @@ pub(crate) fn broadcast_msisdn_callback(
     if !response
         .records
         .len()
-        .is_multiple_of(gct_lapi::MSISDN_RECORD_LEN)
-        || response.records.len() > gct_lapi::MAX_MSISDN_RECORDS * gct_lapi::MSISDN_RECORD_LEN
+        .is_multiple_of(gct_lapi::misc::MSISDN_RECORD_LEN)
+        || response.records.len()
+            > gct_lapi::misc::MAX_MSISDN_RECORDS * gct_lapi::misc::MSISDN_RECORD_LEN
     {
         return Err(HandleError::Ipc(io::Error::new(
             io::ErrorKind::InvalidData,

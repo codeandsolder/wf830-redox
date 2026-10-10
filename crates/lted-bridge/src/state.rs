@@ -1,7 +1,7 @@
 use gct_lapi::{
-    AttachResponse, AttachTailDecodeError, AttachTailField, PdnConnectResponse,
-    PdnConnectTailDecodeError, PdnConnectTailField, PdnInfoContainers, PdnInfoField,
-    PdnInfoFieldLengthError,
+    attach::{AttachResponse, AttachTailDecodeError, AttachTailField},
+    common::{PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError},
+    pdn::{PdnConnectResponse, PdnConnectTailDecodeError, PdnConnectTailField},
 };
 
 pub(crate) const CONNECTION_INFO_LEN: usize = 0x0a0e;

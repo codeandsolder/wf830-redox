@@ -13,26 +13,46 @@ use std::{
 
 use gct_hci::{EncodeError, Header, Packet, public_opcode, recovered_opcode};
 use gct_lapi::{
-    AtCommand, AtCommandExt, AtCommandFromDevice, AtCommandFromDeviceExt, AttachEncodeError,
-    AttachExtEncodeError, AttachExtRequest, AttachExtResponse, AttachRequest, AttachResponse,
-    AttachResponseDecodeError, DetachRequest, DetachRequiredIndication, DetachResponse,
-    DeviceInformationDecodeError, DeviceInformationRequest, DeviceInformationResponse,
-    EmmControlDecodeError, EmmControlReport, EmmControlResponse, EmmNiReattachControlRequest,
-    EmmReattachControlReport, EmmTimerControlRequest, EmmTimerStartRequest, EmptyRequest,
-    IccidReadRequest, IccidReadResponse, LcsControlRequest, LppControlRequest, MiscReadDecodeError,
-    MiscReadResponse, MobileIdReadRequest, MobileIdReadResponse, MsisdnReadRequest,
-    MsisdnReadResponse, NasConfigEncodeError, NasConfigGetRequest, NasConfigSetRequest,
-    PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse,
-    PdnDisconnectRequest, PdnDisconnectResponse, PdnEncodeError, PdnResponseDecodeError,
-    PlmnListResponse, PlmnSearchDecodeError, PlmnSearchExtEncodeError, PlmnSearchExtRequest,
-    PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
-    PsmControlRequest, ResponseDecodeError, ResultResponse, ResultResponseKind,
-    RrcCapabilityGetRequest, RrcCapabilityGetResponse, RrcCapabilitySetRequest,
-    RrcCapabilitySetResponse, SetProtocolInfoRequest, SetProtocolInfoResponse,
-    TemperatureReadRequest, TemperatureReadResponse, UeModeChangeRequest, UeModeChangeResponse,
-    UiccAuthenticateEncodeError, UiccAuthenticateRequest, UiccFixedRequest, UiccFixedRequestError,
-    UiccPinCommandRequest, UiccPinEncodeError, UiccPinStatusRequest, UiccReadBinaryRequest,
-    UiccReadRecordRequest, UiccResponse, UiccResponseDecodeError, UiccStatusRequest, uicc_control,
+    at::{AtCommand, AtCommandExt, AtCommandFromDevice, AtCommandFromDeviceExt},
+    attach::{
+        AttachEncodeError, AttachExtEncodeError, AttachExtRequest, AttachExtResponse,
+        AttachRequest, AttachResponse, AttachResponseDecodeError, DetachRequest,
+        DetachRequiredIndication, DetachResponse,
+    },
+    common::{
+        EmptyRequest, PdnResponseDecodeError, ResponseDecodeError, ResultResponse,
+        ResultResponseKind,
+    },
+    emm::{
+        EmmControlDecodeError, EmmControlReport, EmmControlResponse, EmmNiReattachControlRequest,
+        EmmReattachControlReport, EmmTimerControlRequest, EmmTimerStartRequest, LcsControlRequest,
+        LppControlRequest, NasConfigEncodeError, NasConfigGetRequest, NasConfigSetRequest,
+        PsmControlRequest, UeModeChangeRequest, UeModeChangeResponse,
+    },
+    misc::{
+        DeviceInformationDecodeError, DeviceInformationRequest, DeviceInformationResponse,
+        IccidReadRequest, IccidReadResponse, MiscReadDecodeError, MiscReadResponse,
+        MobileIdReadRequest, MobileIdReadResponse, MsisdnReadRequest, MsisdnReadResponse,
+        TemperatureReadRequest, TemperatureReadResponse,
+    },
+    pdn::{
+        PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse,
+        PdnDisconnectRequest, PdnDisconnectResponse, PdnEncodeError,
+    },
+    plmn::{
+        PlmnListResponse, PlmnSearchDecodeError, PlmnSearchExtEncodeError, PlmnSearchExtRequest,
+        PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
+    },
+    rrc::{
+        RrcCapabilityGetRequest, RrcCapabilityGetResponse, RrcCapabilitySetRequest,
+        RrcCapabilitySetResponse, SetProtocolInfoRequest, SetProtocolInfoResponse,
+    },
+    uicc::{
+        UiccAuthenticateEncodeError, UiccAuthenticateRequest, UiccFixedRequest,
+        UiccFixedRequestError, UiccPinCommandRequest, UiccPinEncodeError, UiccPinStatusRequest,
+        UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse, UiccResponseDecodeError,
+        UiccStatusRequest, uicc_control,
+    },
 };
 use gct_transport::{
     GlifTransport, HciIo, HciStreamDecoder, MAX_HCI_FRAME_LEN, OEM_READ_BUFFER_LEN,
@@ -918,13 +938,21 @@ mod tests {
 
     use gct_hci::{Header, Packet, public_opcode, recovered_opcode};
     use gct_lapi::{
-        AtCommand, AtCommandExt, AtCommandFromDevice, AttachExtProfile, AttachExtRequest,
-        DeviceInformationRequest, EmmNiReattachControlRequest, EmmTimerControlRequest,
-        EmmTimerStartRequest, EmptyRequest, IccidReadRequest, LcsControlRequest, LppControlRequest,
-        MobileIdReadRequest, MsisdnReadRequest, NasConfigGetRequest, NasConfigSetRequest, PcoInfo,
-        PinData, PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchStopRequest, PsmControlRequest,
-        ResponseDecodeError, ResultResponseKind, RrcCapabilityGetRequest, RrcCapabilitySetRequest,
-        SetProtocolInfoRequest, TemperatureReadRequest, UiccPinCommandRequest,
+        at::{AtCommand, AtCommandExt, AtCommandFromDevice},
+        attach::{AttachExtProfile, AttachExtRequest},
+        common::{EmptyRequest, PcoInfo, ResponseDecodeError, ResultResponseKind},
+        emm::{
+            EmmNiReattachControlRequest, EmmTimerControlRequest, EmmTimerStartRequest,
+            LcsControlRequest, LppControlRequest, NasConfigGetRequest, NasConfigSetRequest,
+            PsmControlRequest,
+        },
+        misc::{
+            DeviceInformationRequest, IccidReadRequest, MobileIdReadRequest, MsisdnReadRequest,
+            TemperatureReadRequest,
+        },
+        plmn::{PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchStopRequest},
+        rrc::{RrcCapabilityGetRequest, RrcCapabilitySetRequest, SetProtocolInfoRequest},
+        uicc::{PinData, UiccPinCommandRequest},
     };
     use gct_transport::HciIo;
 
@@ -1400,7 +1428,7 @@ mod tests {
         assert_eq!(
             decode_event(report_packet),
             Ok(ModemEvent::EmmReattachControlReport(
-                gct_lapi::EmmReattachControlReport {
+                gct_lapi::emm::EmmReattachControlReport {
                     prefix: 0x1234,
                     value: 0xaabb_ccdd,
                 }
@@ -1483,7 +1511,7 @@ mod tests {
         let transport = HciIo::new(Cursor::new(Vec::new()));
         let mut modem = Modem::new(transport);
         let mut pending = PendingRequests::new();
-        let command = ModemCommand::UeModeChange(gct_lapi::UeModeChangeRequest { mode: 3 });
+        let command = ModemCommand::UeModeChange(gct_lapi::emm::UeModeChangeRequest { mode: 3 });
         assert!(matches!(
             modem.send_tracked_command(&mut pending, command),
             Ok(5)
@@ -1510,9 +1538,9 @@ mod tests {
         };
         assert_eq!(
             decode_event(packet),
-            Ok(ModemEvent::UeModeChange(gct_lapi::UeModeChangeResponse {
-                result: 0x7f,
-            }))
+            Ok(ModemEvent::UeModeChange(
+                gct_lapi::emm::UeModeChangeResponse { result: 0x7f }
+            ))
         );
     }
 
@@ -1603,7 +1631,7 @@ mod tests {
         assert_eq!(event.response_key(), Some(ResponseKey::DeviceInformation));
         assert_eq!(
             event,
-            ModemEvent::DeviceInformation(gct_lapi::DeviceInformationResponse {
+            ModemEvent::DeviceInformation(gct_lapi::misc::DeviceInformationResponse {
                 fw_revision: [1, 2, 3, 4],
                 chip_revision: [5, 6],
             })

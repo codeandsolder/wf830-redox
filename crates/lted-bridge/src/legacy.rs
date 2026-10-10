@@ -6,20 +6,27 @@
 //! validating and decoding historical local ABI shapes.
 
 use gct_lapi::{
-    ApnType, AttachExtProfile, AttachExtRequest, AttachRequest, PcoInfo, PdnConnectExtRequest,
-    PdnConnectRequest, PdnConnectionControl, PdnDisconnectRequest, Positioning,
-    RrcCapabilityGetRequest, RrcCapabilitySetRequest, SetProtocolInfoRequest, UiccFixedRequest,
-    UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest, UiccStatusRequest,
-    uicc_control,
+    attach::{AttachExtProfile, AttachExtRequest, AttachRequest, Positioning},
+    common::{ApnType, PcoInfo, PdnConnectionControl},
+    pdn::{PdnConnectExtRequest, PdnConnectRequest, PdnDisconnectRequest},
+    rrc::{RrcCapabilityGetRequest, RrcCapabilitySetRequest, SetProtocolInfoRequest},
+    uicc::{
+        UiccFixedRequest, UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest,
+        UiccStatusRequest, uicc_control,
+    },
 };
 
 pub const LEGACY_ATTACH_PARAMS_LEN: usize = 0x160;
 use gct_lapi::{
-    AttachExtResponse, AttachResponse, AttachTailDecodeError, AttachTailField,
-    EmergencyNumberDecodeError, PdnConnectExtResponse, PdnConnectResponse,
-    PdnConnectTailDecodeError, PdnConnectTailField, PdnDisconnectField,
-    PdnDisconnectFieldDecodeError, PdnDisconnectResponse, PdnInfoContainers, PdnInfoField,
-    PdnInfoFieldLengthError, QosField,
+    attach::{
+        AttachExtResponse, AttachResponse, AttachTailDecodeError, AttachTailField,
+        EmergencyNumberDecodeError,
+    },
+    common::{PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, QosField},
+    pdn::{
+        PdnConnectExtResponse, PdnConnectResponse, PdnConnectTailDecodeError, PdnConnectTailField,
+        PdnDisconnectField, PdnDisconnectFieldDecodeError, PdnDisconnectResponse,
+    },
 };
 
 pub const LEGACY_ATTACH_EXT_PARAMS_LEN: usize = 0x1e4;

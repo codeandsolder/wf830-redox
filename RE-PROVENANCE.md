@@ -154,7 +154,7 @@ B014 historically mapped 4/6/7 to 5/7/8; those mappings are deliberately not rep
 
 The normal attach payload begins with the one-byte `optional_info`. If it is zero, the complete payload is that single byte. Otherwise the live SDK emits TLVs in this order: transaction `0x20`, username `0x02`, password `0x03`, APN `0x04`, auth `0x1e`, PDN type `0x05`, IP allocation `0x01`, optional general PCO `0x5c`, optional operator PCO `0x5d`, attach type `0x5f`, request type `0x60`, requested APN mapping `0x70`, emergency mode `0x62`, positioning `0xf5`, low-priority NAS `0xf6`, PDN connection control `0x71`, secure PCO `0xf7`.
 
-`gct-lapi::AttachRequest` now implements this live-P4 behavior directly. It uses borrowed byte slices rather than the historical fixed C arrays, but intentionally caps inputs to the proven safe OEM storage limits. The OEM SDK silently rewrites out-of-range PDN control values; the clean Rust API rejects them instead.
+`gct-lapi::attach::AttachRequest` now implements this live-P4 behavior directly. It uses borrowed byte slices rather than the historical fixed C arrays, but intentionally caps inputs to the proven safe OEM storage limits. The OEM SDK silently rewrites out-of-range PDN control values; the clean Rust API rejects them instead.
 
 `lted-bridge` now also translates stock SDK command 25 from the exact 352-byte `_ATTACH_REQ_PARAM` IPC payload into that clean request. The bridge uses the DWARF-proven offsets but does not recreate the C struct: APN/username/password are borrowed as bounded NUL-terminated slices, operator PCO length is checked against its 100-byte slot, packed `u16` fields are decoded big-endian, and `optional_info == 0` deliberately ignores all dead trailing legacy bytes. Unterminated fixed strings and impossible lengths fail before GLIF is touched.
 
@@ -756,7 +756,7 @@ data because live `LAPI_UICCRequest` forcibly emits a zero-length modem subtype.
 
 AUTHENTICATE and PIN COMMAND deserve a special compatibility path: live P4
 copies their complete fixed 36-byte and 20-byte subtype objects raw, including
-otherwise-dead fixed-slot padding. `gct-lapi::UiccFixedRequest` therefore has
+otherwise-dead fixed-slot padding. `gct-lapi::uicc::UiccFixedRequest` therefore has
 only two constrained constructors for those exact widths and preserves every
 input byte. This avoids silently changing stock-observable padding while still
 refusing an unrestricted raw-UICC API. Status/read-binary/read-record continue

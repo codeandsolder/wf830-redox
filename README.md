@@ -9,7 +9,7 @@ and extracted proprietary files. Reverse-engineering inputs remain in the parent
 Current crates:
 
 - `gct-hci`: exact GCT HCI framing, TLV primitives and verified public/recovered opcodes.
-- `gct-lapi`: typed clean codecs for proven modem request/response families; no stock `liblted.so` ABI.
+- `gct-lapi`: typed clean codecs split by proven modem protocol family; no stock `liblted.so` ABI.
 - `gct-transport`: safe `/dev/glif0` byte transport plus incremental HCI stream framing across split/coalesced reads.
 - `gct-runtime`: modem request correlation, startup sequencing and typed modem-event decoding above transport.
 - `lted-proto`: exact local `lted` datagram envelopes, SDK command IDs and callback metadata.
