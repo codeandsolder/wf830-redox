@@ -3,15 +3,18 @@ use std::{
     ffi::OsStr,
     fs::File,
     io::{self, Read},
-    os::unix::net::UnixDatagram,
+    os::{fd::AsFd, unix::net::UnixDatagram},
     process::ExitCode,
     thread::{self, JoinHandle},
 };
+
+mod ipv6_prefix;
 
 use gct_runtime::{
     Modem, StartupInterface, decode_event, discover_startup_interface, verify_startup_interface,
 };
 use gct_transport::{HciStreamDecoder, OEM_READ_BUFFER_LEN};
+use ipv6_prefix::{Ipv6PrefixSource, interface_name};
 use lted_bridge::DeviceBridge;
 use lted_compat::{Error as CompatError, Server};
 use lted_proto::{Event, Packet, SdkApiRequest, parse_api_close};
@@ -101,6 +104,7 @@ fn run() -> io::Result<()> {
     }
 
     let mut server = Server::bind_oem()?;
+    let mut ipv6_prefix = Ipv6PrefixSource::bind()?;
     let reader_file = modem.transport().inner().try_clone()?;
     let (glif_rx, glif_tx) = UnixDatagram::pair()?;
     let _reader = spawn_glif_reader(reader_file, glif_tx)?;
@@ -111,7 +115,13 @@ fn run() -> io::Result<()> {
     {
         eprintln!("gctd: automatic modem initialization started ({bytes} HCI bytes)");
     }
-    daemon_loop(&mut modem, &mut server, &mut bridge, &glif_rx)
+    daemon_loop(
+        &mut modem,
+        &mut server,
+        &mut bridge,
+        &glif_rx,
+        &mut ipv6_prefix,
+    )
 }
 
 fn resolve_device_id(
@@ -182,14 +192,20 @@ where
 struct ReadySources {
     common: bool,
     glif: bool,
+    ipv6_prefix: bool,
     clients: Vec<u8>,
 }
 
-fn wait_ready(server: &Server, glif_rx: &UnixDatagram) -> io::Result<ReadySources> {
+fn wait_ready<P: AsFd>(
+    server: &Server,
+    glif_rx: &UnixDatagram,
+    ipv6_prefix: &P,
+) -> io::Result<ReadySources> {
     let client_ids = server.client_ids();
-    let mut fds = Vec::with_capacity(client_ids.len() + 2);
+    let mut fds = Vec::with_capacity(client_ids.len() + 3);
     fds.push(PollFd::new(server.common_socket(), PollFlags::IN));
     fds.push(PollFd::new(glif_rx, PollFlags::IN));
+    fds.push(PollFd::new(ipv6_prefix, PollFlags::IN));
     for id in &client_ids {
         fds.push(PollFd::new(server.client_socket(*id)?, PollFlags::IN));
     }
@@ -209,14 +225,16 @@ fn wait_ready(server: &Server, glif_rx: &UnixDatagram) -> io::Result<ReadySource
 
     let common = fds[0].revents().contains(PollFlags::IN);
     let glif = fds[1].revents().contains(PollFlags::IN);
+    let ipv6_prefix = fds[2].revents().contains(PollFlags::IN);
     let clients = client_ids
         .into_iter()
-        .zip(fds.iter().skip(2))
+        .zip(fds.iter().skip(3))
         .filter_map(|(id, fd)| fd.revents().contains(PollFlags::IN).then_some(id))
         .collect();
     Ok(ReadySources {
         common,
         glif,
+        ipv6_prefix,
         clients,
     })
 }
@@ -226,13 +244,14 @@ fn daemon_loop(
     server: &mut Server,
     bridge: &mut DeviceBridge,
     glif_rx: &UnixDatagram,
+    ipv6_prefix: &mut Ipv6PrefixSource,
 ) -> io::Result<()> {
     let mut client_frame = vec![0_u8; LOCAL_FRAME_MAX];
     let mut glif_message = vec![0_u8; OEM_READ_BUFFER_LEN + 1];
     let mut decoder = HciStreamDecoder::new();
 
     loop {
-        let ready = wait_ready(server, glif_rx)?;
+        let ready = wait_ready(server, glif_rx, ipv6_prefix)?;
         if ready.common {
             match server.accept_open_once() {
                 Ok(Some(client)) => eprintln!(
@@ -266,7 +285,35 @@ fn daemon_loop(
                 bridge,
             )?;
         }
+
+        if ready.ipv6_prefix {
+            handle_ipv6_prefix_message(ipv6_prefix, bridge)?;
+        }
     }
+}
+
+fn handle_ipv6_prefix_message(
+    source: &mut Ipv6PrefixSource,
+    bridge: &mut DeviceBridge,
+) -> io::Result<()> {
+    for event in source.receive()? {
+        let Some(interface) = interface_name(event.interface_index)? else {
+            eprintln!(
+                "gctd: IPv6 prefix for unknown interface index {} ignored",
+                event.interface_index
+            );
+            continue;
+        };
+        if bridge.apply_ipv6_prefix(&interface, event.prefix) {
+            eprintln!(
+                "gctd: IPv6 /{} prefix state updated for {interface}",
+                event.prefix_length
+            );
+        } else {
+            eprintln!("gctd: IPv6 prefix for unrelated interface {interface} ignored");
+        }
+    }
+    Ok(())
 }
 
 fn handle_client_datagram(
@@ -464,15 +511,17 @@ mod tests {
         let mut server = Server::bind_paths(base.join("daemon"), base.join("client-"))
             .unwrap_or_else(|_| std::process::abort());
         let (glif_rx, glif_tx) = UnixDatagram::pair().unwrap_or_else(|_| std::process::abort());
+        let (prefix_rx, prefix_tx) = UnixDatagram::pair().unwrap_or_else(|_| std::process::abort());
 
         glif_tx
             .send(&[GLIF_MESSAGE_EOF])
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
-            wait_ready(&server, &glif_rx).unwrap_or_else(|_| std::process::abort()),
+            wait_ready(&server, &glif_rx, &prefix_rx).unwrap_or_else(|_| std::process::abort()),
             ReadySources {
                 common: false,
                 glif: true,
+                ipv6_prefix: false,
                 clients: Vec::new(),
             }
         );
@@ -486,14 +535,28 @@ mod tests {
         peer.send_to(&[0x01, 0x00, 0x00, 0x00], server.common_path())
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
-            wait_ready(&server, &glif_rx).unwrap_or_else(|_| std::process::abort()),
+            wait_ready(&server, &glif_rx, &prefix_rx).unwrap_or_else(|_| std::process::abort()),
             ReadySources {
                 common: true,
                 glif: false,
+                ipv6_prefix: false,
                 clients: Vec::new(),
             }
         );
         let _ = server.accept_open_once();
+
+        prefix_tx
+            .send(&[1])
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            wait_ready(&server, &glif_rx, &prefix_rx).unwrap_or_else(|_| std::process::abort()),
+            ReadySources {
+                common: false,
+                glif: false,
+                ipv6_prefix: true,
+                clients: Vec::new(),
+            }
+        );
 
         drop(peer);
         drop(server);

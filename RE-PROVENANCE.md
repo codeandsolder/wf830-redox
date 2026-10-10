@@ -1818,22 +1818,41 @@ sets the final gateway octet to bitwise-NOT of the assigned final octet (or
 `1` when the assigned octet is `255`). This odd rule is intentional stock
 behavior.
 
-IPv6 is the remaining blocker to declaring command 7 compatible. The modem
-callback supplies only the low 64-bit interface ID. The live helper at `0x3d248`
-copies those eight bytes into the low half of `ipv6_address` and immediately
-invokes `io_ioctl_by_ifname`; the high 64-bit prefix and related host-network
-state are completed later by the SDK's kernel/network IPv6 event path. The clean
-bridge now exposes an explicit prefix/state merge hook, but `gctd` has no proven
-runtime source feeding that hook yet. Until that source is recovered and wired,
-command 7 must not be presented as full dual-stack parity: modem-only state would
-silently become incomplete after host IPv6 configuration.
+The host-side IPv6 completion path is now recovered end-to-end. Live
+`ipv6_evt_init@0x6f060` creates an `AF_NETLINK`/`SOCK_RAW` socket using the
+default `NETLINK_ROUTE` protocol and binds multicast mask **`0x20000`**
+(`RTMGRP_IPV6_PREFIX`). Its worker receives into a 4096-byte buffer, walks
+aligned netlink messages, and dispatches only **`RTM_NEWPREFIX` (52)**. The
+prefix handler requires `AF_INET6` and prefix-information type **3**, parses the
+standard `prefixmsg` attributes, consumes `PREFIX_ADDRESS`, resolves
+`prefix_ifindex` to the interface name, and finds the corresponding live NIC
+slot.
 
-The architecture-cleanup test suite now locks the local command-7 object length and
+That handler then injects a compact internal PDN-manager event containing NIC
+type, default EPS ID, and the first eight prefix bytes.
+`pdn_manager_event_notify@0x3eb60` event type **1** resolves the same NIC record;
+the helper at `0x3d114` copies those eight bytes into the high half of the
+record's IPv6 address at `0x16a` and establishes the recovered link-local
+gateway prefix. This is the missing sibling of the modem callback, which owns
+the low 64-bit interface ID and IPv6 DNS values.
+
+`gctd` now mirrors that source directly with a safe `rustix` rtnetlink listener:
+it subscribes to `RTMGRP_IPV6_PREFIX`, accepts only the proven
+`RTM_NEWPREFIX`/IPv6/prefix-information shape, resolves the kernel interface
+index through `/sys/class/net`, and feeds `DeviceBridge::apply_ipv6_prefix`.
+The OEM helper also shells out to delete an IPv6 route while processing the
+notification; that unrelated host-network side effect is deliberately not
+copied into the compatibility state path.
+
+The architecture-cleanup test suite locks the local command-7 object length and
 shared-memory offset plus an end-to-end typed Attach -> compatibility-state ->
-`_NETWORK_CONNECT_INFO` snapshot path. It checks slot compaction/count, NIC naming,
-APN type/default EPS ID, APN bytes, PDN/IP-allocation state, IPv4 address/DNS/MTU,
-the recovered classful gateway/mask rule, and modem-owned IPv6 interface-ID/DNS
-fields without coupling those checks to stock callback serialization.
+`_NETWORK_CONNECT_INFO` snapshot path. It checks slot compaction/count, NIC
+naming, APN type/default EPS ID, APN bytes, PDN/IP-allocation state, IPv4
+address/DNS/MTU, the recovered classful gateway/mask rule, modem-owned IPv6
+interface-ID/DNS fields, and the rtnetlink prefix parser independently of stock
+callback serialization. The implementation now has every recovered state feed
+required by command 7; live target validation remains a deployment/runtime
+validation task rather than a known architectural gap.
 
 ## Live P4 NAS configuration — shipped request path, dormant completion path
 

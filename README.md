@@ -16,7 +16,7 @@ Current crates:
 - `lted-sysv`: bounded System V shared-memory/semaphore compatibility for stock clients.
 - `lted-compat`: stock local client/socket lifecycle and shared-context access.
 - `lted-bridge`: translation between the stock client ABI and clean modem/runtime semantics, including compatibility-only state.
-- `gctd`: process integration and polling/event-loop wiring for the layers above.
+- `gctd`: process integration and polling/event-loop wiring for the layers above, including the recovered rtnetlink IPv6-prefix feed.
 
 The dependency direction is deliberate: modem wire data is decoded into typed
 semantics before compatibility translation. Historical stock ABI byte layouts are
@@ -26,6 +26,6 @@ stock callback images.
 
 The rule is evidence first: guessed layouts do not enter executable protocol
 code. Every recovered constant should be traceable to either upstream GCT/Linux
-source or a specific OEM function/disassembly. A compatibility path that still
-lacks a required host/modem state feed remains work in progress rather than
-silently returning plausible-but-incomplete data.
+source or a specific OEM function/disassembly. Host-derived compatibility state
+is wired from the proven kernel event source rather than synthesized from
+plausible defaults.
