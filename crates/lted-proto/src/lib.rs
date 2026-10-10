@@ -162,6 +162,11 @@ pub struct UnknownEvent(pub u16);
 pub enum SdkCommand {
     GetPsInitComplete = 0,
     GetDeviceInformation = 3,
+    SetApnType = 14,
+    GetApnType = 15,
+    GetApnTypeByDefaultEpsId = 16,
+    DeleteApnTypeFromTidNode = 17,
+    AddSpecialTid = 18,
     Attach = 25,
     AttachExt = 27,
     Detach = 29,
@@ -201,6 +206,11 @@ impl TryFrom<u16> for SdkCommand {
         match value {
             0 => Ok(Self::GetPsInitComplete),
             3 => Ok(Self::GetDeviceInformation),
+            14 => Ok(Self::SetApnType),
+            15 => Ok(Self::GetApnType),
+            16 => Ok(Self::GetApnTypeByDefaultEpsId),
+            17 => Ok(Self::DeleteApnTypeFromTidNode),
+            18 => Ok(Self::AddSpecialTid),
             25 => Ok(Self::Attach),
             27 => Ok(Self::AttachExt),
             29 => Ok(Self::Detach),
@@ -645,6 +655,17 @@ mod tests {
             SdkCommand::try_from(3),
             Ok(SdkCommand::GetDeviceInformation)
         );
+        assert_eq!(SdkCommand::try_from(14), Ok(SdkCommand::SetApnType));
+        assert_eq!(SdkCommand::try_from(15), Ok(SdkCommand::GetApnType));
+        assert_eq!(
+            SdkCommand::try_from(16),
+            Ok(SdkCommand::GetApnTypeByDefaultEpsId)
+        );
+        assert_eq!(
+            SdkCommand::try_from(17),
+            Ok(SdkCommand::DeleteApnTypeFromTidNode)
+        );
+        assert_eq!(SdkCommand::try_from(18), Ok(SdkCommand::AddSpecialTid));
         assert_eq!(SdkCommand::try_from(177), Ok(SdkCommand::SetProtocolInfo));
         assert_eq!(SdkCommand::try_from(207), Ok(SdkCommand::EmmTimerControl));
         assert_eq!(SdkCommand::try_from(208), Ok(SdkCommand::PsmControl));

@@ -1638,6 +1638,82 @@ the final 30-byte image (including SDK `[3,7,18,2]`, driver `[1,0,2,0]`, and
 zero CM/trailing driver bytes), success release, and malformed-response failure
 release.
 
+## Live P4 APN/TID local state — stock commands 14–18
+
+A fresh shipped-callsite census showed that APN/TID bookkeeping is used much
+more broadly than several remaining modem-control families. `cmcc_cm`,
+`lteautocm`, `smartfren`, and `sprint_cm` all use the default-EPS lookup and
+special-TID helpers during normal connection-management paths. These APIs are
+**daemon/SDK local state only**: they do not write GLIF/HCI traffic.
+
+Live P4 `liblted.so` proves five adjacent synchronous SDK commands:
+
+- `LTED_SetAPNType@0x9ff0` → command **14**, exact four-byte APN-type word;
+- `LTED_GetAPNType@0xa1a4` → command **15**, zero params, one-byte result;
+- `LTED_GetAPNTypeByDftEPSid@0xa368` → command **16**, exact BE `u16`
+  default EPS ID, one-byte result;
+- `LTED_DeleteAPNTypeFromTidnode@0xa560` → command **17**, exact seven-byte
+  record;
+- `LTED_AddSpecialTid@0xa718` → command **18**, exact seven-byte record.
+
+Both one-byte query results are copied through shared-context offset
+**`0x977d`**. The wrappers still use the normal synchronous `lte_api_ret` and
+SysV semaphore handoff. There is no callback registration or modem response.
+
+Live `libltesdk.so` narrows the semantics further. `LAPI_SetAPNType@0x43b14`
+accepts only `0..=7` or `0xff` and stores that value in per-device state at
+`device+0x108`; `LAPI_GetAPNType@0x43c68` returns its low byte.
+`LAPI_GetAPNTypeByDftEPSid@0x43d74` delegates to
+`getApnTypeByDefEPSid@0x39e48`, which scans the SDK TID list by the node's BE
+`dft_eps_id` and returns the node APN-type byte, or **`0xff`** when absent.
+
+The exact seven-byte object passed by commands 17/18 is independently recovered
+from `LAPI_AddSpecialTid@0x43fc8`, `tid_list_add_with_tid_type@0x38bf0`, helper
+logging, and shipped callsites:
+
+```text
+mesg_id:u16be | dft_eps_id:u16be | tid_type:u8 | req_apn_type:u8 | ip_alloc:u8
+```
+
+The internal 16-byte SDK list node stores message ID at `0..1`, default EPS ID
+at `2..3`, allocated TID at `4`, TID type at `5`, requested APN type at `6`, IP
+allocation type at `7`, and list linkage in the tail. `query_by_dft_eps_id`
+compares node bytes `2..3`; the successful APN query returns node byte `6`.
+Special adds choose the first free normal TID in `1..=253`. For `tid_type == 1`,
+the OEM helper can migrate APN/default-EPS/IP-allocation fields from an existing
+TID-0 node before deleting that old node; the clean state model preserves that
+semantic hook if such a node is introduced by future normal-TID integration.
+
+Shipped connection-manager callsites match the recovered layout. Reattach code
+zeroes the seven bytes, stores `mesg_id = 0x3101`, `tid_type = 1`, resolves
+`req_apn_type`, reads `ip_alloc` from product configuration, and leaves
+`dft_eps_id = 0`. PDN-disconnect handlers zero the object and populate only
+`req_apn_type` before command 17. This confirms that command 17 semantically
+selects by APN type; its other six bytes are historical structure baggage.
+
+Rust now keeps a small semantic APN/TID ledger in `DeviceBridge` and implements
+commands 14–18 as immediate local completions with **zero GLIF bytes**. Command
+14 enforces the live SDK value domain. Commands 15/16 materialize the one-byte
+result at `0x977d`. Command 18 bounds the table to the recovered `1..=253` TID
+space and command 17 removes the first matching APN-type entry while preserving
+list order. Missing default-EPS lookup returns `0xff` exactly. A missing delete
+is deliberately a no-op: the OEM helper chain can turn "APN type not found"
+into TID 0 and then call `tid_list_del(0)`, an accidental behavior that the
+clean replacement does not reproduce.
+
+The clean daemon does not yet mirror every normal Attach/PDN SDK TID-list side
+effect into this ledger. That means a default-EPS lookup with no explicit
+special mapping can still miss and return `0xff`; shipped connection managers
+already handle that by falling back to stock `LTED_GetApnTypeByName`, which is a
+separate liblted-local product/configuration helper. Integrating the normal TID
+lifecycle belongs with the later authoritative `GetConnectionInfo`/PDN-state
+work rather than being guessed here.
+
+Tests lock command IDs, Set/Get behavior, invalid APN-type failure, exact
+seven-byte Add/Delete decoding, Add→default-EPS query→Delete→`0xff` lifecycle,
+malformed-record rejection before GLIF, zero pending modem state, and an empty
+modem transport for every local helper.
+
 ## Live P4 DMLogExt — transport proven, semantic bridge intentionally deferred
 
 Live P4 proves the DMLogExt transport contract completely: stock SDK command

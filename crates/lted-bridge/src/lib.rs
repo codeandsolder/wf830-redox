@@ -47,6 +47,8 @@ pub const DEVICE_INFORMATION_LEN: usize = 30;
 pub const STOCK_SDK_VERSION: [u8; 4] = [3, 7, 18, 2];
 /// Live-P4 `gdmlte.ko` `DRIVER_VERSION` (`1.0.2`) after stock `GET_DRV_VER` parsing.
 pub const STOCK_DRIVER_VERSION: [u8; 4] = [1, 0, 2, 0];
+/// One-byte stock APN-type query result near the end of the shared context.
+pub const APN_TYPE_RESULT_OFFSET: usize = 0x977d;
 
 #[derive(Debug)]
 pub enum HandleError {
@@ -77,6 +79,7 @@ pub enum HandleError {
     PdnConnectExtCallback(PdnConnectExtCallbackError),
     PdnDisconnectCallback(PdnDisconnectCallbackError),
     TransactionIdsExhausted,
+    ApnState(ApnStateError),
     PlmnSearch(PlmnInfoDecodeError),
     PlmnList(PlmnInfoDecodeError),
     Send(SendCommandError),
@@ -146,6 +149,7 @@ impl std::fmt::Display for HandleError {
                 write!(f, "invalid PDN-disconnect callback payload: {error:?}")
             }
             Self::TransactionIdsExhausted => write!(f, "no free OEM transaction ID in 1..=253"),
+            Self::ApnState(error) => write!(f, "invalid stock APN/TID state request: {error:?}"),
             Self::PlmnSearch(error) => write!(f, "invalid PLMN-search response: {error:?}"),
             Self::PlmnList(error) => write!(f, "invalid PLMN-list response: {error:?}"),
             Self::Send(error) => write!(f, "modem send failed: {error:?}"),
@@ -177,6 +181,7 @@ impl std::error::Error for HandleError {
             | Self::PdnConnectExtCallback(_)
             | Self::PdnDisconnectCallback(_)
             | Self::TransactionIdsExhausted
+            | Self::ApnState(_)
             | Self::PlmnSearch(_)
             | Self::PlmnList(_)
             | Self::Send(_)
@@ -2574,6 +2579,107 @@ pub fn broadcast_plmn_list_callback(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApnStateError {
+    InvalidConfiguredType(u32),
+    TidTableFull,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SpecialTidRecord {
+    message_id: u16,
+    default_eps_id: u16,
+    tid_type: u8,
+    requested_apn_type: u8,
+    ip_allocation: u8,
+}
+
+impl SpecialTidRecord {
+    fn decode(command: u16, bytes: &[u8]) -> Result<Self, HandleError> {
+        let bytes: [u8; 7] = bytes
+            .try_into()
+            .map_err(|_| HandleError::UnexpectedParameters {
+                command,
+                expected: 7,
+                actual: bytes.len(),
+            })?;
+        Ok(Self {
+            message_id: u16::from_be_bytes([bytes[0], bytes[1]]),
+            default_eps_id: u16::from_be_bytes([bytes[2], bytes[3]]),
+            tid_type: bytes[4],
+            requested_apn_type: bytes[5],
+            ip_allocation: bytes[6],
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TidStateEntry {
+    tid: u8,
+    record: SpecialTidRecord,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ApnState {
+    configured_type: u8,
+    tids: Vec<TidStateEntry>,
+}
+
+impl ApnState {
+    const fn new() -> Self {
+        Self {
+            configured_type: 0,
+            tids: Vec::new(),
+        }
+    }
+
+    fn set_configured_type(&mut self, value: u32) -> Result<(), ApnStateError> {
+        let narrowed =
+            u8::try_from(value).map_err(|_| ApnStateError::InvalidConfiguredType(value))?;
+        if narrowed <= 7 || narrowed == 0xff {
+            self.configured_type = narrowed;
+            Ok(())
+        } else {
+            Err(ApnStateError::InvalidConfiguredType(value))
+        }
+    }
+
+    fn apn_type_by_default_eps_id(&self, default_eps_id: u16) -> u8 {
+        self.tids
+            .iter()
+            .find(|entry| entry.record.default_eps_id == default_eps_id)
+            .map_or(0xff, |entry| entry.record.requested_apn_type)
+    }
+
+    fn add_special_tid(&mut self, mut record: SpecialTidRecord) -> Result<(), ApnStateError> {
+        if record.tid_type == 1
+            && let Some(index) = self.tids.iter().position(|entry| entry.tid == 0)
+        {
+            let normal = self.tids.remove(index).record;
+            record.default_eps_id = normal.default_eps_id;
+            record.requested_apn_type = normal.requested_apn_type;
+            record.ip_allocation = normal.ip_allocation;
+        }
+        let Some(tid) =
+            (1_u8..=253).find(|candidate| !self.tids.iter().any(|entry| entry.tid == *candidate))
+        else {
+            return Err(ApnStateError::TidTableFull);
+        };
+        self.tids.push(TidStateEntry { tid, record });
+        Ok(())
+    }
+
+    fn delete_by_apn_type(&mut self, apn_type: u8) {
+        if let Some(index) = self
+            .tids
+            .iter()
+            .position(|entry| entry.record.requested_apn_type == apn_type)
+        {
+            self.tids.remove(index);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartupPhase {
     Idle,
     AwaitingPsInit,
@@ -2594,6 +2700,7 @@ pub struct DeviceBridge {
     pending: PendingRequests,
     startup_phase: StartupPhase,
     deferred_calls: Vec<DeferredSdkCall>,
+    apn_state: ApnState,
 }
 
 impl DeviceBridge {
@@ -2604,6 +2711,7 @@ impl DeviceBridge {
             pending: PendingRequests::new(),
             startup_phase: StartupPhase::Idle,
             deferred_calls: Vec::new(),
+            apn_state: ApnState::new(),
         }
     }
 
@@ -2708,6 +2816,15 @@ impl DeviceBridge {
                 Ok(SdkCommand::GetDeviceInformation) => {
                     self.dispatch_device_information(modem, request)
                 }
+                Ok(
+                    SdkCommand::SetApnType
+                    | SdkCommand::GetApnType
+                    | SdkCommand::GetApnTypeByDefaultEpsId
+                    | SdkCommand::DeleteApnTypeFromTidNode
+                    | SdkCommand::AddSpecialTid,
+                ) => self.dispatch_apn_state(request, |value| {
+                    context.write(APN_TYPE_RESULT_OFFSET, &[value])
+                }),
                 Ok(SdkCommand::Attach) => self.dispatch_attach(modem, request),
                 Ok(SdkCommand::AttachExt) => self.dispatch_attach_ext(modem, request),
                 Ok(SdkCommand::Detach) => self.dispatch_detach(modem, request),
@@ -3117,6 +3234,76 @@ impl DeviceBridge {
             }
         }
         Err(HandleError::TransactionIdsExhausted)
+    }
+
+    fn dispatch_apn_state<F>(
+        &mut self,
+        request: SdkApiRequest<'_>,
+        mut write_result: F,
+    ) -> Result<HandledCall, HandleError>
+    where
+        F: FnMut(u8) -> io::Result<()>,
+    {
+        let command = request
+            .known_command()
+            .map_err(|_| HandleError::UnsupportedCommand(request.command))?;
+        match command {
+            SdkCommand::SetApnType => {
+                let bytes: [u8; 4] =
+                    request
+                        .params
+                        .try_into()
+                        .map_err(|_| HandleError::UnexpectedParameters {
+                            command: request.command,
+                            expected: 4,
+                            actual: request.params.len(),
+                        })?;
+                self.apn_state
+                    .set_configured_type(u32::from_be_bytes(bytes))
+                    .map_err(HandleError::ApnState)?;
+            }
+            SdkCommand::GetApnType => {
+                if !request.params.is_empty() {
+                    return Err(HandleError::UnexpectedParameters {
+                        command: request.command,
+                        expected: 0,
+                        actual: request.params.len(),
+                    });
+                }
+                write_result(self.apn_state.configured_type)?;
+            }
+            SdkCommand::GetApnTypeByDefaultEpsId => {
+                let bytes: [u8; 2] =
+                    request
+                        .params
+                        .try_into()
+                        .map_err(|_| HandleError::UnexpectedParameters {
+                            command: request.command,
+                            expected: 2,
+                            actual: request.params.len(),
+                        })?;
+                write_result(
+                    self.apn_state
+                        .apn_type_by_default_eps_id(u16::from_be_bytes(bytes)),
+                )?;
+            }
+            SdkCommand::DeleteApnTypeFromTidNode => {
+                let record = SpecialTidRecord::decode(request.command, request.params)?;
+                self.apn_state.delete_by_apn_type(record.requested_apn_type);
+            }
+            SdkCommand::AddSpecialTid => {
+                let record = SpecialTidRecord::decode(request.command, request.params)?;
+                self.apn_state
+                    .add_special_tid(record)
+                    .map_err(HandleError::ApnState)?;
+            }
+            _ => return Err(HandleError::UnsupportedCommand(request.command)),
+        }
+        Ok(HandledCall {
+            command,
+            device_id: request.device_id,
+            bytes_written: 0,
+        })
     }
 
     fn dispatch_device_information<T: Write>(
@@ -3790,16 +3977,17 @@ mod tests {
     };
 
     use super::{
-        BroadcastReport, DEVICE_INFORMATION_LEN, DEVICE_INFORMATION_OFFSET, DeviceBridge,
-        HandleError, LTE_API_RET_OFFSET, LegacyAttachDecodeError, LegacyAttachExtDecodeError,
-        LegacyAttachExtStringField, LegacyAttachStringField, LegacyPdnConnectDecodeError,
-        LegacyPdnConnectExtDecodeError, LegacyPdnConnectExtStringField,
-        LegacyPdnConnectStringField, LegacyPdnDisconnectDecodeError,
-        LegacyRrcCapabilityDecodeError, LegacySetProtocolInfoDecodeError, LegacyUiccDecodeError,
-        PS_INIT_COMPLETE_OFFSET, StartupPhase, UiccCallbackError, broadcast_result_callback,
-        decode_legacy_attach, decode_legacy_attach_ext, decode_legacy_pdn_connect_ext,
-        decode_legacy_pdn_disconnect, decode_legacy_rrc_capability_get,
-        decode_legacy_rrc_capability_set, decode_legacy_set_protocol_info,
+        APN_TYPE_RESULT_OFFSET, ApnStateError, BroadcastReport, DEVICE_INFORMATION_LEN,
+        DEVICE_INFORMATION_OFFSET, DeviceBridge, HandleError, LTE_API_RET_OFFSET,
+        LegacyAttachDecodeError, LegacyAttachExtDecodeError, LegacyAttachExtStringField,
+        LegacyAttachStringField, LegacyPdnConnectDecodeError, LegacyPdnConnectExtDecodeError,
+        LegacyPdnConnectExtStringField, LegacyPdnConnectStringField,
+        LegacyPdnDisconnectDecodeError, LegacyRrcCapabilityDecodeError,
+        LegacySetProtocolInfoDecodeError, LegacyUiccDecodeError, PS_INIT_COMPLETE_OFFSET,
+        StartupPhase, UiccCallbackError, broadcast_result_callback, decode_legacy_attach,
+        decode_legacy_attach_ext, decode_legacy_pdn_connect_ext, decode_legacy_pdn_disconnect,
+        decode_legacy_rrc_capability_get, decode_legacy_rrc_capability_set,
+        decode_legacy_set_protocol_info,
     };
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -3867,6 +4055,16 @@ mod tests {
             .read(LTE_API_RET_OFFSET, &mut bytes)
             .unwrap_or_else(|_| std::process::abort());
         i32::from_be_bytes(bytes)
+    }
+
+    fn read_shared_byte(server: &mut Server, id: u8, offset: usize) -> u8 {
+        let mut byte = [0_u8; 1];
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .read(offset, &mut byte)
+            .unwrap_or_else(|_| std::process::abort());
+        byte[0]
     }
 
     fn bind_server(dir: &TestDir) -> Server {
@@ -7362,6 +7560,187 @@ mod tests {
                 maximum: 100,
                 actual: 101,
             })
+        );
+    }
+
+    #[test]
+    fn stock_local_apn_type_set_get_and_validation_never_touch_glif() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_set_client, set_id) = open_client(&mut server, &dir, 0);
+        let (_get_client, get_id) = open_client(&mut server, &dir, 1);
+        let (_bad_client, bad_id) = open_client(&mut server, &dir, 2);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        let set = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                set_id,
+                SdkApiRequest {
+                    command: SdkCommand::SetApnType as u16,
+                    device_id: 1,
+                    params: &[0, 0, 0, 3],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(set.bytes_written, 0);
+        assert_eq!(read_api_ret(&mut server, set_id), 0);
+
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                get_id,
+                SdkApiRequest {
+                    command: SdkCommand::GetApnType as u16,
+                    device_id: 1,
+                    params: &[],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(read_api_ret(&mut server, get_id), 0);
+        assert_eq!(
+            read_shared_byte(&mut server, get_id, APN_TYPE_RESULT_OFFSET),
+            3
+        );
+
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                bad_id,
+                SdkApiRequest {
+                    command: SdkCommand::SetApnType as u16,
+                    device_id: 1,
+                    params: &[0, 0, 0, 8],
+                },
+            ),
+            Err(HandleError::ApnState(ApnStateError::InvalidConfiguredType(
+                8
+            )))
+        ));
+        assert_eq!(read_api_ret(&mut server, bad_id), 1);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn stock_special_tid_add_query_delete_matches_live_local_state_contract() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_add_client, add_id) = open_client(&mut server, &dir, 0);
+        let (_query_client, query_id) = open_client(&mut server, &dir, 1);
+        let (_delete_client, delete_id) = open_client(&mut server, &dir, 2);
+        let (_missing_client, missing_id) = open_client(&mut server, &dir, 3);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                add_id,
+                SdkApiRequest {
+                    command: SdkCommand::AddSpecialTid as u16,
+                    device_id: 1,
+                    params: &[0x31, 0x01, 0, 0x2a, 1, 4, 2],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(read_api_ret(&mut server, add_id), 0);
+
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                query_id,
+                SdkApiRequest {
+                    command: SdkCommand::GetApnTypeByDefaultEpsId as u16,
+                    device_id: 1,
+                    params: &[0, 0x2a],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            read_shared_byte(&mut server, query_id, APN_TYPE_RESULT_OFFSET),
+            4
+        );
+
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                delete_id,
+                SdkApiRequest {
+                    command: SdkCommand::DeleteApnTypeFromTidNode as u16,
+                    device_id: 1,
+                    params: &[0, 0, 0, 0, 0, 4, 0],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(read_api_ret(&mut server, delete_id), 0);
+
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                missing_id,
+                SdkApiRequest {
+                    command: SdkCommand::GetApnTypeByDefaultEpsId as u16,
+                    device_id: 1,
+                    params: &[0, 0x2a],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            read_shared_byte(&mut server, missing_id, APN_TYPE_RESULT_OFFSET),
+            0xff
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn malformed_special_tid_record_is_rejected_before_glif() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::AddSpecialTid as u16,
+                    device_id: 1,
+                    params: &[0x31, 0x01, 0, 0, 1, 4],
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                expected: 7,
+                actual: 6,
+                ..
+            })
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
         );
     }
 
