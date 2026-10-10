@@ -30,6 +30,7 @@ pub enum SdkCallbackKind {
     PdnDisconnect,
     PlmnSearch,
     PlmnSearchStop,
+    ContentsResetAndDelete,
     PlmnList,
     Online,
     Offline,
@@ -66,6 +67,7 @@ impl SdkCallbackKind {
             Self::PdnDisconnect => 37,
             Self::PlmnSearch => 41,
             Self::PlmnSearchStop => 64,
+            Self::ContentsResetAndDelete => 66,
             Self::PlmnList => 45,
             Self::Online => 59,
             Self::Offline => 62,
@@ -102,6 +104,7 @@ impl SdkCallbackKind {
             Self::PdnDisconnect => 8,
             Self::PlmnSearch => 9,
             Self::PlmnSearchStop => 20,
+            Self::ContentsResetAndDelete => 21,
             Self::PlmnList => 11,
             Self::Online => 18,
             Self::Offline => 19,
@@ -192,6 +195,7 @@ pub enum SdkCommand {
     Online = 58,
     Offline = 60,
     PlmnSearchStop = 63,
+    ContentsResetAndDelete = 65,
     PsInit = 67,
     MobileIdRead = 76,
     IccidRead = 78,
@@ -241,6 +245,7 @@ impl TryFrom<u16> for SdkCommand {
             58 => Ok(Self::Online),
             60 => Ok(Self::Offline),
             63 => Ok(Self::PlmnSearchStop),
+            65 => Ok(Self::ContentsResetAndDelete),
             67 => Ok(Self::PsInit),
             76 => Ok(Self::MobileIdRead),
             78 => Ok(Self::IccidRead),
@@ -871,6 +876,11 @@ mod tests {
         assert_eq!(SdkCallbackKind::PlmnSearch.registration_offset(), 0x4c);
         assert_eq!(SdkCallbackKind::PlmnSearchStop.callback_id(), 64);
         assert_eq!(SdkCallbackKind::PlmnSearchStop.registration_offset(), 0xa4);
+        assert_eq!(SdkCallbackKind::ContentsResetAndDelete.callback_id(), 66);
+        assert_eq!(
+            SdkCallbackKind::ContentsResetAndDelete.registration_offset(),
+            0xac
+        );
         assert_eq!(SdkCallbackKind::PlmnList.callback_id(), 45);
         assert_eq!(SdkCallbackKind::PlmnList.registration_offset(), 0x5c);
         assert_eq!(SdkCallbackKind::Online.callback_id(), 59);

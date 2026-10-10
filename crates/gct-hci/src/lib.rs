@@ -343,6 +343,8 @@ pub mod recovered_opcode {
     pub const PLMN_SEARCH_REQUEST_EXT: u16 = 0x315a;
     pub const PLMN_LIST_REQUEST: u16 = 0x310b;
     pub const PLMN_SEARCH_STOP_REQUEST: u16 = 0x3127;
+    /// Live contents-reset/delete request; unlike adjacent request families this opcode is in the `0xb1xx` range.
+    pub const CONTENTS_RESET_AND_DELETE_REQUEST: u16 = 0xb173;
     pub const ONLINE_REQUEST: u16 = 0x3121;
     pub const OFFLINE_REQUEST: u16 = 0x3123;
     pub const PS_INIT_REQUEST: u16 = 0x312e;
@@ -380,6 +382,8 @@ pub mod recovered_opcode {
     pub const PLMN_SEARCH_RESPONSE_EXT_DORMANT: u16 = 0xb15b;
     pub const PLMN_LIST_RESPONSE: u16 = 0xb10c;
     pub const PLMN_SEARCH_STOP_RESPONSE: u16 = 0xb128;
+    /// Live dispatch-table response for contents reset/delete.
+    pub const CONTENTS_RESET_AND_DELETE_RESPONSE: u16 = 0xb174;
     pub const ONLINE_RESPONSE: u16 = 0xb122;
     pub const OFFLINE_RESPONSE: u16 = 0xb124;
     pub const PS_INIT_RESPONSE: u16 = 0xb12f;

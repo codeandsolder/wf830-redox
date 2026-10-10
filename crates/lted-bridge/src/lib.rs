@@ -16,7 +16,8 @@ mod state;
 pub use callbacks::{RrcCapabilityCallbackError, UiccCallbackError};
 use callbacks::{
     broadcast_at_callback, broadcast_at_ext_callback, broadcast_attach_callback,
-    broadcast_attach_ext_callback, broadcast_detach_callback, broadcast_detach_required_callback,
+    broadcast_attach_ext_callback, broadcast_contents_reset_and_delete_callback,
+    broadcast_detach_callback, broadcast_detach_required_callback,
     broadcast_emm_ni_reattach_callback, broadcast_emm_reattach_report_callback,
     broadcast_iccid_callback, broadcast_mobile_id_callback, broadcast_msisdn_callback,
     broadcast_pdn_connect_callback, broadcast_pdn_connect_ext_callback,
@@ -49,9 +50,9 @@ use gct_lapi::{
     attach::{AttachExtResponse, AttachResponse, DetachRequest},
     common::{EmptyRequest, ResultResponse, ResultResponseKind},
     emm::{
-        EmmNiReattachControlRequest, EmmTimerControlRequest, EmmTimerStartRequest,
-        LcsControlRequest, LppControlRequest, NasConfigGetRequest, NasConfigSetRequest,
-        PsmControlRequest, UeModeChangeRequest, UeModeChangeResponse,
+        ContentsResetAndDeleteRequest, EmmNiReattachControlRequest, EmmTimerControlRequest,
+        EmmTimerStartRequest, LcsControlRequest, LppControlRequest, NasConfigGetRequest,
+        NasConfigSetRequest, PsmControlRequest, UeModeChangeRequest, UeModeChangeResponse,
     },
     misc::{
         DeviceInformationRequest, DeviceInformationResponse, IccidReadRequest, MobileIdReadRequest,
@@ -439,6 +440,9 @@ impl DeviceBridge {
                 Ok(SdkCommand::PlmnSearch) => self.dispatch_plmn_search(modem, request),
                 Ok(SdkCommand::PlmnSearchExt) => self.dispatch_plmn_search_ext(modem, request),
                 Ok(SdkCommand::PlmnSearchStop) => self.dispatch_plmn_search_stop(modem, request),
+                Ok(SdkCommand::ContentsResetAndDelete) => {
+                    self.dispatch_contents_reset_and_delete(modem, request)
+                }
                 Ok(SdkCommand::MobileIdRead) => self.dispatch_mobile_id_read(modem, request),
                 Ok(SdkCommand::IccidRead) => self.dispatch_iccid_read(modem, request),
                 Ok(SdkCommand::MsisdnRead) => self.dispatch_msisdn_read(modem, request),
@@ -711,6 +715,28 @@ impl DeviceBridge {
         broadcast_ue_mode_change_callback(server, self.device_id, response).map(Some)
     }
 
+    fn handle_rf_status_report_control_event(
+        &mut self,
+        server: &mut Server,
+        response: gct_lapi::rf::RfStatusReportControlResponse,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        if !self.pending.remove(ResponseKey::RfStatusReportControl) {
+            return Ok(None);
+        }
+        broadcast_rf_status_report_control_callback(server, self.device_id, response).map(Some)
+    }
+
+    fn handle_contents_reset_and_delete_event(
+        &mut self,
+        server: &mut Server,
+        response: gct_lapi::emm::ContentsResetAndDeleteResponse,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        if !self.pending.remove(ResponseKey::ContentsResetAndDelete) {
+            return Ok(None);
+        }
+        broadcast_contents_reset_and_delete_callback(server, self.device_id, response).map(Some)
+    }
+
     fn handle_result_event(
         &mut self,
         server: &mut Server,
@@ -904,11 +930,7 @@ impl DeviceBridge {
                 broadcast_emm_reattach_report_callback(server, self.device_id, *report).map(Some)
             }
             ModemEvent::RfStatusReportControl(response) => {
-                if !self.pending.remove(ResponseKey::RfStatusReportControl) {
-                    return Ok(None);
-                }
-                broadcast_rf_status_report_control_callback(server, self.device_id, *response)
-                    .map(Some)
+                self.handle_rf_status_report_control_event(server, *response)
             }
             ModemEvent::RfMeasureReport(response) => {
                 if !self.pending.remove(ResponseKey::RfMeasureReport) {
@@ -922,6 +944,9 @@ impl DeviceBridge {
             }
             ModemEvent::Result { kind, response } => {
                 self.handle_result_event(server, *kind, *response)
+            }
+            ModemEvent::ContentsResetAndDelete(response) => {
+                self.handle_contents_reset_and_delete_event(server, *response)
             }
             ModemEvent::PlmnSearchStop(response) => {
                 let key = ResponseKey::PlmnSearchStop(response.search_type);
@@ -1391,6 +1416,33 @@ impl DeviceBridge {
         )?;
         Ok(HandledCall {
             command: SdkCommand::UeModeChange,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_contents_reset_and_delete<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let bytes: [u8; 4] =
+            request
+                .params
+                .try_into()
+                .map_err(|_| HandleError::UnexpectedParameters {
+                    command: request.command,
+                    expected: 4,
+                    actual: request.params.len(),
+                })?;
+        let bytes_written = modem.send_tracked_command(
+            &mut self.pending,
+            ModemCommand::ContentsResetAndDelete(ContentsResetAndDeleteRequest {
+                mask_id: u32::from_be_bytes(bytes),
+            }),
+        )?;
+        Ok(HandledCall {
+            command: SdkCommand::ContentsResetAndDelete,
             device_id: request.device_id,
             bytes_written,
         })
@@ -5591,6 +5643,94 @@ mod tests {
             &[
                 0x00, 0x00, 0x02, 0x03, 0xff, 0xba, 0xff, 0xa1, 0xff, 0xf4, 0x00, 0x19,
             ]
+        );
+    }
+
+    #[test]
+    fn stock_contents_reset_and_delete_round_trips_exact_live_p4_contract() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, id) = open_client(&mut server, &dir, 0);
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(
+                SdkCallbackKind::ContentsResetAndDelete.registration_offset(),
+                1,
+            )
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::ContentsResetAndDelete as u16,
+                    device_id: 0x1122_3344,
+                    params: &[0x00, 0x00, 0x00, 0x03],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.bytes_written, 8);
+        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![0xb1, 0x73, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03]
+        );
+
+        assert_eq!(
+            route_one_hci(&mut bridge, &mut server, hci_frame(0xb174, &[0x00]),),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 24];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 66);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(callback.data, &[0x00]);
+    }
+
+    #[test]
+    fn malformed_stock_contents_reset_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::ContentsResetAndDelete as u16,
+                    device_id: 1,
+                    params: &[0, 0, 3],
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                command: 65,
+                expected: 4,
+                actual: 3,
+            })
+        ));
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
         );
     }
 

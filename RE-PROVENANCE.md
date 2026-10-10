@@ -501,6 +501,38 @@ frames, pending retirement, callback selectors/registration gating, callback
 memory images, the unsolicited indication path, and malformed local request
 rejection before modem I/O.
 
+## Contents reset/delete — narrow NAS cache compatibility, not a generic factory reset
+
+The shipped automatic connection manager imports `LTED_ContentsResetAndDeleteRequest`,
+but older project notes described it too broadly as a factory reset. Executable and
+baseband evidence now pins the actual compatibility surface much more narrowly.
+
+Live `liblted.so::LTED_ContentsResetAndDeleteRequest@0x8fc8` emits stock SDK command
+**65** with exactly four caller bytes. B014 DWARF independently names the four-byte
+request `_CONTENTS_RESET_AND_DELETE_REQ { maskID:u32 }`. The two shipped `lteautocm`
+call sites both build `maskID = 3` while handling explicit `+CFUN` reset/reboot paths;
+this is not part of ordinary Attach/PDN operation. Baseband strings name the relevant
+NAS EMM cache classes `LAPI_CONTENT_RESET_DELETE_T3402` and
+`LAPI_CONTENT_RESET_DELETE_TAI`, so the implementation deliberately describes the
+operation as selected EMM-cache reset/delete rather than a device factory reset.
+
+The live modem wire is fully recovered without opcode adjacency inference.
+`LAPI_ContentsResetAndDeleteRequest@0x497fc` passes **`0xb173`** through `H2D()` and
+sends one converted `u32` payload. In the live SDK response dispatch table at
+`0x8e704`, entry **`0xb174`** points directly to converter **`0x12428`**. That
+converter resolves SDK callback slot **21**, allocates exactly one result byte, copies
+one HCI payload byte, and invokes the registered callback. Live `lted` handler
+`ind_contents_reset_and_delete_response@0x25724` forwards that one-byte object as
+stock callback selector **66**. The generic stock registration formula therefore puts
+this callback at `cb_rsp[21]`, offset **`0xac`**.
+
+Rust models this only as a client-triggered compatibility exchange:
+`ContentsResetAndDeleteRequest { mask_id }` -> `0xb173`, tracked family response
+`0xb174` -> one-byte `ContentsResetAndDeleteResponse` -> stock callback 66. `gctd`
+never initiates this cache mutation autonomously. End-to-end tests lock mask byte
+order, exact HCI framing, pending retirement, callback registration/delivery, and
+malformed local-request rejection before modem I/O.
+
 ## Shared EMM control — timer control, NI reattach, and live widened callbacks
 
 This family is heavily used by the shipping P4 userspace: recovered LTE clients

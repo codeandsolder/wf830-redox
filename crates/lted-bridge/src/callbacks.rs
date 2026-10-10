@@ -9,7 +9,7 @@ use std::io;
 use gct_lapi::{
     attach::{AttachExtResponse, AttachResponse, DetachRequiredIndication, DetachResponse},
     common::{ResultResponse, ResultResponseKind},
-    emm::{EmmReattachControlReport, UeModeChangeResponse},
+    emm::{ContentsResetAndDeleteResponse, EmmReattachControlReport, UeModeChangeResponse},
     misc::{IccidReadResponse, MobileIdReadResponse, MsisdnReadResponse, TemperatureReadResponse},
     pdn::{PdnConnectExtResponse, PdnConnectResponse, PdnDisconnectResponse},
     plmn::{PlmnListResponse, PlmnSearchResponse, PlmnSearchStopResponse},
@@ -943,6 +943,26 @@ pub(crate) fn broadcast_ue_mode_change_callback(
         server,
         device_id,
         SdkCallbackKind::UeModeChange,
+        &[response.result],
+    )
+}
+
+/// Broadcast live-P4 callback 66 for contents reset/delete.
+///
+/// The SDK response converter uses slot 21 and copies exactly one byte; the
+/// daemon forwards that object unchanged as stock callback 66.
+///
+/// # Errors
+/// Returns [`HandleError::Ipc`] for local IPC failures.
+pub(crate) fn broadcast_contents_reset_and_delete_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: ContentsResetAndDeleteResponse,
+) -> Result<BroadcastReport, HandleError> {
+    broadcast_variable_callback(
+        server,
+        device_id,
+        SdkCallbackKind::ContentsResetAndDelete,
         &[response.result],
     )
 }

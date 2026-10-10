@@ -278,6 +278,53 @@ impl EmmControlReport {
     }
 }
 
+/// Reset/delete selected NAS EMM cached contents.
+///
+/// B014 DWARF names the exact four-byte request field `maskID`; the live P4
+/// SDK preserves that value as one device-endian 32-bit word on opcode `0xb173`.
+/// The shipped `lteautocm` uses mask `3` while handling an explicit `+CFUN`
+/// reset path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContentsResetAndDeleteRequest {
+    pub mask_id: u32,
+}
+
+impl ContentsResetAndDeleteRequest {
+    /// Encode the exact four-byte live-P4 request body.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than eight bytes.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        encode_packet(
+            recovered_opcode::CONTENTS_RESET_AND_DELETE_REQUEST,
+            &self.mask_id.to_be_bytes(),
+            output,
+        )
+    }
+}
+
+/// Exact one-byte live-P4 completion object for contents reset/delete.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContentsResetAndDeleteResponse {
+    pub result: u8,
+}
+
+impl ContentsResetAndDeleteResponse {
+    /// Decode response `0xb174`, which the live SDK dispatch table maps to
+    /// callback slot 21 and whose converter copies exactly one payload byte.
+    ///
+    /// # Errors
+    /// Returns [`ResponseDecodeError`] for another opcode or a non-one-byte payload.
+    pub fn parse(packet: Packet<'_>) -> Result<Self, ResponseDecodeError> {
+        let payload = exact_payload(
+            packet,
+            recovered_opcode::CONTENTS_RESET_AND_DELETE_RESPONSE,
+            1,
+        )?;
+        Ok(Self { result: payload[0] })
+    }
+}
+
 /// UE-mode-change request `0x3118`.
 ///
 /// Live P4 `LAPI_UeModeChangeRequest` allocates a five-byte HCI frame and copies

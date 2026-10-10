@@ -24,7 +24,8 @@ use gct_lapi::{
         ResultResponseKind,
     },
     emm::{
-        EmmControlDecodeError, EmmControlReport, EmmControlResponse, EmmNiReattachControlRequest,
+        ContentsResetAndDeleteRequest, ContentsResetAndDeleteResponse, EmmControlDecodeError,
+        EmmControlReport, EmmControlResponse, EmmNiReattachControlRequest,
         EmmReattachControlReport, EmmTimerControlRequest, EmmTimerStartRequest, LcsControlRequest,
         LppControlRequest, NasConfigEncodeError, NasConfigGetRequest, NasConfigSetRequest,
         PsmControlRequest, UeModeChangeRequest, UeModeChangeResponse,
@@ -182,6 +183,7 @@ pub enum ModemEvent<'a> {
     PdnDisconnect(PdnDisconnectResponse<'a>),
     PlmnSearch(PlmnSearchResponse<'a>),
     PlmnSearchStop(PlmnSearchStopResponse),
+    ContentsResetAndDelete(ContentsResetAndDeleteResponse),
     PlmnList(PlmnListResponse<'a>),
     MobileIdRead(MobileIdReadResponse<'a>),
     IccidRead(IccidReadResponse<'a>),
@@ -242,6 +244,7 @@ pub enum ModemCommand<'a> {
     PlmnSearch(PlmnSearchRequest),
     PlmnSearchExt(PlmnSearchExtRequest<'a>),
     PlmnSearchStop(PlmnSearchStopRequest),
+    ContentsResetAndDelete(ContentsResetAndDeleteRequest),
     MobileIdRead(MobileIdReadRequest),
     IccidRead(IccidReadRequest),
     MsisdnRead(MsisdnReadRequest),
@@ -289,6 +292,7 @@ pub enum ResponseKey {
     PdnDisconnect(u8),
     PlmnSearch,
     PlmnSearchStop(u8),
+    ContentsResetAndDelete,
     PlmnList,
     MiscRead,
     UeModeChange,
@@ -322,6 +326,7 @@ impl ModemCommand<'_> {
             }
             Self::PlmnSearch(_) | Self::PlmnSearchExt(_) => Some(ResponseKey::PlmnSearch),
             Self::PlmnSearchStop(request) => Some(ResponseKey::PlmnSearchStop(request.search_type)),
+            Self::ContentsResetAndDelete(_) => Some(ResponseKey::ContentsResetAndDelete),
             Self::MobileIdRead(_)
             | Self::IccidRead(_)
             | Self::MsisdnRead(_)
@@ -390,6 +395,7 @@ impl ModemEvent<'_> {
             Self::PlmnSearchStop(response) => {
                 Some(ResponseKey::PlmnSearchStop(response.search_type))
             }
+            Self::ContentsResetAndDelete(_) => Some(ResponseKey::ContentsResetAndDelete),
             Self::PlmnList(_) => Some(ResponseKey::PlmnList),
             Self::MobileIdRead(_)
             | Self::IccidRead(_)
@@ -605,6 +611,7 @@ pub fn encode_command(
         ModemCommand::PlmnSearch(request) => Ok(request.encode(output)?),
         ModemCommand::PlmnSearchExt(request) => Ok(request.encode(output)?),
         ModemCommand::PlmnSearchStop(request) => Ok(request.encode(output)?),
+        ModemCommand::ContentsResetAndDelete(request) => Ok(request.encode(output)?),
         ModemCommand::MobileIdRead(request) => Ok(request.encode(output)?),
         ModemCommand::IccidRead(request) => Ok(request.encode(output)?),
         ModemCommand::MsisdnRead(request) => Ok(request.encode(output)?),
@@ -695,6 +702,19 @@ fn shared_control_kind(packet: Packet<'_>) -> Result<u16, ResponseDecodeError> {
     Ok(u16::from_be_bytes([packet.payload[2], packet.payload[3]]))
 }
 
+fn decode_misc_read_event(packet: Packet<'_>) -> Result<ModemEvent<'_>, EventDecodeError> {
+    match MiscReadResponse::parse(packet)? {
+        MiscReadResponse::MobileId(response) => Ok(ModemEvent::MobileIdRead(response)),
+        MiscReadResponse::Iccid(response) => Ok(ModemEvent::IccidRead(response)),
+        MiscReadResponse::Msisdn(response) => Ok(ModemEvent::MsisdnRead(response)),
+        MiscReadResponse::Temperature(response) => Ok(ModemEvent::TemperatureRead(response)),
+        MiscReadResponse::Failure { read_result } => {
+            Ok(ModemEvent::MiscReadFailure { read_result })
+        }
+        MiscReadResponse::UnsupportedSuccess => Ok(ModemEvent::Unknown(packet)),
+    }
+}
+
 /// Decode one complete HCI packet into the proven typed P0 surface.
 ///
 /// Unknown opcodes remain available through [`ModemEvent::Unknown`]. Known
@@ -728,6 +748,9 @@ pub fn decode_event(packet: Packet<'_>) -> Result<ModemEvent<'_>, EventDecodeErr
         recovered_opcode::PLMN_SEARCH_STOP_RESPONSE => Ok(ModemEvent::PlmnSearchStop(
             PlmnSearchStopResponse::parse(packet)?,
         )),
+        recovered_opcode::CONTENTS_RESET_AND_DELETE_RESPONSE => Ok(
+            ModemEvent::ContentsResetAndDelete(ContentsResetAndDeleteResponse::parse(packet)?),
+        ),
         recovered_opcode::PLMN_LIST_RESPONSE => {
             Ok(ModemEvent::PlmnList(PlmnListResponse::parse(packet)?))
         }
@@ -792,16 +815,7 @@ pub fn decode_event(packet: Packet<'_>) -> Result<ModemEvent<'_>, EventDecodeErr
         public_opcode::LTE_GET_INFORMATION_RESULT => Ok(ModemEvent::DeviceInformation(
             DeviceInformationResponse::parse(packet)?,
         )),
-        recovered_opcode::MISC_READ_RESPONSE => match MiscReadResponse::parse(packet)? {
-            MiscReadResponse::MobileId(response) => Ok(ModemEvent::MobileIdRead(response)),
-            MiscReadResponse::Iccid(response) => Ok(ModemEvent::IccidRead(response)),
-            MiscReadResponse::Msisdn(response) => Ok(ModemEvent::MsisdnRead(response)),
-            MiscReadResponse::Temperature(response) => Ok(ModemEvent::TemperatureRead(response)),
-            MiscReadResponse::Failure { read_result } => {
-                Ok(ModemEvent::MiscReadFailure { read_result })
-            }
-            MiscReadResponse::UnsupportedSuccess => Ok(ModemEvent::Unknown(packet)),
-        },
+        recovered_opcode::MISC_READ_RESPONSE => decode_misc_read_event(packet),
         _ => Ok(ModemEvent::Unknown(packet)),
     }
 }
