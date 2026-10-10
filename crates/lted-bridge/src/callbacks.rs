@@ -13,6 +13,7 @@ use gct_lapi::{
     misc::{IccidReadResponse, MobileIdReadResponse, MsisdnReadResponse, TemperatureReadResponse},
     pdn::{PdnConnectExtResponse, PdnConnectResponse, PdnDisconnectResponse},
     plmn::{PlmnListResponse, PlmnSearchResponse, PlmnSearchStopResponse},
+    rf::{RfMeasureReportIndication, RfMeasureReportResponse, RfStatusReportControlResponse},
     rrc::{RrcCapabilityGetResponse, RrcCapabilitySetResponse, SetProtocolInfoResponse},
     uicc::{UiccResponse, uicc_control},
 };
@@ -858,6 +859,73 @@ pub(crate) fn broadcast_emm_reattach_report_callback(
         server,
         device_id,
         SdkCallbackKind::EmmReattachControlReport,
+        &data,
+    )
+}
+
+/// Broadcast live-P4 callback 188 (`RF_STATUS_REPORT_CONTROL_RSP`) through
+/// `cb_rsp[95]`. The exact stock object is 12 bytes.
+///
+/// # Errors
+/// Returns [`HandleError::Ipc`] for local IPC failures.
+pub(crate) fn broadcast_rf_status_report_control_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: RfStatusReportControlResponse,
+) -> Result<BroadcastReport, HandleError> {
+    let mut data = [0_u8; 12];
+    data[0..2].copy_from_slice(&response.result.to_be_bytes());
+    data[2..4].copy_from_slice(&response.status.to_be_bytes());
+    data[4..6].copy_from_slice(&response.mode.to_be_bytes());
+    data[6..8].copy_from_slice(&response.prev_rsrp.to_be_bytes());
+    data[8..10].copy_from_slice(&response.cur_rsrp.to_be_bytes());
+    data[10..12].copy_from_slice(&response.thresh.to_be_bytes());
+    broadcast_variable_callback(
+        server,
+        device_id,
+        SdkCallbackKind::RfStatusReportControl,
+        &data,
+    )
+}
+
+/// Broadcast live-P4 callback 203 (`RF_MEASURE_REPORT_RSP`) through
+/// `cb_rsp[106]`. The exact stock object is `result:u16 | status:u16`.
+///
+/// # Errors
+/// Returns [`HandleError::Ipc`] for local IPC failures.
+pub(crate) fn broadcast_rf_measure_report_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: RfMeasureReportResponse,
+) -> Result<BroadcastReport, HandleError> {
+    let mut data = [0_u8; 4];
+    data[0..2].copy_from_slice(&response.result.to_be_bytes());
+    data[2..4].copy_from_slice(&response.status.to_be_bytes());
+    broadcast_variable_callback(server, device_id, SdkCallbackKind::RfMeasureReport, &data)
+}
+
+/// Broadcast unsolicited live-P4 callback 204 (`RF_MEASURE_REPORT_IND`) through
+/// `cb_rsp[107]`. The exact stock object is 12 bytes.
+///
+/// # Errors
+/// Returns [`HandleError::Ipc`] for local IPC failures.
+pub(crate) fn broadcast_rf_measure_report_indication_callback(
+    server: &mut Server,
+    device_id: u32,
+    indication: RfMeasureReportIndication,
+) -> Result<BroadcastReport, HandleError> {
+    let mut data = [0_u8; 12];
+    data[0..2].copy_from_slice(&indication.result.to_be_bytes());
+    data[2] = indication.rrc_state;
+    data[3] = indication.paging_cycle;
+    data[4..6].copy_from_slice(&indication.rssi.to_be_bytes());
+    data[6..8].copy_from_slice(&indication.rsrp.to_be_bytes());
+    data[8..10].copy_from_slice(&indication.rsrq.to_be_bytes());
+    data[10..12].copy_from_slice(&indication.snr.to_be_bytes());
+    broadcast_variable_callback(
+        server,
+        device_id,
+        SdkCallbackKind::RfMeasureReportIndication,
         &data,
     )
 }

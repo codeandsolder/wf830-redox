@@ -21,7 +21,7 @@ impl EmmTimerControlRequest {
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
         let timer_id = self.timer_id.to_be_bytes();
         encode_packet(
-            recovered_opcode::EMM_CONTROL_REQUEST,
+            recovered_opcode::SHARED_CONTROL_REQUEST,
             &[
                 0x00,
                 0x07,
@@ -60,7 +60,7 @@ impl PsmControlRequest {
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
         let ctrl_cmd = self.ctrl_cmd.to_be_bytes();
         encode_packet(
-            recovered_opcode::EMM_CONTROL_REQUEST,
+            recovered_opcode::SHARED_CONTROL_REQUEST,
             &[
                 0x00,
                 0x08,
@@ -92,7 +92,7 @@ impl LcsControlRequest {
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
         let mode = self.mode.to_be_bytes();
         encode_packet(
-            recovered_opcode::EMM_CONTROL_REQUEST,
+            recovered_opcode::SHARED_CONTROL_REQUEST,
             &[0x00, 0x09, 0x00, 0x04, mode[0], mode[1], mode[2], mode[3]],
             output,
         )
@@ -113,7 +113,7 @@ impl LppControlRequest {
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
         let mode = self.mode.to_be_bytes();
         encode_packet(
-            recovered_opcode::EMM_CONTROL_REQUEST,
+            recovered_opcode::SHARED_CONTROL_REQUEST,
             &[0x00, 0x0a, 0x00, 0x04, mode[0], mode[1], mode[2], mode[3]],
             output,
         )
@@ -139,7 +139,7 @@ impl EmmTimerStartRequest {
     /// Returns [`EncodeError::NoSpace`] when `output` is shorter than 11 bytes.
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
         encode_packet(
-            recovered_opcode::EMM_CONTROL_REQUEST,
+            recovered_opcode::SHARED_CONTROL_REQUEST,
             &[
                 0x00,
                 0x0d,
@@ -169,7 +169,7 @@ impl EmmNiReattachControlRequest {
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
         let control = self.control.to_be_bytes();
         encode_packet(
-            recovered_opcode::EMM_CONTROL_REQUEST,
+            recovered_opcode::SHARED_CONTROL_REQUEST,
             &[
                 0x00, 0x0b, 0x00, 0x04, control[0], control[1], control[2], control[3],
             ],
@@ -228,7 +228,7 @@ impl EmmControlResponse {
     /// Returns [`EmmControlDecodeError`] for a malformed opcode or NI-reattach
     /// envelope.
     pub fn parse(packet: Packet<'_>) -> Result<Self, EmmControlDecodeError> {
-        let payload = response_payload(packet, recovered_opcode::EMM_CONTROL_RESPONSE)?;
+        let payload = response_payload(packet, recovered_opcode::SHARED_CONTROL_RESPONSE)?;
         if payload.len() < 4 {
             return Err(ResponseDecodeError::TruncatedPrefix {
                 minimum: 4,
@@ -241,7 +241,7 @@ impl EmmControlResponse {
             return Ok(Self::Unsupported { kind });
         }
         let (_prefix, _kind, value) =
-            parse_emm_control_envelope(packet, recovered_opcode::EMM_CONTROL_RESPONSE)?;
+            parse_emm_control_envelope(packet, recovered_opcode::SHARED_CONTROL_RESPONSE)?;
         Ok(Self::NiReattach { result: value })
     }
 }
@@ -269,7 +269,7 @@ impl EmmControlReport {
     /// Returns [`EmmControlDecodeError`] for a malformed opcode/length envelope.
     pub fn parse(packet: Packet<'_>) -> Result<Self, EmmControlDecodeError> {
         let (prefix, kind, value) =
-            parse_emm_control_envelope(packet, recovered_opcode::EMM_CONTROL_REPORT)?;
+            parse_emm_control_envelope(packet, recovered_opcode::SHARED_CONTROL_REPORT)?;
         Ok(if kind == 11 {
             Self::Reattach(EmmReattachControlReport { prefix, value })
         } else {

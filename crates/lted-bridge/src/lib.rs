@@ -22,9 +22,10 @@ use callbacks::{
     broadcast_pdn_connect_callback, broadcast_pdn_connect_ext_callback,
     broadcast_pdn_disconnect_callback, broadcast_plmn_list_callback,
     broadcast_plmn_search_callback, broadcast_plmn_search_stop_callback, broadcast_result_callback,
-    broadcast_rrc_capability_get_callback, broadcast_rrc_capability_set_callback,
-    broadcast_set_protocol_info_callback, broadcast_temperature_callback,
-    broadcast_ue_mode_change_callback, broadcast_uicc_callback,
+    broadcast_rf_measure_report_callback, broadcast_rf_measure_report_indication_callback,
+    broadcast_rf_status_report_control_callback, broadcast_rrc_capability_get_callback,
+    broadcast_rrc_capability_set_callback, broadcast_set_protocol_info_callback,
+    broadcast_temperature_callback, broadcast_ue_mode_change_callback, broadcast_uicc_callback,
 };
 pub use delivery::BroadcastReport;
 use legacy::{
@@ -61,6 +62,7 @@ use gct_lapi::{
         PlmnInfoDecodeError, PlmnListResponse, PlmnSearchExtRequest, PlmnSearchRequest,
         PlmnSearchStopRequest,
     },
+    rf::{RfMeasureReportRequest, RfStatusReportControlRequest},
     rrc::{RrcCapabilityGetResponse, RrcCapabilitySetResponse, SetProtocolInfoResponse},
     uicc::UiccResponse,
 };
@@ -446,6 +448,10 @@ impl DeviceBridge {
                 Ok(SdkCommand::UiccRequest) => self.dispatch_uicc(modem, request),
                 Ok(SdkCommand::UeModeChange) => self.dispatch_ue_mode_change(modem, request),
                 Ok(SdkCommand::SetProtocolInfo) => self.dispatch_set_protocol_info(modem, request),
+                Ok(SdkCommand::RfStatusReportControl) => {
+                    self.dispatch_rf_status_report_control(modem, request)
+                }
+                Ok(SdkCommand::RfMeasureReport) => self.dispatch_rf_measure_report(modem, request),
                 Ok(SdkCommand::SetNasConfig) => Self::dispatch_nas_config_set(modem, request),
                 Ok(SdkCommand::GetNasConfig) => Self::dispatch_nas_config_get(modem, request),
                 Ok(SdkCommand::EmmTimerControl) => Self::dispatch_emm_timer_control(modem, request),
@@ -897,6 +903,23 @@ impl DeviceBridge {
             ModemEvent::EmmReattachControlReport(report) => {
                 broadcast_emm_reattach_report_callback(server, self.device_id, *report).map(Some)
             }
+            ModemEvent::RfStatusReportControl(response) => {
+                if !self.pending.remove(ResponseKey::RfStatusReportControl) {
+                    return Ok(None);
+                }
+                broadcast_rf_status_report_control_callback(server, self.device_id, *response)
+                    .map(Some)
+            }
+            ModemEvent::RfMeasureReport(response) => {
+                if !self.pending.remove(ResponseKey::RfMeasureReport) {
+                    return Ok(None);
+                }
+                broadcast_rf_measure_report_callback(server, self.device_id, *response).map(Some)
+            }
+            ModemEvent::RfMeasureReportIndication(indication) => {
+                broadcast_rf_measure_report_indication_callback(server, self.device_id, *indication)
+                    .map(Some)
+            }
             ModemEvent::Result { kind, response } => {
                 self.handle_result_event(server, *kind, *response)
             }
@@ -1286,6 +1309,63 @@ impl DeviceBridge {
         )?;
         Ok(HandledCall {
             command: SdkCommand::EmmNiReattachControl,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_rf_status_report_control<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let bytes: [u8; 10] =
+            request
+                .params
+                .try_into()
+                .map_err(|_| HandleError::UnexpectedParameters {
+                    command: request.command,
+                    expected: 10,
+                    actual: request.params.len(),
+                })?;
+        let modem_request = RfStatusReportControlRequest {
+            on_off: u16::from_be_bytes([bytes[0], bytes[1]]),
+            intval_idle: u16::from_be_bytes([bytes[2], bytes[3]]),
+            intval_connect: u16::from_be_bytes([bytes[4], bytes[5]]),
+            thresh_idle: u16::from_be_bytes([bytes[6], bytes[7]]),
+            thresh_connect: u16::from_be_bytes([bytes[8], bytes[9]]),
+        };
+        let bytes_written = modem.send_tracked_command(
+            &mut self.pending,
+            ModemCommand::RfStatusReportControl(modem_request),
+        )?;
+        Ok(HandledCall {
+            command: SdkCommand::RfStatusReportControl,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_rf_measure_report<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let [control]: [u8; 1] =
+            request
+                .params
+                .try_into()
+                .map_err(|_| HandleError::UnexpectedParameters {
+                    command: request.command,
+                    expected: 1,
+                    actual: request.params.len(),
+                })?;
+        let bytes_written = modem.send_tracked_command(
+            &mut self.pending,
+            ModemCommand::RfMeasureReport(RfMeasureReportRequest { control }),
+        )?;
+        Ok(HandledCall {
+            command: SdkCommand::RfMeasureReport,
             device_id: request.device_id,
             bytes_written,
         })
@@ -5340,6 +5420,228 @@ mod tests {
         assert_eq!(callback.callback_id, 309);
         assert_eq!(callback.device_id, 0x1122_3344);
         assert_eq!(callback.data, &[0x12, 0x34, 0xaa, 0xbb, 0xcc, 0xdd]);
+    }
+
+    #[test]
+    fn stock_rf_status_report_control_round_trips_exact_live_p4_contract() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, id) = open_client(&mut server, &dir, 0);
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(
+                SdkCallbackKind::RfStatusReportControl.registration_offset(),
+                1,
+            )
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        let params = [0x00, 0x01, 0x00, 0x3c, 0x00, 0x0a, 0xff, 0x9c, 0xff, 0x88];
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::RfStatusReportControl as u16,
+                    device_id: 0x1122_3344,
+                    params: &params,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.bytes_written, 18);
+        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![
+                0x31, 0x55, 0x00, 0x0e, 0x00, 0x01, 0x00, 0x0a, 0x00, 0x01, 0x00, 0x3c, 0x00, 0x0a,
+                0xff, 0x9c, 0xff, 0x88,
+            ]
+        );
+
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                hci_frame(
+                    0xb156,
+                    &[
+                        0x00, 0x00, 0x00, 0x01, 0x00, 0x0a, 0x00, 0x01, 0x00, 0x02, 0xff, 0x9c,
+                        0xff, 0xa6, 0xff, 0x92,
+                    ],
+                ),
+            ),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 32];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 188);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(
+            callback.data,
+            &[
+                0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0xff, 0x9c, 0xff, 0xa6, 0xff, 0x92,
+            ]
+        );
+    }
+
+    #[test]
+    fn stock_rf_measure_report_round_trips_response_and_unsolicited_indication() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, id) = open_client(&mut server, &dir, 0);
+        let context = server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort());
+        context
+            .write_u32_be(SdkCallbackKind::RfMeasureReport.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+        context
+            .write_u32_be(
+                SdkCallbackKind::RfMeasureReportIndication.registration_offset(),
+                1,
+            )
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::RfMeasureReport as u16,
+                    device_id: 0x1122_3344,
+                    params: &[1],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.bytes_written, 9);
+        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![0x31, 0x55, 0x00, 0x05, 0x00, 0x05, 0x00, 0x01, 0x01]
+        );
+
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                hci_frame(0xb156, &[0x00, 0x00, 0x00, 0x05, 0x00, 0x02, 0x00, 0x01],),
+            ),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 32];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 203);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(callback.data, &[0x00, 0x00, 0x00, 0x01]);
+
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                hci_frame(
+                    0xb164,
+                    &[
+                        0x00, 0x00, 0x00, 0x05, 0x00, 0x0a, 0x02, 0x03, 0xff, 0xba, 0xff, 0xa1,
+                        0xff, 0xf4, 0x00, 0x19,
+                    ],
+                ),
+            ),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        let packet = Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(packet).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 204);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(
+            callback.data,
+            &[
+                0x00, 0x00, 0x02, 0x03, 0xff, 0xba, 0xff, 0xa1, 0xff, 0xf4, 0x00, 0x19,
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_stock_rf_requests_are_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::RfStatusReportControl as u16,
+                    device_id: 1,
+                    params: &[0; 9],
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                command: 187,
+                expected: 10,
+                actual: 9,
+            })
+        ));
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::RfMeasureReport as u16,
+                    device_id: 1,
+                    params: &[],
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                command: 202,
+                expected: 1,
+                actual: 0,
+            })
+        ));
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]

@@ -352,8 +352,8 @@ pub mod recovered_opcode {
     /// Shared read-info request used by Mobile ID and adjacent stock read APIs.
     pub const MISC_READ_REQUEST: u16 = 0x3145;
     pub const UE_MODE_CHANGE_REQUEST: u16 = 0x3118;
-    /// Shared EMM control request used by timer-control and NI-reattach families.
-    pub const EMM_CONTROL_REQUEST: u16 = 0x3155;
+    /// Shared control request used by RF, EMM, PSM, LCS and LPP families.
+    pub const SHARED_CONTROL_REQUEST: u16 = 0x3155;
     /// Set-protocol-info request used by shipped P4 `lteatcm`/`gdmmon`.
     pub const SET_PROTOCOL_INFO_REQUEST: u16 = 0x3151;
     /// Live-P4 NAS configuration setter used by shipped `lteautocm`.
@@ -387,10 +387,10 @@ pub mod recovered_opcode {
     /// Shared read-info response dispatched by subtype; Mobile ID is subtype 1.
     pub const MISC_READ_RESPONSE: u16 = 0xb146;
     pub const UE_MODE_CHANGE_RESPONSE: u16 = 0xb14f;
-    /// Shared solicited EMM-control response envelope.
-    pub const EMM_CONTROL_RESPONSE: u16 = 0xb156;
-    /// Shared unsolicited EMM-control report envelope.
-    pub const EMM_CONTROL_REPORT: u16 = 0xb164;
+    /// Shared solicited control response envelope.
+    pub const SHARED_CONTROL_RESPONSE: u16 = 0xb156;
+    /// Shared unsolicited control report envelope.
+    pub const SHARED_CONTROL_REPORT: u16 = 0xb164;
     /// Response to `SET_PROTOCOL_INFO_REQUEST`; live SDK internal response slot 89.
     pub const SET_PROTOCOL_INFO_RESPONSE: u16 = 0xb152;
     /// Response to `RRC_CAPABILITY_CONTROL_REQUEST`; live SDK callback slot 115.

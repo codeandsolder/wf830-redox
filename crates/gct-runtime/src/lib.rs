@@ -43,6 +43,10 @@ use gct_lapi::{
         PlmnListResponse, PlmnSearchDecodeError, PlmnSearchExtEncodeError, PlmnSearchExtRequest,
         PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
     },
+    rf::{
+        RfControlDecodeError, RfMeasureReportIndication, RfMeasureReportRequest,
+        RfMeasureReportResponse, RfStatusReportControlRequest, RfStatusReportControlResponse,
+    },
     rrc::{
         RrcCapabilityGetRequest, RrcCapabilityGetResponse, RrcCapabilitySetRequest,
         RrcCapabilitySetResponse, SetProtocolInfoRequest, SetProtocolInfoResponse,
@@ -188,6 +192,9 @@ pub enum ModemEvent<'a> {
         result: u32,
     },
     EmmReattachControlReport(EmmReattachControlReport),
+    RfStatusReportControl(RfStatusReportControlResponse),
+    RfMeasureReport(RfMeasureReportResponse),
+    RfMeasureReportIndication(RfMeasureReportIndication),
     MiscReadFailure {
         read_result: u16,
     },
@@ -216,6 +223,7 @@ pub enum EventDecodeError {
     MiscRead(MiscReadDecodeError),
     Uicc(UiccResponseDecodeError),
     EmmControl(EmmControlDecodeError),
+    RfControl(RfControlDecodeError),
     DeviceInformation(DeviceInformationDecodeError),
 }
 
@@ -245,6 +253,8 @@ pub enum ModemCommand<'a> {
     LcsControl(LcsControlRequest),
     LppControl(LppControlRequest),
     EmmNiReattachControl(EmmNiReattachControlRequest),
+    RfStatusReportControl(RfStatusReportControlRequest),
+    RfMeasureReport(RfMeasureReportRequest),
     Empty(EmptyRequest),
     At(AtCommand<'a>),
     AtExt(AtCommandExt<'a>),
@@ -283,6 +293,8 @@ pub enum ResponseKey {
     MiscRead,
     UeModeChange,
     EmmNiReattachControl,
+    RfStatusReportControl,
+    RfMeasureReport,
     Result(ResultResponseKind),
     Uicc(u16),
     RrcCapabilitySet(u16),
@@ -316,6 +328,8 @@ impl ModemCommand<'_> {
             | Self::TemperatureRead(_) => Some(ResponseKey::MiscRead),
             Self::UeModeChange(_) => Some(ResponseKey::UeModeChange),
             Self::EmmNiReattachControl(_) => Some(ResponseKey::EmmNiReattachControl),
+            Self::RfStatusReportControl(_) => Some(ResponseKey::RfStatusReportControl),
+            Self::RfMeasureReport(_) => Some(ResponseKey::RfMeasureReport),
             Self::Empty(EmptyRequest::PlmnList) => Some(ResponseKey::PlmnList),
             Self::Empty(EmptyRequest::Online) => {
                 Some(ResponseKey::Result(ResultResponseKind::Online))
@@ -364,6 +378,7 @@ impl ModemEvent<'_> {
             | Self::At(_)
             | Self::AtExt(_)
             | Self::EmmReattachControlReport(_)
+            | Self::RfMeasureReportIndication(_)
             | Self::Unknown(_) => None,
             Self::Detach(_) => Some(ResponseKey::Detach),
             Self::PdnConnect(response) => Some(ResponseKey::PdnConnect(response.transaction_id)),
@@ -383,6 +398,8 @@ impl ModemEvent<'_> {
             | Self::MiscReadFailure { .. } => Some(ResponseKey::MiscRead),
             Self::UeModeChange(_) => Some(ResponseKey::UeModeChange),
             Self::EmmNiReattachControl { .. } => Some(ResponseKey::EmmNiReattachControl),
+            Self::RfStatusReportControl(_) => Some(ResponseKey::RfStatusReportControl),
+            Self::RfMeasureReport(_) => Some(ResponseKey::RfMeasureReport),
             Self::Result { kind, .. } => Some(ResponseKey::Result(*kind)),
             Self::Uicc(response) => Some(ResponseKey::Uicc(response.kind)),
             Self::RrcCapabilitySet(response) => {
@@ -599,6 +616,8 @@ pub fn encode_command(
         ModemCommand::LcsControl(request) => Ok(request.encode(output)?),
         ModemCommand::LppControl(request) => Ok(request.encode(output)?),
         ModemCommand::EmmNiReattachControl(request) => Ok(request.encode(output)?),
+        ModemCommand::RfStatusReportControl(request) => Ok(request.encode(output)?),
+        ModemCommand::RfMeasureReport(request) => Ok(request.encode(output)?),
         ModemCommand::Empty(request) => Ok(request.encode(output)?),
         ModemCommand::At(request) => Ok(request.encode(output)?),
         ModemCommand::AtExt(request) => Ok(request.encode(output)?),
@@ -654,10 +673,26 @@ impl From<UiccResponseDecodeError> for EventDecodeError {
     }
 }
 
+impl From<RfControlDecodeError> for EventDecodeError {
+    fn from(value: RfControlDecodeError) -> Self {
+        Self::RfControl(value)
+    }
+}
+
 impl From<DeviceInformationDecodeError> for EventDecodeError {
     fn from(value: DeviceInformationDecodeError) -> Self {
         Self::DeviceInformation(value)
     }
+}
+
+fn shared_control_kind(packet: Packet<'_>) -> Result<u16, ResponseDecodeError> {
+    if packet.payload.len() < 4 {
+        return Err(ResponseDecodeError::TruncatedPrefix {
+            minimum: 4,
+            actual: packet.payload.len(),
+        });
+    }
+    Ok(u16::from_be_bytes([packet.payload[2], packet.payload[3]]))
 }
 
 /// Decode one complete HCI packet into the proven typed P0 surface.
@@ -718,19 +753,32 @@ pub fn decode_event(packet: Packet<'_>) -> Result<ModemEvent<'_>, EventDecodeErr
         recovered_opcode::UE_MODE_CHANGE_RESPONSE => Ok(ModemEvent::UeModeChange(
             UeModeChangeResponse::parse(packet)?,
         )),
-        recovered_opcode::EMM_CONTROL_RESPONSE => {
-            match EmmControlResponse::parse(packet).map_err(EventDecodeError::EmmControl)? {
+        recovered_opcode::SHARED_CONTROL_RESPONSE => match shared_control_kind(packet)? {
+            1 => Ok(ModemEvent::RfStatusReportControl(
+                RfStatusReportControlResponse::parse(packet)?,
+            )),
+            5 => Ok(ModemEvent::RfMeasureReport(RfMeasureReportResponse::parse(
+                packet,
+            )?)),
+            11 => match EmmControlResponse::parse(packet).map_err(EventDecodeError::EmmControl)? {
                 EmmControlResponse::NiReattach { result } => {
                     Ok(ModemEvent::EmmNiReattachControl { result })
                 }
                 EmmControlResponse::Unsupported { .. } => Ok(ModemEvent::Unknown(packet)),
-            }
-        }
-        recovered_opcode::EMM_CONTROL_REPORT => match EmmControlReport::parse(packet)
-            .map_err(EventDecodeError::EmmControl)?
-        {
-            EmmControlReport::Reattach(report) => Ok(ModemEvent::EmmReattachControlReport(report)),
-            EmmControlReport::Unsupported { .. } => Ok(ModemEvent::Unknown(packet)),
+            },
+            _ => Ok(ModemEvent::Unknown(packet)),
+        },
+        recovered_opcode::SHARED_CONTROL_REPORT => match shared_control_kind(packet)? {
+            5 => Ok(ModemEvent::RfMeasureReportIndication(
+                RfMeasureReportIndication::parse(packet)?,
+            )),
+            11 => match EmmControlReport::parse(packet).map_err(EventDecodeError::EmmControl)? {
+                EmmControlReport::Reattach(report) => {
+                    Ok(ModemEvent::EmmReattachControlReport(report))
+                }
+                EmmControlReport::Unsupported { .. } => Ok(ModemEvent::Unknown(packet)),
+            },
+            _ => Ok(ModemEvent::Unknown(packet)),
         },
         recovered_opcode::RRC_CAPABILITY_CONTROL_RESPONSE => Ok(ModemEvent::RrcCapabilitySet(
             RrcCapabilitySetResponse::parse(packet)?,
@@ -1405,7 +1453,7 @@ mod tests {
         let ni_payload = [0, 0, 0, 11, 0, 4, 0x11, 0x22, 0x33, 0x44];
         let ni_packet = Packet {
             header: Header {
-                command: recovered_opcode::EMM_CONTROL_RESPONSE,
+                command: recovered_opcode::SHARED_CONTROL_RESPONSE,
                 payload_len: 10,
             },
             payload: &ni_payload,
@@ -1420,7 +1468,7 @@ mod tests {
         let report_payload = [0x12, 0x34, 0, 11, 0, 4, 0xaa, 0xbb, 0xcc, 0xdd];
         let report_packet = Packet {
             header: Header {
-                command: recovered_opcode::EMM_CONTROL_REPORT,
+                command: recovered_opcode::SHARED_CONTROL_REPORT,
                 payload_len: 10,
             },
             payload: &report_payload,
@@ -1436,11 +1484,11 @@ mod tests {
         );
 
         for kind in [7_u8, 8, 9, 10, 13] {
-            let ignored_ack = [0, 0, 0, kind, 0, 4, 0, 0, 0, 1];
+            let ignored_ack = [0, 0, 0, kind];
             let packet = Packet {
                 header: Header {
-                    command: recovered_opcode::EMM_CONTROL_RESPONSE,
-                    payload_len: 10,
+                    command: recovered_opcode::SHARED_CONTROL_RESPONSE,
+                    payload_len: 4,
                 },
                 payload: &ignored_ack,
             };

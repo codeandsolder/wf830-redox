@@ -42,6 +42,9 @@ pub enum SdkCallbackKind {
     AtCommandFromDeviceExt,
     UiccFromDevice,
     UeModeChange,
+    RfStatusReportControl,
+    RfMeasureReport,
+    RfMeasureReportIndication,
     EmmNiReattachControl,
     EmmReattachControlReport,
     RrcCapabilityControl,
@@ -75,6 +78,9 @@ impl SdkCallbackKind {
             Self::AtCommandFromDeviceExt => 128,
             Self::UiccFromDevice => 148,
             Self::UeModeChange => 162,
+            Self::RfStatusReportControl => 188,
+            Self::RfMeasureReport => 203,
+            Self::RfMeasureReportIndication => 204,
             Self::EmmNiReattachControl => 308,
             Self::EmmReattachControlReport => 309,
             Self::RrcCapabilityControl => 221,
@@ -108,6 +114,9 @@ impl SdkCallbackKind {
             Self::AtCommandFromDeviceExt => 61,
             Self::UiccFromDevice => 71,
             Self::UeModeChange => 82,
+            Self::RfStatusReportControl => 95,
+            Self::RfMeasureReport => 106,
+            Self::RfMeasureReportIndication => 107,
             Self::EmmNiReattachControl => 159,
             Self::EmmReattachControlReport => 160,
             Self::RrcCapabilityControl => 115,
@@ -193,6 +202,8 @@ pub enum SdkCommand {
     UiccRequest = 147,
     UeModeChange = 161,
     SetProtocolInfo = 177,
+    RfStatusReportControl = 187,
+    RfMeasureReport = 202,
     SetNasConfig = 303,
     GetNasConfig = 304,
     EmmTimerControl = 207,
@@ -240,6 +251,8 @@ impl TryFrom<u16> for SdkCommand {
             147 => Ok(Self::UiccRequest),
             161 => Ok(Self::UeModeChange),
             177 => Ok(Self::SetProtocolInfo),
+            187 => Ok(Self::RfStatusReportControl),
+            202 => Ok(Self::RfMeasureReport),
             303 => Ok(Self::SetNasConfig),
             304 => Ok(Self::GetNasConfig),
             207 => Ok(Self::EmmTimerControl),
@@ -676,6 +689,11 @@ mod tests {
         );
         assert_eq!(SdkCommand::try_from(18), Ok(SdkCommand::AddSpecialTid));
         assert_eq!(SdkCommand::try_from(177), Ok(SdkCommand::SetProtocolInfo));
+        assert_eq!(
+            SdkCommand::try_from(187),
+            Ok(SdkCommand::RfStatusReportControl)
+        );
+        assert_eq!(SdkCommand::try_from(202), Ok(SdkCommand::RfMeasureReport));
         assert_eq!(SdkCommand::try_from(303), Ok(SdkCommand::SetNasConfig));
         assert_eq!(SdkCommand::try_from(304), Ok(SdkCommand::GetNasConfig));
         assert_eq!(SdkCommand::try_from(207), Ok(SdkCommand::EmmTimerControl));
@@ -883,6 +901,24 @@ mod tests {
         assert_eq!(SdkCallbackKind::UiccFromDevice.registration_offset(), 0x23c);
         assert_eq!(SdkCallbackKind::UeModeChange.callback_id(), 162);
         assert_eq!(SdkCallbackKind::UeModeChange.registration_offset(), 0x294);
+        assert_eq!(SdkCallbackKind::RfStatusReportControl.callback_id(), 188);
+        assert_eq!(
+            SdkCallbackKind::RfStatusReportControl.registration_offset(),
+            0x2fc
+        );
+        assert_eq!(SdkCallbackKind::RfMeasureReport.callback_id(), 203);
+        assert_eq!(
+            SdkCallbackKind::RfMeasureReport.registration_offset(),
+            0x354
+        );
+        assert_eq!(
+            SdkCallbackKind::RfMeasureReportIndication.callback_id(),
+            204
+        );
+        assert_eq!(
+            SdkCallbackKind::RfMeasureReportIndication.registration_offset(),
+            0x35c
+        );
         assert_eq!(SdkCallbackKind::SetProtocolInfo.callback_id(), 178);
         assert_eq!(SdkCallbackKind::SetProtocolInfo.registration_index(), 90);
         assert_eq!(

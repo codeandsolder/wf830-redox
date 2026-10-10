@@ -458,6 +458,49 @@ callback 64 only to clients registered in that slot. Tests cover exact local and
 modem wire bytes, malformed request length before I/O, callback materialization,
 subscription gating, search-type correlation, and pending release.
 
+## RF status + measurement — shipped client compatibility
+
+The remaining modem-facing imports in the automatic connection manager include
+`LTED_RFStatusReportControlRequest` and `LTED_RFMeasureReportRequest`. Live P4
+`liblted.so` fixes their stock-local command IDs and exact object sizes:
+
+- command **187**: ten-byte RF-status object
+  `on_off:u16 | intval_idle:u16 | intval_connect:u16 | thresh_idle:u16 | thresh_connect:u16`;
+- command **202**: one-byte RF-measure object `control:u8`.
+
+B014 DWARF independently names those request fields and the three stock callback
+objects. Live P4 converters preserve those layouts: RF-status response is 12
+bytes (`result:u16 | status:u16 | mode:u16 | prev_rsrp:i16 | cur_rsrp:i16 |
+thresh:i16`), RF-measure response is four bytes (`result:u16 | status:u16`),
+and the unsolicited measurement indication is 12 bytes
+(`result:u16 | rrc_state:u8 | paging_cycle:u8 | rssi:i16 | rsrp:i16 |
+rsrq:i16 | snr:i16`).
+
+Both requests use the same shared modem-control command **`0x3155`** used by the
+EMM/PSM/LCS/LPP families. RF status uses discriminator **1** with body length 10;
+RF measure uses discriminator **5** with body length 1. The live shared
+**`0xb156`** response switch routes discriminator 1 to the RF-status converter
+and discriminator 5 to the RF-measure response converter. The shared
+**`0xb164`** report switch routes discriminator 5 to the unsolicited RF-measure
+indication converter.
+
+The SDK callback slots are **95**, **106**, and **107** respectively. The live
+daemon then emits stock callback selectors **188**, **203**, and **204**.
+Stock `liblted.so::LTED_RegisterCallbackResponse` independently proves the
+client registration layout as `context + 4 + 8*selector_index`, giving
+registration offsets **`0x2fc`**, **`0x354`**, and **`0x35c`** for those three
+slots.
+
+Rust now models the three live value objects semantically in `gct-lapi::rf`,
+tracks the two solicited RF request families independently, and routes the
+measurement indication without pending state. The top-level shared-control
+decoder validates known RF/NI-reattach discriminators strictly while preserving
+unknown discriminators as opaque events without imposing another family's body
+grammar. End-to-end bridge tests lock exact stock request bytes, exact HCI
+frames, pending retirement, callback selectors/registration gating, callback
+memory images, the unsolicited indication path, and malformed local request
+rejection before modem I/O.
+
 ## Shared EMM control — timer control, NI reattach, and live widened callbacks
 
 This family is heavily used by the shipping P4 userspace: recovered LTE clients
@@ -1273,9 +1316,10 @@ invented and Timer Start is request-only/untracked. This also exposed an overly
 strict assumption in the earlier shared-response decoder: stock chooses the
 handler from the discriminator *before* parsing a family-specific body, while
 Rust previously required every unsupported response to look like the ten-byte
-NI-reattach envelope. `EmmControlResponse::parse` now requires only enough bytes
-to read the discriminator for unsupported families; only discriminator 11 must
-satisfy the exact NI-reattach body grammar. Tests prove command 213, the exact
+NI-reattach envelope. The top-level shared-control dispatcher now reads only the
+discriminator first, validates known RF and NI-reattach families with their own
+exact grammars, and preserves every other discriminator as an opaque event.
+Tests prove command 213, the exact
 11-byte HCI frame, malformed local-length rejection before GLIF I/O, zero
 pending state, and discriminator-13 drop behavior with a non-NI body shape.
 

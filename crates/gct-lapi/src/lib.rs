@@ -13,6 +13,7 @@ pub mod emm;
 pub mod misc;
 pub mod pdn;
 pub mod plmn;
+pub mod rf;
 pub mod rrc;
 pub mod uicc;
 
