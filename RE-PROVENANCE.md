@@ -1691,28 +1691,139 @@ zeroes the seven bytes, stores `mesg_id = 0x3101`, `tid_type = 1`, resolves
 `req_apn_type` before command 17. This confirms that command 17 semantically
 selects by APN type; its other six bytes are historical structure baggage.
 
-Rust now keeps a small semantic APN/TID ledger in `DeviceBridge` and implements
-commands 14–18 as immediate local completions with **zero GLIF bytes**. Command
-14 enforces the live SDK value domain. Commands 15/16 materialize the one-byte
-result at `0x977d`. Command 18 bounds the table to the recovered `1..=253` TID
-space and command 17 removes the first matching APN-type entry while preserving
-list order. Missing default-EPS lookup returns `0xff` exactly. A missing delete
-is deliberately a no-op: the OEM helper chain can turn "APN type not found"
-into TID 0 and then call `tid_list_del(0)`, an accidental behavior that the
-clean replacement does not reproduce.
+Rust keeps a semantic APN/TID ledger in `DeviceBridge` and implements commands
+14–18 as immediate local completions with **zero GLIF bytes**. Command 14
+enforces the live SDK value domain. Commands 15/16 materialize the one-byte
+result at `0x977d`. Command 17 removes the first matching APN-type entry while
+preserving list order. Missing default-EPS lookup returns `0xff` exactly. A
+missing delete is deliberately a no-op: the OEM helper chain can turn "APN type
+not found" into TID 0 and then call `tid_list_del(0)`, an accidental behavior
+that the clean replacement does not reproduce.
 
-The clean daemon does not yet mirror every normal Attach/PDN SDK TID-list side
-effect into this ledger. That means a default-EPS lookup with no explicit
-special mapping can still miss and return `0xff`; shipped connection managers
-already handle that by falling back to stock `LTED_GetApnTypeByName`, which is a
-separate liblted-local product/configuration helper. Integrating the normal TID
-lifecycle belongs with the later authoritative `GetConnectionInfo`/PDN-state
-work rather than being guessed here.
+The normal live-P4 TID lifecycle is now independently recovered and mirrored as
+well. `tid_list_add@0x38908` and `tid_list_add_with_tid_type@0x38bf0` share one
+first-free allocator over **1..=253**, so normal requests and command-18 special
+entries must never collide. The normal request callsites are exact:
 
-Tests lock command IDs, Set/Get behavior, invalid APN-type failure, exact
+- `LAPI_AttachRequest@0x44128`, only when `optional_info != 0`, calls
+  `tid_list_add(0x3101, req_apn_type@0x152, 0, ip_alloc@0x67)` and overwrites
+  historical request byte `0x001` with the allocated TID. The one-byte minimal
+  Attach path allocates no TID.
+- `LAPI_PDNConnRequest@0x457ac` calls
+  `tid_list_add(0x3105, req_apn_type@0x19a, 0, ip_alloc@0x67)` and overwrites
+  historical request byte `0x1a3`.
+- `LAPI_PDNDisconnRequest@0x46694` calls
+  `tid_list_add(0x3107, 0xff, default_eps_id, 0)` and overwrites historical
+  request byte `0x002`.
+- `LAPI_DetachRequest` calls `tid_list_clean()` before sending.
+
+The receive-side mutations are also proven from the live HCI handlers. Normal
+Attach response `0xb102` updates the matching node's default-EPS ID on success;
+when its second registration-result word is nonzero it deletes the response TID.
+Normal PDN-connect response `0xb106` updates the matching node's default-EPS ID
+for the ordinary path, but deletes the node for the stock special failure
+condition **`result == 5`**. PDN-disconnect response `0xb108` only enters
+`pdn_manager_event_notify(..., event=256, ...)` for the two live completion
+results **101 or 108**. That event-256 branch calls `tid_list_del(event[8])`,
+where byte 8 is the response transaction ID, after optionally clearing the
+matching connection-manager record by default-EPS ID. Other disconnect result
+codes still reach the normal stock callback but leave the SDK TID node intact.
+The disconnect path does not automatically erase the older established
+Attach/Connect TID node; that remains subject to the stock APN-type/delete
+helper flow.
+
+The Rust allocator now checks both pending modem requests and the APN/TID ledger,
+so a special TID reserves the same namespace seen by Attach/PDN. Normal ledger
+entries are committed only **after a successful full GLIF write**. This is an
+intentional cleanup over the OEM ordering, which mutates `tid_list` before I/O
+and can leave stale nodes when a send fails. Successful Detach clears the whole
+ledger and retires normal Attach/PDN transaction pending keys. Response handling
+updates/deletes nodes under the exact live conditions above.
+
+`LTED_GetApnTypeByName@0x18eb0` is not another daemon command at all: it executes
+inside stock `liblted.so`, obtains the operator, shells through product `ucfg`
+configuration into `/var/tmp/ucfg_*`, scans `apn%d` records, and maps `pdn_label`
+strings (`internet`, `ims`, `admin`, `app`, `emergency`, `reserved1..3`) to
+APN-type values. Several operator-specific branches also recognize product APN
+names such as `otasn`, `vzwadmin`, `TestGp.rs`, and `Test12.rs`. Therefore the
+replacement daemon deliberately does **not** invent an IPC command for this
+fallback; it remains a client-library concern until `liblted.so` itself is
+replaced.
+
+Tests now lock command IDs, Set/Get behavior, invalid APN-type failure, exact
 seven-byte Add/Delete decoding, Add→default-EPS query→Delete→`0xff` lifecycle,
-malformed-record rejection before GLIF, zero pending modem state, and an empty
-modem transport for every local helper.
+malformed-record rejection before GLIF, the globally shared special/normal TID
+allocator, Attach caller-TID overwrite, success-side default-EPS updates, exact
+Attach/PDN-connect failure deletions, disconnect-request retirement, Detach
+cleanup, and the cleaner invariant that a failed GLIF write leaves no stale
+replacement-side TID node.
+
+## Live P4 GetConnectionInfo — local snapshot contract mapped, implementation deferred
+
+The stock `LTED_GetConnectionInfo@0xfc44` / `LAPI_GetConnectionInfo@0x4f5cc`
+path is now mapped end-to-end, but is deliberately **not implemented yet**.
+Unlike a modem request it is a synchronous snapshot of the SDK's own PDN/NIC
+manager, so implementing command 7 before that state manager is complete would
+return believable but false compatibility data.
+
+Live P4 `liblted.so` sends SDK command **7** with an exact historical
+**`0x0a0e` (2574)-byte** caller object. The live daemon ignores the input
+contents and asks `LAPI_GetConnectionInfo` to materialize the result into the
+client shared context at offset **`0x8d6c`**. No GLIF/HCI traffic occurs.
+The returned image is exactly:
+
+```text
+num_connection:u32be | nic[5][0x202]
+```
+
+`LAPI_GetConnectionInfo` walks five fixed internal NIC slots, skips null slots
+and slots whose `default_eps_id` is zero, compacts each surviving **514-byte**
+record into the output, and writes the final BE count. This is another
+generation delta from B014: its DWARF `_NETWORK_CONNECT_INFO` is 4572 bytes and
+contains eight 571-byte `_NIC_CONFIG_INFO` records.
+
+The first 514 bytes of B014 `_NIC_CONFIG_INFO` nevertheless match the live-P4
+record offsets exactly. Cross-checking live setters/getters proves at least:
+
+- `nic_name[256]@0x000`;
+- `status:u32be@0x100`, `req_apn_type:u32be@0x104`,
+  `nic_type:u32be@0x108`;
+- `activate@0x10c`, `data_path@0x10d`, `pdn_ip_type@0x10e`,
+  `ip_alloc@0x10f`, `apn_class@0x110`;
+- `default_eps_id:u16be@0x111`, followed by the 65-byte APN object at `0x113`;
+- IPv4 address/subnet/gateway/primary-DNS/secondary-DNS at
+  `0x154/0x158/0x15c/0x160/0x164`, with link MTU at `0x168`;
+- IPv6 address at `0x16a`, primary/secondary DNS at `0x18a/0x19a`,
+  gateway at `0x1aa`, then the recovered IPv6 status/configuration tail.
+
+The live manager has exactly five reusable slots. `pdn_manager_get_nic` finds a
+slot by `default_eps_id`; `pdn_manager_init_nic` reuses the first existing slot
+whose `default_eps_id == 0`. Attach event **8** and normal PDN-connect event
+**64** populate those records. PDN-disconnect event **256** clears the matching
+record only on the live `0xb108` result-101/result-108 completion path.
+
+NIC naming is also recovered exactly. The helper at `0x3ceb8` resolves its PIC
+literal to **`"lte%dpdn%d"`**, passes a hard-coded first argument `0`, and uses
+the resolved `req_apn_type` word from record offset `0x104` as the second
+argument. Thus a type-0 record becomes `lte0pdn0`; the suffix is APN type, not
+the five-slot index.
+
+The IPv4 derived fields are deterministic and fully recovered from
+`ipv4_gateway_and_mask@0x6507c`: it chooses a classful `/8`, `/16`, or `/24`
+mask from the first octet, copies that network prefix into the gateway, then
+sets the final gateway octet to bitwise-NOT of the assigned final octet (or
+`1` when the assigned octet is `255`). This odd rule is intentional stock
+behavior.
+
+IPv6 is the reason command 7 remains deferred. The modem callback supplies only
+the low 64-bit interface ID. The live helper at `0x3d248` copies those eight
+bytes into the low half of `ipv6_address` and immediately invokes
+`io_ioctl_by_ifname`; the high 64-bit prefix and related host-network state are
+completed later by the SDK's kernel/network IPv6 event path. Therefore a
+bridge that only remembered modem callbacks would silently return incomplete
+records once the host interface had configured IPv6. The clean replacement
+will implement command 7 together with the corresponding NIC/kernel state feed,
+rather than zero-filling those bytes and claiming parity.
 
 ## Live P4 NAS configuration — shipped request path, dormant completion path
 

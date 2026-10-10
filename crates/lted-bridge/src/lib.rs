@@ -764,8 +764,12 @@ const fn legacy_apn_type(value: u8) -> ApnType {
 /// The offsets come from B014 DWARF and the fields consumed by live P4
 /// `LAPI_AttachRequest` were independently checked in disassembly. Fixed C
 /// strings are bounded here instead of reproducing the OEM `strlen` over-read
-/// hazard. When `optional_info == 0`, the modem wire request contains only that
-/// byte, so dead legacy fields are deliberately not validated.
+/// hazard. For non-minimal requests, live `LAPI_AttachRequest` ignores the
+/// historical transaction byte at `0x001`, allocates a first-free TID, and
+/// overwrites that byte before encoding; the bridge applies that allocation
+/// after this structural decode. When `optional_info == 0`, the modem wire
+/// request contains only that byte and no TID is allocated, so dead legacy
+/// fields are deliberately not validated.
 ///
 /// # Errors
 /// Returns [`LegacyAttachDecodeError`] for a wrong legacy structure size,
@@ -2581,7 +2585,6 @@ pub fn broadcast_plmn_list_callback(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApnStateError {
     InvalidConfiguredType(u32),
-    TidTableFull,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2650,7 +2653,11 @@ impl ApnState {
             .map_or(0xff, |entry| entry.record.requested_apn_type)
     }
 
-    fn add_special_tid(&mut self, mut record: SpecialTidRecord) -> Result<(), ApnStateError> {
+    fn contains_tid(&self, tid: u8) -> bool {
+        self.tids.iter().any(|entry| entry.tid == tid)
+    }
+
+    fn add_special_tid(&mut self, tid: u8, mut record: SpecialTidRecord) {
         if record.tid_type == 1
             && let Some(index) = self.tids.iter().position(|entry| entry.tid == 0)
         {
@@ -2659,13 +2666,45 @@ impl ApnState {
             record.requested_apn_type = normal.requested_apn_type;
             record.ip_allocation = normal.ip_allocation;
         }
-        let Some(tid) =
-            (1_u8..=253).find(|candidate| !self.tids.iter().any(|entry| entry.tid == *candidate))
-        else {
-            return Err(ApnStateError::TidTableFull);
-        };
+        debug_assert!(!self.contains_tid(tid));
         self.tids.push(TidStateEntry { tid, record });
-        Ok(())
+    }
+
+    fn add_normal_tid(
+        &mut self,
+        tid: u8,
+        message_id: u16,
+        requested_apn_type: u8,
+        default_eps_id: u16,
+        ip_allocation: u8,
+    ) {
+        debug_assert!(!self.contains_tid(tid));
+        self.tids.push(TidStateEntry {
+            tid,
+            record: SpecialTidRecord {
+                message_id,
+                default_eps_id,
+                tid_type: 0,
+                requested_apn_type,
+                ip_allocation,
+            },
+        });
+    }
+
+    fn update_default_eps_id(&mut self, tid: u8, default_eps_id: u16) {
+        if let Some(entry) = self.tids.iter_mut().find(|entry| entry.tid == tid) {
+            entry.record.default_eps_id = default_eps_id;
+        }
+    }
+
+    fn delete_by_tid(&mut self, tid: u8) {
+        if let Some(index) = self.tids.iter().position(|entry| entry.tid == tid) {
+            self.tids.remove(index);
+        }
+    }
+
+    fn clear_tids(&mut self) {
+        self.tids.clear();
     }
 
     fn delete_by_apn_type(&mut self, apn_type: u8) {
@@ -3108,6 +3147,57 @@ impl DeviceBridge {
         Ok(true)
     }
 
+    fn handle_attach_event(
+        &mut self,
+        server: &mut Server,
+        response: AttachResponse<'_>,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        let key = ResponseKey::Attach(response.transaction_id);
+        if !self.pending.remove(key) {
+            return Ok(None);
+        }
+        if response.register_result2 == 0 {
+            self.apn_state
+                .update_default_eps_id(response.transaction_id, response.default_eps_id);
+        } else {
+            self.apn_state.delete_by_tid(response.transaction_id);
+        }
+        broadcast_attach_callback(server, self.device_id, response).map(Some)
+    }
+
+    fn handle_pdn_connect_event(
+        &mut self,
+        server: &mut Server,
+        response: PdnConnectResponse<'_>,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        let key = ResponseKey::PdnConnect(response.transaction_id);
+        if !self.pending.remove(key) {
+            return Ok(None);
+        }
+        if response.result == 5 {
+            self.apn_state.delete_by_tid(response.transaction_id);
+        } else {
+            self.apn_state
+                .update_default_eps_id(response.transaction_id, response.default_eps_id);
+        }
+        broadcast_pdn_connect_callback(server, self.device_id, response).map(Some)
+    }
+
+    fn handle_pdn_disconnect_event(
+        &mut self,
+        server: &mut Server,
+        response: PdnDisconnectResponse<'_>,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        let key = ResponseKey::PdnDisconnect(response.transaction_id);
+        if !self.pending.remove(key) {
+            return Ok(None);
+        }
+        if matches!(response.result, 101 | 108) {
+            self.apn_state.delete_by_tid(response.transaction_id);
+        }
+        broadcast_pdn_disconnect_callback(server, self.device_id, response).map(Some)
+    }
+
     /// Route one decoded modem event through the asynchronous stock callback
     /// path implemented so far.
     ///
@@ -3124,13 +3214,7 @@ impl DeviceBridge {
         event: &ModemEvent<'_>,
     ) -> Result<Option<BroadcastReport>, HandleError> {
         match event {
-            ModemEvent::Attach(response) => {
-                let key = ResponseKey::Attach(response.transaction_id);
-                if !self.pending.remove(key) {
-                    return Ok(None);
-                }
-                broadcast_attach_callback(server, self.device_id, *response).map(Some)
-            }
+            ModemEvent::Attach(response) => self.handle_attach_event(server, *response),
             ModemEvent::AttachExt(response) => self.handle_attach_ext_event(server, *response),
             ModemEvent::Detach(response) => {
                 if !self.pending.remove(ResponseKey::Detach) {
@@ -3141,13 +3225,7 @@ impl DeviceBridge {
             ModemEvent::DetachRequired(indication) => {
                 broadcast_detach_required_callback(server, self.device_id, *indication).map(Some)
             }
-            ModemEvent::PdnConnect(response) => {
-                let key = ResponseKey::PdnConnect(response.transaction_id);
-                if !self.pending.remove(key) {
-                    return Ok(None);
-                }
-                broadcast_pdn_connect_callback(server, self.device_id, *response).map(Some)
-            }
+            ModemEvent::PdnConnect(response) => self.handle_pdn_connect_event(server, *response),
             ModemEvent::PdnConnectExt(response) => {
                 if !self.pending.remove(ResponseKey::PdnConnectExt) {
                     return Ok(None);
@@ -3155,11 +3233,7 @@ impl DeviceBridge {
                 broadcast_pdn_connect_ext_callback(server, self.device_id, *response).map(Some)
             }
             ModemEvent::PdnDisconnect(response) => {
-                let key = ResponseKey::PdnDisconnect(response.transaction_id);
-                if !self.pending.remove(key) {
-                    return Ok(None);
-                }
-                broadcast_pdn_disconnect_callback(server, self.device_id, *response).map(Some)
+                self.handle_pdn_disconnect_event(server, *response)
             }
             ModemEvent::At(response) => {
                 broadcast_at_callback(server, self.device_id, response.command).map(Some)
@@ -3224,7 +3298,8 @@ impl DeviceBridge {
 
     fn allocate_transaction_id(&self) -> Result<u8, HandleError> {
         for transaction_id in 1_u8..=253 {
-            let used = self.pending.contains(ResponseKey::Attach(transaction_id))
+            let used = self.apn_state.contains_tid(transaction_id)
+                || self.pending.contains(ResponseKey::Attach(transaction_id))
                 || self
                     .pending
                     .contains(ResponseKey::PdnConnect(transaction_id))
@@ -3295,9 +3370,8 @@ impl DeviceBridge {
             }
             SdkCommand::AddSpecialTid => {
                 let record = SpecialTidRecord::decode(request.command, request.params)?;
-                self.apn_state
-                    .add_special_tid(record)
-                    .map_err(HandleError::ApnState)?;
+                let tid = self.allocate_transaction_id()?;
+                self.apn_state.add_special_tid(tid, record);
             }
             _ => return Err(HandleError::UnsupportedCommand(request.command)),
         }
@@ -3717,10 +3791,12 @@ impl DeviceBridge {
         let bytes_written =
             modem.send_tracked_command(&mut self.pending, ModemCommand::Detach(detach))?;
 
-        // Live LAPI_DetachRequest calls tid_list_clean() before sending. That
-        // list is populated by normal PDN connect/disconnect TID allocation.
-        // Retire those pending transaction keys once the detach write succeeds.
+        // Live LAPI_DetachRequest calls tid_list_clean() before sending. Keep
+        // the same logical reset, but commit it only after a successful GLIF
+        // write so an I/O failure cannot strand replacement-side state.
+        self.apn_state.clear_tids();
         for transaction_id in 1_u8..=253 {
+            self.pending.remove(ResponseKey::Attach(transaction_id));
             self.pending.remove(ResponseKey::PdnConnect(transaction_id));
             self.pending
                 .remove(ResponseKey::PdnDisconnect(transaction_id));
@@ -3743,6 +3819,13 @@ impl DeviceBridge {
             .map_err(HandleError::LegacyPdnConnect)?;
         let bytes_written =
             modem.send_tracked_command(&mut self.pending, ModemCommand::PdnConnect(pdn))?;
+        self.apn_state.add_normal_tid(
+            transaction_id,
+            0x3105,
+            request.params[0x19a],
+            0,
+            request.params[0x067],
+        );
         Ok(HandledCall {
             command: SdkCommand::PdnConnect,
             device_id: request.device_id,
@@ -3776,6 +3859,8 @@ impl DeviceBridge {
             .map_err(HandleError::LegacyPdnDisconnect)?;
         let bytes_written =
             modem.send_tracked_command(&mut self.pending, ModemCommand::PdnDisconnect(pdn))?;
+        self.apn_state
+            .add_normal_tid(transaction_id, 0x3107, 0xff, pdn.default_eps_id, 0);
         Ok(HandledCall {
             command: SdkCommand::PdnDisconnect,
             device_id: request.device_id,
@@ -3804,9 +3889,25 @@ impl DeviceBridge {
         modem: &mut Modem<T>,
         request: SdkApiRequest<'_>,
     ) -> Result<HandledCall, HandleError> {
-        let attach = decode_legacy_attach(request.params).map_err(HandleError::LegacyAttach)?;
+        let mut attach = decode_legacy_attach(request.params).map_err(HandleError::LegacyAttach)?;
+        let transaction_id = if attach.optional_info == 0 {
+            None
+        } else {
+            let transaction_id = self.allocate_transaction_id()?;
+            attach.transaction_id = transaction_id;
+            Some(transaction_id)
+        };
         let bytes_written =
             modem.send_tracked_command(&mut self.pending, ModemCommand::Attach(attach))?;
+        if let Some(transaction_id) = transaction_id {
+            self.apn_state.add_normal_tid(
+                transaction_id,
+                0x3101,
+                request.params[0x152],
+                0,
+                request.params[0x067],
+            );
+        }
         Ok(HandledCall {
             command: SdkCommand::Attach,
             device_id: request.device_id,
@@ -4114,6 +4215,18 @@ mod tests {
     fn bind_server(dir: &TestDir) -> Server {
         Server::bind_paths(dir.join("daemon"), dir.join("client-"))
             .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn hci_frame(command: u16, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(4 + payload.len());
+        frame.extend_from_slice(&command.to_be_bytes());
+        frame.extend_from_slice(
+            &u16::try_from(payload.len())
+                .unwrap_or_else(|_| std::process::abort())
+                .to_be_bytes(),
+        );
+        frame.extend_from_slice(payload);
+        frame
     }
 
     fn route_one_hci(
@@ -4868,7 +4981,7 @@ mod tests {
         assert_eq!(
             modem.into_transport().into_inner().into_inner(),
             [
-                0x31, 0x01, 0x00, 0x43, 0x01, 0x20, 0x01, 0x07, 0x02, 0x01, 0x75, 0x03, 0x01, 0x70,
+                0x31, 0x01, 0x00, 0x43, 0x01, 0x20, 0x01, 0x01, 0x02, 0x01, 0x75, 0x03, 0x01, 0x70,
                 0x04, 0x08, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x6e, 0x65, 0x74, 0x1e, 0x01, 0x02, 0x05,
                 0x01, 0x03, 0x01, 0x01, 0x01, 0x5c, 0x02, 0x12, 0x34, 0x5d, 0x02, 0xaa, 0xbb, 0x5f,
                 0x01, 0x04, 0x60, 0x01, 0x05, 0x70, 0x01, 0x03, 0x62, 0x01, 0x00, 0xf5, 0x02, 0x01,
@@ -4912,7 +5025,7 @@ mod tests {
 
         let payload = [
             0x00, 0x01, 0x00, 0x02, 0x12, 0x34, 0x56, 0x78, 0x09, 0x0a, 1, 2, 3, 4, 5, 0x20, 0x01,
-            0x07, 0x99, 0x03, b'i', b'm', b's', 0xf0, 0x1a, 0x04, 0x03, b'p', b'd', b'n', 0x05,
+            0x01, 0x99, 0x03, b'i', b'm', b's', 0xf0, 0x1a, 0x04, 0x03, b'p', b'd', b'n', 0x05,
             0x01, 0x02, 0x06, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x07, 0x04, 192, 168, 1, 2, 0x40, 0x04,
             0x00, 0x00, 0x00, 0x09, 0x58, 0x01, 0xaa, 0x59, 0x01, 0xbb, 0x5a, 0x01, 0xcc, 0x5b,
             0x02, 0x05, 0xdc, 0x5d, 0x03, 0x11, 0x22, 0x33, 0x5e, 0x04, 0x01, 0x02, 0x03, 0x04,
@@ -4960,7 +5073,7 @@ mod tests {
         assert_eq!(&data[0x0d0..0x0d4], &[192, 168, 1, 2]);
         assert_eq!(&data[0x261..0x265], &9_u32.to_be_bytes());
         assert_eq!(&data[0x275..0x27a], &[1, 2, 3, 4, 5]);
-        assert_eq!(data[0x27a], 7);
+        assert_eq!(data[0x27a], 1);
         assert_eq!(&data[0x27b..0x27e], &[0xaa, 0xbb, 0xcc]);
         assert_eq!(&data[0x27e..0x280], &1500_u16.to_be_bytes());
         assert_eq!(&data[0x280..0x285], &[1, 3, 0x11, 0x22, 0x33]);
@@ -7672,6 +7785,321 @@ mod tests {
             modem.into_transport().into_inner().into_inner(),
             Vec::<u8>::new()
         );
+    }
+
+    #[test]
+    fn normal_tid_lifecycle_shares_oem_allocator_and_updates_default_eps_state() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        // Special TIDs and normal modem requests share one live-SDK allocator.
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::AddSpecialTid as u16,
+                    device_id: 1,
+                    params: &[0x31, 0x05, 0, 0, 2, 6, 7],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.apn_state.tids[0].tid, 1);
+
+        let mut attach = [0_u8; 352];
+        attach[0] = 1;
+        attach[1] = 0x77; // historical caller TID: live SDK overwrites it
+        attach[0x067] = 4;
+        attach[0x152] = 3;
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::Attach as u16,
+                    device_id: 1,
+                    params: &attach,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        let attach_node = bridge
+            .apn_state
+            .tids
+            .iter()
+            .find(|entry| entry.tid == 2)
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(attach_node.record.message_id, 0x3101);
+        assert_eq!(attach_node.record.requested_apn_type, 3);
+        assert_eq!(attach_node.record.default_eps_id, 0);
+        assert_eq!(attach_node.record.ip_allocation, 4);
+
+        let attach_rsp = [
+            0, 0, // register_result1
+            0, 0, // register_result2
+            0x12, 0x34, // default EPS ID
+            0, 9, // EPS ID
+            1, 2, // data path / IP allocation
+            0, 0, 0, 0, 0, // network features
+            0x20, 1, 2, // allocated transaction ID
+            0x99, 0, // positional APN TLV
+        ];
+        assert_eq!(
+            route_one_hci(&mut bridge, &mut server, hci_frame(0xb102, &attach_rsp)),
+            Some(BroadcastReport::default())
+        );
+        assert_eq!(
+            bridge
+                .apn_state
+                .tids
+                .iter()
+                .find(|entry| entry.tid == 2)
+                .map(|entry| entry.record.default_eps_id),
+            Some(0x1234)
+        );
+
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::GetApnTypeByDefaultEpsId as u16,
+                    device_id: 1,
+                    params: &0x1234_u16.to_be_bytes(),
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(read_shared_byte(&mut server, id, APN_TYPE_RESULT_OFFSET), 3);
+    }
+
+    #[test]
+    fn normal_pdn_tid_lifecycle_updates_disconnects_and_detaches() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        let mut pdn = [0_u8; 420];
+        pdn[0x067] = 7;
+        pdn[0x19a] = 4;
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::PdnConnect as u16,
+                    device_id: 1,
+                    params: &pdn,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        let pdn_node = bridge
+            .apn_state
+            .tids
+            .iter()
+            .find(|entry| entry.tid == 1)
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(pdn_node.record.message_id, 0x3105);
+        assert_eq!(pdn_node.record.requested_apn_type, 4);
+        assert_eq!(pdn_node.record.ip_allocation, 7);
+
+        let pdn_rsp = [0, 0, 0, 0, 0, 0, 0x56, 0x78, 1, 7, 0x20, 1, 1, 0x99, 0];
+        assert_eq!(
+            route_one_hci(&mut bridge, &mut server, hci_frame(0xb106, &pdn_rsp)),
+            Some(BroadcastReport::default())
+        );
+        assert_eq!(
+            bridge
+                .apn_state
+                .tids
+                .iter()
+                .find(|entry| entry.tid == 1)
+                .map(|entry| entry.record.default_eps_id),
+            Some(0x5678)
+        );
+
+        let disconnect = [0x56, 0x78, 0xee, 0];
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::PdnDisconnect as u16,
+                    device_id: 1,
+                    params: &disconnect,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(bridge.apn_state.tids.iter().any(|entry| entry.tid == 2));
+
+        let disconnect_rsp = [0, 101, 0, 0, 0, 0, 0x56, 0x78, 0x20, 1, 2];
+        assert_eq!(
+            route_one_hci(&mut bridge, &mut server, hci_frame(0xb108, &disconnect_rsp)),
+            Some(BroadcastReport::default())
+        );
+        assert!(!bridge.apn_state.tids.iter().any(|entry| entry.tid == 2));
+        assert!(bridge.apn_state.tids.iter().any(|entry| entry.tid == 1));
+
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::Detach as u16,
+                    device_id: 1,
+                    params: &0_u32.to_be_bytes(),
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.apn_state.tids.len(), 0);
+    }
+
+    #[test]
+    fn normal_tid_failure_responses_retire_only_the_stock_failure_cases() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        let mut attach = [0_u8; 352];
+        attach[0] = 1;
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::Attach as u16,
+                    device_id: 1,
+                    params: &attach,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(bridge.apn_state.contains_tid(1));
+        let attach_failure = [
+            0, 0, 0, 1, // register_result2 != 0 is the live deletion condition
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20, 1, 1, 0x99, 0,
+        ];
+        route_one_hci(&mut bridge, &mut server, hci_frame(0xb102, &attach_failure));
+        assert!(!bridge.apn_state.contains_tid(1));
+
+        let pdn = [0_u8; 420];
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::PdnConnect as u16,
+                    device_id: 1,
+                    params: &pdn,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(bridge.apn_state.contains_tid(1));
+        let pdn_result_five = [
+            0, 5, // this exact result is the live deletion condition
+            0, 0, 0, 0, 0, 7, 0, 0, 0x20, 1, 1, 0x99, 0,
+        ];
+        route_one_hci(
+            &mut bridge,
+            &mut server,
+            hci_frame(0xb106, &pdn_result_five),
+        );
+        assert!(!bridge.apn_state.contains_tid(1));
+
+        // Live 0xb108 only feeds event 256 into the PDN manager for result
+        // 101 or 108. Other disconnect responses still callback, but leave the
+        // SDK TID node untouched.
+        let disconnect = [0, 7, 0, 0];
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::PdnDisconnect as u16,
+                    device_id: 1,
+                    params: &disconnect,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(bridge.apn_state.contains_tid(1));
+        let rejected_disconnect = [
+            0, 1, // not one of the two live PDN-manager completion results
+            0, 0, 0, 0, 0, 7, 0x20, 1, 1,
+        ];
+        route_one_hci(
+            &mut bridge,
+            &mut server,
+            hci_frame(0xb108, &rejected_disconnect),
+        );
+        assert!(bridge.apn_state.contains_tid(1));
+
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::PdnDisconnect as u16,
+                    device_id: 1,
+                    params: &disconnect,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(bridge.apn_state.contains_tid(2));
+        let completed_disconnect = [
+            0, 108, // second live PDN-manager completion result
+            0, 0, 0, 0, 0, 7, 0x20, 1, 2,
+        ];
+        route_one_hci(
+            &mut bridge,
+            &mut server,
+            hci_frame(0xb108, &completed_disconnect),
+        );
+        assert!(bridge.apn_state.contains_tid(1));
+        assert!(!bridge.apn_state.contains_tid(2));
+    }
+
+    #[test]
+    fn failed_normal_tid_write_does_not_leave_replacement_side_stale_state() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let mut modem = Modem::new(HciIo::new(FailingWriter));
+        let mut bridge = DeviceBridge::new(1);
+        let mut pdn = [0_u8; 420];
+        pdn[0x19a] = 2;
+
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::PdnConnect as u16,
+                    device_id: 1,
+                    params: &pdn,
+                },
+            ),
+            Err(HandleError::Tracked(_))
+        ));
+        assert_eq!(bridge.apn_state.tids.len(), 0);
+        assert_eq!(bridge.pending_count(), 0);
     }
 
     #[test]
