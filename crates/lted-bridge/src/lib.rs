@@ -8,6 +8,11 @@
 
 use std::{io, io::Write};
 
+mod state;
+
+use state::{ApnState, NicState, SpecialTidRecord};
+pub use state::{ApnStateError, ConnectionStateError};
+
 use gct_lapi::{
     ApnType, AtCommand, AtCommandExt, AttachExtProfile, AttachExtRequest, AttachExtResponse,
     AttachRequest, AttachResponse, AttachTailDecodeError, AttachTailField, DetachRequest,
@@ -43,6 +48,9 @@ pub const PS_INIT_COMPLETE_OFFSET: usize = 0x528;
 /// Exact 30-byte `_SYSTEM_VERSION` result slot read by stock command 3.
 pub const DEVICE_INFORMATION_OFFSET: usize = 0x52a;
 pub const DEVICE_INFORMATION_LEN: usize = 30;
+/// Exact live-P4 command-7 `_NETWORK_CONNECT_INFO` result slot.
+pub const CONNECTION_INFO_OFFSET: usize = 0x8d6c;
+pub const CONNECTION_INFO_LEN: usize = state::CONNECTION_INFO_LEN;
 /// `libltesdk.so` live-P4 compiled SDK version filled locally after `0xb003`.
 pub const STOCK_SDK_VERSION: [u8; 4] = [3, 7, 18, 2];
 /// Live-P4 `gdmlte.ko` `DRIVER_VERSION` (`1.0.2`) after stock `GET_DRV_VER` parsing.
@@ -80,6 +88,7 @@ pub enum HandleError {
     PdnDisconnectCallback(PdnDisconnectCallbackError),
     TransactionIdsExhausted,
     ApnState(ApnStateError),
+    ConnectionState(ConnectionStateError),
     PlmnSearch(PlmnInfoDecodeError),
     PlmnList(PlmnInfoDecodeError),
     Send(SendCommandError),
@@ -150,6 +159,7 @@ impl std::fmt::Display for HandleError {
             }
             Self::TransactionIdsExhausted => write!(f, "no free OEM transaction ID in 1..=253"),
             Self::ApnState(error) => write!(f, "invalid stock APN/TID state request: {error:?}"),
+            Self::ConnectionState(error) => write!(f, "invalid stock connection state: {error:?}"),
             Self::PlmnSearch(error) => write!(f, "invalid PLMN-search response: {error:?}"),
             Self::PlmnList(error) => write!(f, "invalid PLMN-list response: {error:?}"),
             Self::Send(error) => write!(f, "modem send failed: {error:?}"),
@@ -182,6 +192,7 @@ impl std::error::Error for HandleError {
             | Self::PdnDisconnectCallback(_)
             | Self::TransactionIdsExhausted
             | Self::ApnState(_)
+            | Self::ConnectionState(_)
             | Self::PlmnSearch(_)
             | Self::PlmnList(_)
             | Self::Send(_)
@@ -2583,142 +2594,6 @@ pub fn broadcast_plmn_list_callback(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ApnStateError {
-    InvalidConfiguredType(u32),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SpecialTidRecord {
-    message_id: u16,
-    default_eps_id: u16,
-    tid_type: u8,
-    requested_apn_type: u8,
-    ip_allocation: u8,
-}
-
-impl SpecialTidRecord {
-    fn decode(command: u16, bytes: &[u8]) -> Result<Self, HandleError> {
-        let bytes: [u8; 7] = bytes
-            .try_into()
-            .map_err(|_| HandleError::UnexpectedParameters {
-                command,
-                expected: 7,
-                actual: bytes.len(),
-            })?;
-        Ok(Self {
-            message_id: u16::from_be_bytes([bytes[0], bytes[1]]),
-            default_eps_id: u16::from_be_bytes([bytes[2], bytes[3]]),
-            tid_type: bytes[4],
-            requested_apn_type: bytes[5],
-            ip_allocation: bytes[6],
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TidStateEntry {
-    tid: u8,
-    record: SpecialTidRecord,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct ApnState {
-    configured_type: u8,
-    tids: Vec<TidStateEntry>,
-}
-
-impl ApnState {
-    const fn new() -> Self {
-        Self {
-            configured_type: 0,
-            tids: Vec::new(),
-        }
-    }
-
-    fn set_configured_type(&mut self, value: u32) -> Result<(), ApnStateError> {
-        let narrowed =
-            u8::try_from(value).map_err(|_| ApnStateError::InvalidConfiguredType(value))?;
-        if narrowed <= 7 || narrowed == 0xff {
-            self.configured_type = narrowed;
-            Ok(())
-        } else {
-            Err(ApnStateError::InvalidConfiguredType(value))
-        }
-    }
-
-    fn apn_type_by_default_eps_id(&self, default_eps_id: u16) -> u8 {
-        self.tids
-            .iter()
-            .find(|entry| entry.record.default_eps_id == default_eps_id)
-            .map_or(0xff, |entry| entry.record.requested_apn_type)
-    }
-
-    fn contains_tid(&self, tid: u8) -> bool {
-        self.tids.iter().any(|entry| entry.tid == tid)
-    }
-
-    fn add_special_tid(&mut self, tid: u8, mut record: SpecialTidRecord) {
-        if record.tid_type == 1
-            && let Some(index) = self.tids.iter().position(|entry| entry.tid == 0)
-        {
-            let normal = self.tids.remove(index).record;
-            record.default_eps_id = normal.default_eps_id;
-            record.requested_apn_type = normal.requested_apn_type;
-            record.ip_allocation = normal.ip_allocation;
-        }
-        debug_assert!(!self.contains_tid(tid));
-        self.tids.push(TidStateEntry { tid, record });
-    }
-
-    fn add_normal_tid(
-        &mut self,
-        tid: u8,
-        message_id: u16,
-        requested_apn_type: u8,
-        default_eps_id: u16,
-        ip_allocation: u8,
-    ) {
-        debug_assert!(!self.contains_tid(tid));
-        self.tids.push(TidStateEntry {
-            tid,
-            record: SpecialTidRecord {
-                message_id,
-                default_eps_id,
-                tid_type: 0,
-                requested_apn_type,
-                ip_allocation,
-            },
-        });
-    }
-
-    fn update_default_eps_id(&mut self, tid: u8, default_eps_id: u16) {
-        if let Some(entry) = self.tids.iter_mut().find(|entry| entry.tid == tid) {
-            entry.record.default_eps_id = default_eps_id;
-        }
-    }
-
-    fn delete_by_tid(&mut self, tid: u8) {
-        if let Some(index) = self.tids.iter().position(|entry| entry.tid == tid) {
-            self.tids.remove(index);
-        }
-    }
-
-    fn clear_tids(&mut self) {
-        self.tids.clear();
-    }
-
-    fn delete_by_apn_type(&mut self, apn_type: u8) {
-        if let Some(index) = self
-            .tids
-            .iter()
-            .position(|entry| entry.record.requested_apn_type == apn_type)
-        {
-            self.tids.remove(index);
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartupPhase {
     Idle,
     AwaitingPsInit,
@@ -2740,6 +2615,7 @@ pub struct DeviceBridge {
     startup_phase: StartupPhase,
     deferred_calls: Vec<DeferredSdkCall>,
     apn_state: ApnState,
+    nic_state: NicState,
 }
 
 impl DeviceBridge {
@@ -2751,6 +2627,7 @@ impl DeviceBridge {
             startup_phase: StartupPhase::Idle,
             deferred_calls: Vec::new(),
             apn_state: ApnState::new(),
+            nic_state: NicState::new(),
         }
     }
 
@@ -2772,6 +2649,14 @@ impl DeviceBridge {
     #[must_use]
     pub const fn init_complete(&self) -> bool {
         matches!(self.startup_phase, StartupPhase::Complete)
+    }
+
+    /// Merge one stock IPv6 Router Advertisement prefix into the matching
+    /// connection record. The interface ID and DNS values remain modem-owned;
+    /// only the high 64-bit prefix and the post-configuration cache are updated.
+    #[must_use]
+    pub fn apply_ipv6_prefix(&mut self, interface_name: &str, prefix: [u8; 16]) -> bool {
+        self.nic_state.apply_ipv6_prefix(interface_name, prefix)
     }
 
     #[must_use]
@@ -2835,26 +2720,17 @@ impl DeviceBridge {
 
         let dispatch = if request.device_id == self.device_id {
             match request.known_command() {
-                Ok(SdkCommand::GetPsInitComplete) => {
-                    if request.params.is_empty() {
-                        context
-                            .write(PS_INIT_COMPLETE_OFFSET, &[u8::from(self.init_complete())])?;
-                        Ok(HandledCall {
-                            command: SdkCommand::GetPsInitComplete,
-                            device_id: request.device_id,
-                            bytes_written: 0,
-                        })
-                    } else {
-                        Err(HandleError::UnexpectedParameters {
-                            command: request.command,
-                            expected: 0,
-                            actual: request.params.len(),
-                        })
-                    }
-                }
+                Ok(SdkCommand::GetPsInitComplete) => self
+                    .dispatch_ps_init_complete(request, |value| {
+                        context.write(PS_INIT_COMPLETE_OFFSET, &[value])
+                    }),
                 Ok(SdkCommand::GetDeviceInformation) => {
                     self.dispatch_device_information(modem, request)
                 }
+                Ok(SdkCommand::GetConnectionInfo) => self
+                    .dispatch_connection_info(request, |snapshot| {
+                        context.write(CONNECTION_INFO_OFFSET, snapshot)
+                    }),
                 Ok(
                     SdkCommand::SetApnType
                     | SdkCommand::GetApnType
@@ -2921,6 +2797,53 @@ impl DeviceBridge {
         status_result?;
         release_result?;
         dispatch
+    }
+
+    fn dispatch_ps_init_complete<F>(
+        &self,
+        request: SdkApiRequest<'_>,
+        write_result: F,
+    ) -> Result<HandledCall, HandleError>
+    where
+        F: FnOnce(u8) -> io::Result<()>,
+    {
+        if !request.params.is_empty() {
+            return Err(HandleError::UnexpectedParameters {
+                command: request.command,
+                expected: 0,
+                actual: request.params.len(),
+            });
+        }
+        write_result(u8::from(self.init_complete()))?;
+        Ok(HandledCall {
+            command: SdkCommand::GetPsInitComplete,
+            device_id: request.device_id,
+            bytes_written: 0,
+        })
+    }
+
+    fn dispatch_connection_info<F>(
+        &self,
+        request: SdkApiRequest<'_>,
+        write_result: F,
+    ) -> Result<HandledCall, HandleError>
+    where
+        F: FnOnce(&[u8]) -> io::Result<()>,
+    {
+        if request.params.len() != CONNECTION_INFO_LEN {
+            return Err(HandleError::UnexpectedParameters {
+                command: request.command,
+                expected: CONNECTION_INFO_LEN,
+                actual: request.params.len(),
+            });
+        }
+        let snapshot = self.nic_state.snapshot();
+        write_result(&snapshot)?;
+        Ok(HandledCall {
+            command: SdkCommand::GetConnectionInfo,
+            device_id: request.device_id,
+            bytes_written: 0,
+        })
     }
 
     fn handle_attach_ext_event(
@@ -3159,6 +3082,12 @@ impl DeviceBridge {
         if response.register_result2 == 0 {
             self.apn_state
                 .update_default_eps_id(response.transaction_id, response.default_eps_id);
+            let apn_type = self
+                .apn_state
+                .resolved_apn_type_for_tid(response.transaction_id);
+            self.nic_state
+                .apply_attach(response, apn_type)
+                .map_err(HandleError::ConnectionState)?;
         } else {
             self.apn_state.delete_by_tid(response.transaction_id);
         }
@@ -3180,6 +3109,14 @@ impl DeviceBridge {
             self.apn_state
                 .update_default_eps_id(response.transaction_id, response.default_eps_id);
         }
+        if response.result == 1 {
+            let apn_type = self
+                .apn_state
+                .resolved_apn_type_for_tid(response.transaction_id);
+            self.nic_state
+                .apply_pdn_connect(response, apn_type)
+                .map_err(HandleError::ConnectionState)?;
+        }
         broadcast_pdn_connect_callback(server, self.device_id, response).map(Some)
     }
 
@@ -3193,6 +3130,8 @@ impl DeviceBridge {
             return Ok(None);
         }
         if matches!(response.result, 101 | 108) {
+            self.nic_state
+                .clear_by_default_eps_id(response.default_eps_id);
             self.apn_state.delete_by_tid(response.transaction_id);
         }
         broadcast_pdn_disconnect_callback(server, self.device_id, response).map(Some)
@@ -3347,7 +3286,7 @@ impl DeviceBridge {
                         actual: request.params.len(),
                     });
                 }
-                write_result(self.apn_state.configured_type)?;
+                write_result(self.apn_state.configured_type())?;
             }
             SdkCommand::GetApnTypeByDefaultEpsId => {
                 let bytes: [u8; 2] =
@@ -3365,11 +3304,24 @@ impl DeviceBridge {
                 )?;
             }
             SdkCommand::DeleteApnTypeFromTidNode => {
-                let record = SpecialTidRecord::decode(request.command, request.params)?;
-                self.apn_state.delete_by_apn_type(record.requested_apn_type);
+                let record = SpecialTidRecord::decode(request.params).map_err(|actual| {
+                    HandleError::UnexpectedParameters {
+                        command: request.command,
+                        expected: 7,
+                        actual,
+                    }
+                })?;
+                self.apn_state
+                    .delete_by_apn_type(record.requested_apn_type());
             }
             SdkCommand::AddSpecialTid => {
-                let record = SpecialTidRecord::decode(request.command, request.params)?;
+                let record = SpecialTidRecord::decode(request.params).map_err(|actual| {
+                    HandleError::UnexpectedParameters {
+                        command: request.command,
+                        expected: 7,
+                        actual,
+                    }
+                })?;
                 let tid = self.allocate_transaction_id()?;
                 self.apn_state.add_special_tid(tid, record);
             }
@@ -4122,17 +4074,17 @@ mod tests {
     };
 
     use super::{
-        APN_TYPE_RESULT_OFFSET, ApnStateError, BroadcastReport, DEVICE_INFORMATION_LEN,
-        DEVICE_INFORMATION_OFFSET, DeviceBridge, HandleError, LTE_API_RET_OFFSET,
-        LegacyAttachDecodeError, LegacyAttachExtDecodeError, LegacyAttachExtStringField,
-        LegacyAttachStringField, LegacyPdnConnectDecodeError, LegacyPdnConnectExtDecodeError,
-        LegacyPdnConnectExtStringField, LegacyPdnConnectStringField,
-        LegacyPdnDisconnectDecodeError, LegacyRrcCapabilityDecodeError,
-        LegacySetProtocolInfoDecodeError, LegacyUiccDecodeError, PS_INIT_COMPLETE_OFFSET,
-        StartupPhase, UiccCallbackError, broadcast_result_callback, decode_legacy_attach,
-        decode_legacy_attach_ext, decode_legacy_pdn_connect_ext, decode_legacy_pdn_disconnect,
-        decode_legacy_rrc_capability_get, decode_legacy_rrc_capability_set,
-        decode_legacy_set_protocol_info,
+        APN_TYPE_RESULT_OFFSET, ApnStateError, BroadcastReport, CONNECTION_INFO_LEN,
+        CONNECTION_INFO_OFFSET, DEVICE_INFORMATION_LEN, DEVICE_INFORMATION_OFFSET, DeviceBridge,
+        HandleError, LTE_API_RET_OFFSET, LegacyAttachDecodeError, LegacyAttachExtDecodeError,
+        LegacyAttachExtStringField, LegacyAttachStringField, LegacyPdnConnectDecodeError,
+        LegacyPdnConnectExtDecodeError, LegacyPdnConnectExtStringField,
+        LegacyPdnConnectStringField, LegacyPdnDisconnectDecodeError,
+        LegacyRrcCapabilityDecodeError, LegacySetProtocolInfoDecodeError, LegacyUiccDecodeError,
+        PS_INIT_COMPLETE_OFFSET, StartupPhase, UiccCallbackError, broadcast_result_callback,
+        decode_legacy_attach, decode_legacy_attach_ext, decode_legacy_pdn_connect_ext,
+        decode_legacy_pdn_disconnect, decode_legacy_rrc_capability_get,
+        decode_legacy_rrc_capability_set, decode_legacy_set_protocol_info,
     };
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -4350,6 +4302,114 @@ mod tests {
         assert_eq!(
             modem.into_transport().into_inner().into_inner(),
             Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn get_connection_info_materializes_typed_attach_network_state() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        let mut attach = [0_u8; 352];
+        attach[0] = 1;
+        attach[0x067] = 4;
+        attach[0x152] = 3;
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::Attach as u16,
+                    device_id: 1,
+                    params: &attach,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+
+        let mut attach_rsp = vec![
+            0, 0, // register_result1
+            0, 0, // register_result2
+            0x12, 0x34, // default EPS ID
+            0, 9, // EPS ID
+            1, 4, // data path / IP allocation
+            0, 0, 0, 0, 0, // network features
+            0x20, 1, 1, // allocated transaction ID
+            0x04, 8, b'i', b'n', b't', b'e', b'r', b'n', b'e', b't', // APN
+        ];
+        let pdn_fields = [
+            0x05, 1, 3, // PDN type
+            0x07, 4, 10, 20, 30, 40, // IPv4
+            0x08, 4, 1, 1, 1, 1, // IPv4 DNS 1
+            0x09, 4, 8, 8, 8, 8, // IPv4 DNS 2
+            0x0a, 16, 0x20, 1, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0b, 16, 0x20, 1,
+            0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0x0c, 8, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x66, 0x77, 0x88,
+        ];
+        attach_rsp.push(0xf0);
+        attach_rsp.push(u8::try_from(pdn_fields.len()).unwrap_or_else(|_| std::process::abort()));
+        attach_rsp.extend_from_slice(&pdn_fields);
+        attach_rsp.extend_from_slice(&[0x5b, 2, 0x05, 0xdc]); // IPv4 MTU 1500
+
+        assert_eq!(
+            route_one_hci(&mut bridge, &mut server, hci_frame(0xb102, &attach_rsp)),
+            Some(BroadcastReport::default())
+        );
+
+        let params = vec![0_u8; CONNECTION_INFO_LEN];
+        let handled = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::GetConnectionInfo as u16,
+                    device_id: 1,
+                    params: &params,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(handled.command, SdkCommand::GetConnectionInfo);
+        assert_eq!(handled.bytes_written, 0);
+        assert_eq!(read_api_ret(&mut server, id), 0);
+
+        let mut snapshot = vec![0_u8; CONNECTION_INFO_LEN];
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .read(CONNECTION_INFO_OFFSET, &mut snapshot)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(&snapshot[..4], &1_u32.to_be_bytes());
+        let record = &snapshot[4..4 + 0x202];
+        assert_eq!(&record[..8], b"lte0pdn3");
+        assert_eq!(&record[0x100..0x104], &8_u32.to_be_bytes());
+        assert_eq!(&record[0x104..0x108], &3_u32.to_be_bytes());
+        assert_eq!(record[0x10d], 1);
+        assert_eq!(record[0x10e], 3);
+        assert_eq!(record[0x10f], 4);
+        assert_eq!(&record[0x111..0x113], &0x1234_u16.to_be_bytes());
+        assert_eq!(&record[0x113..0x11b], b"internet");
+        assert_eq!(&record[0x154..0x158], &[10, 20, 30, 40]);
+        assert_eq!(&record[0x158..0x15c], &[0xff, 0, 0, 0]);
+        assert_eq!(&record[0x15c..0x160], &[10, 0, 0, 0xd7]);
+        assert_eq!(&record[0x160..0x164], &[1, 1, 1, 1]);
+        assert_eq!(&record[0x164..0x168], &[8, 8, 8, 8]);
+        assert_eq!(&record[0x168..0x16a], &1500_u16.to_be_bytes());
+        assert_eq!(
+            &record[0x172..0x17a],
+            &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]
+        );
+        assert_eq!(
+            &record[0x18a..0x19a],
+            &[0x20, 1, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+        );
+        assert_eq!(
+            &record[0x19a..0x1aa],
+            &[0x20, 1, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]
         );
     }
 

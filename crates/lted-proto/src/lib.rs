@@ -165,6 +165,7 @@ pub struct UnknownEvent(pub u16);
 pub enum SdkCommand {
     GetPsInitComplete = 0,
     GetDeviceInformation = 3,
+    GetConnectionInfo = 7,
     SetApnType = 14,
     GetApnType = 15,
     GetApnTypeByDefaultEpsId = 16,
@@ -211,6 +212,7 @@ impl TryFrom<u16> for SdkCommand {
         match value {
             0 => Ok(Self::GetPsInitComplete),
             3 => Ok(Self::GetDeviceInformation),
+            7 => Ok(Self::GetConnectionInfo),
             14 => Ok(Self::SetApnType),
             15 => Ok(Self::GetApnType),
             16 => Ok(Self::GetApnTypeByDefaultEpsId),

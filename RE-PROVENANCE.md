@@ -1758,13 +1758,16 @@ Attach/PDN-connect failure deletions, disconnect-request retirement, Detach
 cleanup, and the cleaner invariant that a failed GLIF write leaves no stale
 replacement-side TID node.
 
-## Live P4 GetConnectionInfo — local snapshot contract mapped, implementation deferred
+## Live P4 GetConnectionInfo — local snapshot implemented, IPv6 parity still gated
 
 The stock `LTED_GetConnectionInfo@0xfc44` / `LAPI_GetConnectionInfo@0x4f5cc`
-path is now mapped end-to-end, but is deliberately **not implemented yet**.
-Unlike a modem request it is a synchronous snapshot of the SDK's own PDN/NIC
-manager, so implementing command 7 before that state manager is complete would
-return believable but false compatibility data.
+path is mapped end-to-end. The architecture-cleanup branch now contains an
+in-progress command-7 implementation with a five-slot compatibility state
+manager and exact snapshot encoder. Attach and normal PDN-connect responses feed
+that manager directly from typed `gct-lapi` semantics; the bridge does **not**
+serialize a stock callback and then read magic offsets back out of that byte image.
+The command remains a work-in-progress compatibility path, however, because the
+host IPv6 prefix/network-state feed described below is not yet connected to `gctd`.
 
 Live P4 `liblted.so` sends SDK command **7** with an exact historical
 **`0x0a0e` (2574)-byte** caller object. The live daemon ignores the input
@@ -1815,15 +1818,22 @@ sets the final gateway octet to bitwise-NOT of the assigned final octet (or
 `1` when the assigned octet is `255`). This odd rule is intentional stock
 behavior.
 
-IPv6 is the reason command 7 remains deferred. The modem callback supplies only
-the low 64-bit interface ID. The live helper at `0x3d248` copies those eight
-bytes into the low half of `ipv6_address` and immediately invokes
-`io_ioctl_by_ifname`; the high 64-bit prefix and related host-network state are
-completed later by the SDK's kernel/network IPv6 event path. Therefore a
-bridge that only remembered modem callbacks would silently return incomplete
-records once the host interface had configured IPv6. The clean replacement
-will implement command 7 together with the corresponding NIC/kernel state feed,
-rather than zero-filling those bytes and claiming parity.
+IPv6 is the remaining blocker to declaring command 7 compatible. The modem
+callback supplies only the low 64-bit interface ID. The live helper at `0x3d248`
+copies those eight bytes into the low half of `ipv6_address` and immediately
+invokes `io_ioctl_by_ifname`; the high 64-bit prefix and related host-network
+state are completed later by the SDK's kernel/network IPv6 event path. The clean
+bridge now exposes an explicit prefix/state merge hook, but `gctd` has no proven
+runtime source feeding that hook yet. Until that source is recovered and wired,
+command 7 must not be presented as full dual-stack parity: modem-only state would
+silently become incomplete after host IPv6 configuration.
+
+The architecture-cleanup test suite now locks the local command-7 object length and
+shared-memory offset plus an end-to-end typed Attach -> compatibility-state ->
+`_NETWORK_CONNECT_INFO` snapshot path. It checks slot compaction/count, NIC naming,
+APN type/default EPS ID, APN bytes, PDN/IP-allocation state, IPv4 address/DNS/MTU,
+the recovered classful gateway/mask rule, and modem-owned IPv6 interface-ID/DNS
+fields without coupling those checks to stock callback serialization.
 
 ## Live P4 NAS configuration — shipped request path, dormant completion path
 

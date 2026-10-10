@@ -8,12 +8,24 @@ and extracted proprietary files. Reverse-engineering inputs remain in the parent
 
 Current crates:
 
-- `gct-hci`: exact GCT HCI framing plus only verified public/recovered opcodes.
-- `gct-lapi`: typed clean codecs for proven attach/detach, PDN, PLMN, UICC, online/offline and AT paths.
+- `gct-hci`: exact GCT HCI framing, TLV primitives and verified public/recovered opcodes.
+- `gct-lapi`: typed clean codecs for proven modem request/response families; no stock `liblted.so` ABI.
 - `gct-transport`: safe `/dev/glif0` byte transport plus incremental HCI stream framing across split/coalesced reads.
-- `gct-runtime`: modem core owning GLIF buffering, typed proven TX/P0 event dispatch, conservative request correlation and the observed startup handshake; includes the `gctd` executable harness.
-- `lted-proto`: exact local `lted` framing and the minimum critical SDK command set.
+- `gct-runtime`: modem request correlation, startup sequencing and typed modem-event decoding above transport.
+- `lted-proto`: exact local `lted` datagram envelopes, SDK command IDs and callback metadata.
+- `lted-sysv`: bounded System V shared-memory/semaphore compatibility for stock clients.
+- `lted-compat`: stock local client/socket lifecycle and shared-context access.
+- `lted-bridge`: translation between the stock client ABI and clean modem/runtime semantics, including compatibility-only state.
+- `gctd`: process integration and polling/event-loop wiring for the layers above.
+
+The dependency direction is deliberate: modem wire data is decoded into typed
+semantics before compatibility translation. Historical stock ABI byte layouts are
+output formats, not an internal state model. In particular, connection state is
+maintained from typed Attach/PDN responses rather than reconstructed from serialized
+stock callback images.
 
 The rule is evidence first: guessed layouts do not enter executable protocol
 code. Every recovered constant should be traceable to either upstream GCT/Linux
-source or a specific OEM function/disassembly.
+source or a specific OEM function/disassembly. A compatibility path that still
+lacks a required host/modem state feed remains work in progress rather than
+silently returning plausible-but-incomplete data.
