@@ -16,6 +16,7 @@ use gct_lapi::{
     AtCommand, AtCommandExt, AtCommandFromDevice, AtCommandFromDeviceExt, AttachEncodeError,
     AttachExtEncodeError, AttachExtRequest, AttachExtResponse, AttachRequest, AttachResponse,
     AttachResponseDecodeError, DetachRequest, DetachRequiredIndication, DetachResponse,
+    DeviceInformationDecodeError, DeviceInformationRequest, DeviceInformationResponse,
     EmmControlDecodeError, EmmControlReport, EmmControlResponse, EmmNiReattachControlRequest,
     EmmReattachControlReport, EmmTimerControlRequest, EmmTimerStartRequest, EmptyRequest,
     IccidReadRequest, IccidReadResponse, LcsControlRequest, LppControlRequest, MiscReadDecodeError,
@@ -179,6 +180,7 @@ pub enum ModemEvent<'a> {
     RrcCapabilitySet(RrcCapabilitySetResponse<'a>),
     RrcCapabilityGet(RrcCapabilityGetResponse<'a>),
     SetProtocolInfo(SetProtocolInfoResponse<'a>),
+    DeviceInformation(DeviceInformationResponse),
     Unknown(Packet<'a>),
 }
 
@@ -193,6 +195,7 @@ pub enum EventDecodeError {
     MiscRead(MiscReadDecodeError),
     Uicc(UiccResponseDecodeError),
     EmmControl(EmmControlDecodeError),
+    DeviceInformation(DeviceInformationDecodeError),
 }
 
 /// Typed outbound commands with fully recovered request encoders.
@@ -234,6 +237,7 @@ pub enum ModemCommand<'a> {
     RrcCapabilitySet(RrcCapabilitySetRequest<'a>),
     RrcCapabilityGet(RrcCapabilityGetRequest),
     SetProtocolInfo(SetProtocolInfoRequest<'a>),
+    DeviceInformation(DeviceInformationRequest),
 }
 
 /// Identity available on both sides of a proven request/response exchange.
@@ -261,6 +265,7 @@ pub enum ResponseKey {
     RrcCapabilitySet(u16),
     RrcCapabilityGet(u16),
     SetProtocolInfo(u16),
+    DeviceInformation,
 }
 
 impl ModemCommand<'_> {
@@ -315,6 +320,7 @@ impl ModemCommand<'_> {
             Self::RrcCapabilitySet(request) => Some(ResponseKey::RrcCapabilitySet(request.type_id)),
             Self::RrcCapabilityGet(request) => Some(ResponseKey::RrcCapabilityGet(request.type_id)),
             Self::SetProtocolInfo(request) => Some(ResponseKey::SetProtocolInfo(request.type_id)),
+            Self::DeviceInformation(_) => Some(ResponseKey::DeviceInformation),
         }
     }
 }
@@ -361,6 +367,7 @@ impl ModemEvent<'_> {
                 Some(ResponseKey::RrcCapabilityGet(response.type_id))
             }
             Self::SetProtocolInfo(response) => Some(ResponseKey::SetProtocolInfo(response.type_id)),
+            Self::DeviceInformation(_) => Some(ResponseKey::DeviceInformation),
         }
     }
 }
@@ -573,6 +580,7 @@ pub fn encode_command(
         ModemCommand::RrcCapabilitySet(request) => Ok(request.encode(output)?),
         ModemCommand::RrcCapabilityGet(request) => Ok(request.encode(output)?),
         ModemCommand::SetProtocolInfo(request) => Ok(request.encode(output)?),
+        ModemCommand::DeviceInformation(request) => Ok(request.encode(output)?),
     }
 }
 
@@ -609,6 +617,12 @@ impl From<MiscReadDecodeError> for EventDecodeError {
 impl From<UiccResponseDecodeError> for EventDecodeError {
     fn from(value: UiccResponseDecodeError) -> Self {
         Self::Uicc(value)
+    }
+}
+
+impl From<DeviceInformationDecodeError> for EventDecodeError {
+    fn from(value: DeviceInformationDecodeError) -> Self {
+        Self::DeviceInformation(value)
     }
 }
 
@@ -692,6 +706,9 @@ pub fn decode_event(packet: Packet<'_>) -> Result<ModemEvent<'_>, EventDecodeErr
         )),
         recovered_opcode::SET_PROTOCOL_INFO_RESPONSE => Ok(ModemEvent::SetProtocolInfo(
             SetProtocolInfoResponse::parse(packet)?,
+        )),
+        public_opcode::LTE_GET_INFORMATION_RESULT => Ok(ModemEvent::DeviceInformation(
+            DeviceInformationResponse::parse(packet)?,
         )),
         recovered_opcode::MISC_READ_RESPONSE => match MiscReadResponse::parse(packet)? {
             MiscReadResponse::MobileId(response) => Ok(ModemEvent::MobileIdRead(response)),
@@ -888,12 +905,12 @@ mod tests {
     use gct_hci::{Header, Packet, public_opcode, recovered_opcode};
     use gct_lapi::{
         AtCommand, AtCommandExt, AtCommandFromDevice, AttachExtProfile, AttachExtRequest,
-        EmmNiReattachControlRequest, EmmTimerControlRequest, EmmTimerStartRequest, EmptyRequest,
-        IccidReadRequest, LcsControlRequest, LppControlRequest, MobileIdReadRequest,
-        MsisdnReadRequest, PcoInfo, PinData, PlmnSearchExtRequest, PlmnSearchRequest,
-        PlmnSearchStopRequest, PsmControlRequest, ResponseDecodeError, ResultResponseKind,
-        RrcCapabilityGetRequest, RrcCapabilitySetRequest, SetProtocolInfoRequest,
-        TemperatureReadRequest, UiccPinCommandRequest,
+        DeviceInformationRequest, EmmNiReattachControlRequest, EmmTimerControlRequest,
+        EmmTimerStartRequest, EmptyRequest, IccidReadRequest, LcsControlRequest, LppControlRequest,
+        MobileIdReadRequest, MsisdnReadRequest, PcoInfo, PinData, PlmnSearchExtRequest,
+        PlmnSearchRequest, PlmnSearchStopRequest, PsmControlRequest, ResponseDecodeError,
+        ResultResponseKind, RrcCapabilityGetRequest, RrcCapabilitySetRequest,
+        SetProtocolInfoRequest, TemperatureReadRequest, UiccPinCommandRequest,
     };
     use gct_transport::HciIo;
 
@@ -1551,6 +1568,32 @@ mod tests {
             std::process::abort();
         };
         assert_eq!(event.response_key(), Some(ResponseKey::SetProtocolInfo(8)));
+    }
+
+    #[test]
+    fn device_information_uses_family_key_and_decodes_modem_owned_versions() {
+        let command = ModemCommand::DeviceInformation(DeviceInformationRequest);
+        assert_eq!(command.response_key(), Some(ResponseKey::DeviceInformation));
+
+        let payload = [0xa0, 4, 1, 2, 3, 4, 0xa1, 2, 5, 6];
+        let packet = Packet {
+            header: Header {
+                command: public_opcode::LTE_GET_INFORMATION_RESULT,
+                payload_len: 10,
+            },
+            payload: &payload,
+        };
+        let Ok(event) = decode_event(packet) else {
+            std::process::abort();
+        };
+        assert_eq!(event.response_key(), Some(ResponseKey::DeviceInformation));
+        assert_eq!(
+            event,
+            ModemEvent::DeviceInformation(gct_lapi::DeviceInformationResponse {
+                fw_revision: [1, 2, 3, 4],
+                chip_revision: [5, 6],
+            })
+        );
     }
 
     #[test]

@@ -11,25 +11,26 @@ use std::{io, io::Write};
 use gct_lapi::{
     ApnType, AtCommand, AtCommandExt, AttachExtProfile, AttachExtRequest, AttachExtResponse,
     AttachRequest, AttachResponse, AttachTailDecodeError, AttachTailField, DetachRequest,
-    DetachRequiredIndication, DetachResponse, EmergencyNumberDecodeError,
-    EmmNiReattachControlRequest, EmmReattachControlReport, EmmTimerControlRequest,
-    EmmTimerStartRequest, EmptyRequest, IccidReadRequest, IccidReadResponse, LcsControlRequest,
-    LppControlRequest, MobileIdReadRequest, MobileIdReadResponse, MsisdnReadRequest,
-    MsisdnReadResponse, PcoInfo, PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest,
-    PdnConnectResponse, PdnConnectTailDecodeError, PdnConnectTailField, PdnConnectionControl,
-    PdnDisconnectField, PdnDisconnectFieldDecodeError, PdnDisconnectRequest, PdnDisconnectResponse,
-    PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError,
-    PlmnListResponse, PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchResponse,
-    PlmnSearchStopRequest, PlmnSearchStopResponse, Positioning, PsmControlRequest, QosField,
-    ResultResponse, ResultResponseKind, RrcCapabilityGetRequest, RrcCapabilityGetResponse,
-    RrcCapabilitySetRequest, RrcCapabilitySetResponse, SetProtocolInfoRequest,
-    SetProtocolInfoResponse, TemperatureReadRequest, TemperatureReadResponse, UeModeChangeRequest,
-    UeModeChangeResponse, UiccFixedRequest, UiccPinStatusRequest, UiccReadBinaryRequest,
-    UiccReadRecordRequest, UiccResponse, UiccStatusRequest, uicc_control,
+    DetachRequiredIndication, DetachResponse, DeviceInformationRequest, DeviceInformationResponse,
+    EmergencyNumberDecodeError, EmmNiReattachControlRequest, EmmReattachControlReport,
+    EmmTimerControlRequest, EmmTimerStartRequest, EmptyRequest, IccidReadRequest,
+    IccidReadResponse, LcsControlRequest, LppControlRequest, MobileIdReadRequest,
+    MobileIdReadResponse, MsisdnReadRequest, MsisdnReadResponse, PcoInfo, PdnConnectExtRequest,
+    PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse, PdnConnectTailDecodeError,
+    PdnConnectTailField, PdnConnectionControl, PdnDisconnectField, PdnDisconnectFieldDecodeError,
+    PdnDisconnectRequest, PdnDisconnectResponse, PdnInfoContainers, PdnInfoField,
+    PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse, PlmnSearchExtRequest,
+    PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
+    Positioning, PsmControlRequest, QosField, ResultResponse, ResultResponseKind,
+    RrcCapabilityGetRequest, RrcCapabilityGetResponse, RrcCapabilitySetRequest,
+    RrcCapabilitySetResponse, SetProtocolInfoRequest, SetProtocolInfoResponse,
+    TemperatureReadRequest, TemperatureReadResponse, UeModeChangeRequest, UeModeChangeResponse,
+    UiccFixedRequest, UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest,
+    UiccResponse, UiccStatusRequest, uicc_control,
 };
 use gct_runtime::{
-    Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
-    SendTrackedCommandError,
+    EventDecodeError, Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey,
+    SendCommandError, SendTrackedCommandError,
 };
 use lted_compat::Server;
 use lted_proto::{SdkApiRequest, SdkCallback, SdkCallbackKind, SdkCommand};
@@ -39,6 +40,13 @@ use lted_proto::{SdkApiRequest, SdkCallback, SdkCallbackKind, SdkCommand};
 pub const LTE_API_RET_OFFSET: usize = 0x524;
 /// One-byte `LTED_GetPSInitComplete` return slot in the stock shared context.
 pub const PS_INIT_COMPLETE_OFFSET: usize = 0x528;
+/// Exact 30-byte `_SYSTEM_VERSION` result slot read by stock command 3.
+pub const DEVICE_INFORMATION_OFFSET: usize = 0x52a;
+pub const DEVICE_INFORMATION_LEN: usize = 30;
+/// `libltesdk.so` live-P4 compiled SDK version filled locally after `0xb003`.
+pub const STOCK_SDK_VERSION: [u8; 4] = [3, 7, 18, 2];
+/// Live-P4 `gdmlte.ko` `DRIVER_VERSION` (`1.0.2`) after stock `GET_DRV_VER` parsing.
+pub const STOCK_DRIVER_VERSION: [u8; 4] = [1, 0, 2, 0];
 
 #[derive(Debug)]
 pub enum HandleError {
@@ -1733,6 +1741,30 @@ pub struct HandledCall {
     pub bytes_written: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompletionMode {
+    Immediate,
+    Deferred(ResponseKey),
+}
+
+impl HandledCall {
+    #[must_use]
+    pub const fn completion_mode(self) -> CompletionMode {
+        match self.command {
+            SdkCommand::GetDeviceInformation => {
+                CompletionMode::Deferred(ResponseKey::DeviceInformation)
+            }
+            _ => CompletionMode::Immediate,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeferredSdkCall {
+    client_id: u8,
+    key: ResponseKey,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BroadcastReport {
     pub registered_clients: usize,
@@ -2561,6 +2593,7 @@ pub struct DeviceBridge {
     device_id: u32,
     pending: PendingRequests,
     startup_phase: StartupPhase,
+    deferred_calls: Vec<DeferredSdkCall>,
 }
 
 impl DeviceBridge {
@@ -2570,6 +2603,7 @@ impl DeviceBridge {
             device_id,
             pending: PendingRequests::new(),
             startup_phase: StartupPhase::Idle,
+            deferred_calls: Vec::new(),
         }
     }
 
@@ -2581,6 +2615,11 @@ impl DeviceBridge {
     #[must_use]
     pub const fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    #[must_use]
+    pub const fn deferred_count(&self) -> usize {
+        self.deferred_calls.len()
     }
 
     #[must_use]
@@ -2666,6 +2705,9 @@ impl DeviceBridge {
                         })
                     }
                 }
+                Ok(SdkCommand::GetDeviceInformation) => {
+                    self.dispatch_device_information(modem, request)
+                }
                 Ok(SdkCommand::Attach) => self.dispatch_attach(modem, request),
                 Ok(SdkCommand::AttachExt) => self.dispatch_attach_ext(modem, request),
                 Ok(SdkCommand::Detach) => self.dispatch_detach(modem, request),
@@ -2707,6 +2749,13 @@ impl DeviceBridge {
                 expected: self.device_id,
             })
         };
+        if let Ok(call) = dispatch
+            && let CompletionMode::Deferred(key) = call.completion_mode()
+        {
+            self.deferred_calls.push(DeferredSdkCall { client_id, key });
+            return Ok(call);
+        }
+
         let status = i32::from(dispatch.is_err());
         let status_result = context.write_i32_be(LTE_API_RET_OFFSET, status);
         let release_result = context.daemon_release();
@@ -2714,6 +2763,17 @@ impl DeviceBridge {
         status_result?;
         release_result?;
         dispatch
+    }
+
+    fn handle_attach_ext_event(
+        &mut self,
+        server: &mut Server,
+        response: AttachExtResponse<'_>,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        if !self.pending.remove(ResponseKey::AttachExt) {
+            return Ok(None);
+        }
+        broadcast_attach_ext_callback(server, self.device_id, response).map(Some)
     }
 
     fn handle_plmn_list_event(
@@ -2762,6 +2822,35 @@ impl DeviceBridge {
         let report = broadcast_rrc_capability_get_callback(server, self.device_id, response)?;
         self.pending.remove(key);
         Ok(Some(report))
+    }
+
+    fn handle_device_information_event(
+        &mut self,
+        server: &mut Server,
+        response: DeviceInformationResponse,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        let key = ResponseKey::DeviceInformation;
+        if !self.pending.contains(key) {
+            return Ok(None);
+        }
+        let Some(index) = self.deferred_calls.iter().position(|call| call.key == key) else {
+            return Ok(None);
+        };
+        let deferred = self.deferred_calls[index];
+        let mut result = [0_u8; DEVICE_INFORMATION_LEN];
+        result[0..4].copy_from_slice(&response.fw_revision);
+        result[4..6].copy_from_slice(&response.chip_revision);
+        result[10..14].copy_from_slice(&STOCK_SDK_VERSION);
+        result[14..18].copy_from_slice(&STOCK_DRIVER_VERSION);
+
+        let context = server.client_context(deferred.client_id)?;
+        context.write(DEVICE_INFORMATION_OFFSET, &result)?;
+        context.write_i32_be(LTE_API_RET_OFFSET, 0)?;
+        context.daemon_release()?;
+
+        self.deferred_calls.swap_remove(index);
+        self.pending.remove(key);
+        Ok(Some(BroadcastReport::default()))
     }
 
     fn handle_set_protocol_info_event(
@@ -2869,6 +2958,37 @@ impl DeviceBridge {
         broadcast_result_callback(server, kind, self.device_id, response).map(Some)
     }
 
+    /// Complete a deferred stock synchronous call with failure when its known
+    /// modem response is structurally malformed.
+    ///
+    /// This prevents a malformed `0xb003` from leaving the stock caller blocked
+    /// forever on its `SysV` semaphore. Decode failures for asynchronous families
+    /// do not have a deferred local caller and are left to the normal log path.
+    ///
+    /// # Errors
+    /// Returns [`HandleError::Ipc`] if the shared status or semaphore handoff
+    /// cannot be completed.
+    pub fn handle_modem_decode_error(
+        &mut self,
+        server: &mut Server,
+        error: &EventDecodeError,
+    ) -> Result<bool, HandleError> {
+        let key = match error {
+            EventDecodeError::DeviceInformation(_) => ResponseKey::DeviceInformation,
+            _ => return Ok(false),
+        };
+        let Some(index) = self.deferred_calls.iter().position(|call| call.key == key) else {
+            return Ok(false);
+        };
+        let deferred = self.deferred_calls[index];
+        let context = server.client_context(deferred.client_id)?;
+        context.write_i32_be(LTE_API_RET_OFFSET, 1)?;
+        context.daemon_release()?;
+        self.deferred_calls.swap_remove(index);
+        self.pending.remove(key);
+        Ok(true)
+    }
+
     /// Route one decoded modem event through the asynchronous stock callback
     /// path implemented so far.
     ///
@@ -2892,12 +3012,7 @@ impl DeviceBridge {
                 }
                 broadcast_attach_callback(server, self.device_id, *response).map(Some)
             }
-            ModemEvent::AttachExt(response) => {
-                if !self.pending.remove(ResponseKey::AttachExt) {
-                    return Ok(None);
-                }
-                broadcast_attach_ext_callback(server, self.device_id, *response).map(Some)
-            }
+            ModemEvent::AttachExt(response) => self.handle_attach_ext_event(server, *response),
             ModemEvent::Detach(response) => {
                 if !self.pending.remove(ResponseKey::Detach) {
                     return Ok(None);
@@ -2945,6 +3060,9 @@ impl DeviceBridge {
             }
             ModemEvent::SetProtocolInfo(response) => {
                 self.handle_set_protocol_info_event(server, *response)
+            }
+            ModemEvent::DeviceInformation(response) => {
+                self.handle_device_information_event(server, *response)
             }
             ModemEvent::Uicc(response) => self.handle_uicc_event(server, *response),
             ModemEvent::UeModeChange(response) => {
@@ -2999,6 +3117,29 @@ impl DeviceBridge {
             }
         }
         Err(HandleError::TransactionIdsExhausted)
+    }
+
+    fn dispatch_device_information<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        if !request.params.is_empty() {
+            return Err(HandleError::UnexpectedParameters {
+                command: request.command,
+                expected: 0,
+                actual: request.params.len(),
+            });
+        }
+        let bytes_written = modem.send_tracked_command(
+            &mut self.pending,
+            ModemCommand::DeviceInformation(DeviceInformationRequest),
+        )?;
+        Ok(HandledCall {
+            command: SdkCommand::GetDeviceInformation,
+            device_id: request.device_id,
+            bytes_written,
+        })
     }
 
     fn dispatch_set_protocol_info<T: Write>(
@@ -3636,8 +3777,11 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use gct_lapi::{DetachRequiredIndication, ResultResponse, ResultResponseKind, UiccResponse};
-    use gct_runtime::{Modem, ModemEvent, ResponseKey};
+    use gct_lapi::{
+        DetachRequiredIndication, DeviceInformationDecodeError, ResultResponse, ResultResponseKind,
+        UiccResponse,
+    };
+    use gct_runtime::{EventDecodeError, Modem, ModemEvent, ResponseKey};
     use gct_transport::HciIo;
     use lted_compat::Server;
     use lted_proto::{
@@ -3646,16 +3790,16 @@ mod tests {
     };
 
     use super::{
-        BroadcastReport, DeviceBridge, HandleError, LTE_API_RET_OFFSET, LegacyAttachDecodeError,
-        LegacyAttachExtDecodeError, LegacyAttachExtStringField, LegacyAttachStringField,
-        LegacyPdnConnectDecodeError, LegacyPdnConnectExtDecodeError,
-        LegacyPdnConnectExtStringField, LegacyPdnConnectStringField,
-        LegacyPdnDisconnectDecodeError, LegacyRrcCapabilityDecodeError,
-        LegacySetProtocolInfoDecodeError, LegacyUiccDecodeError, PS_INIT_COMPLETE_OFFSET,
-        StartupPhase, UiccCallbackError, broadcast_result_callback, decode_legacy_attach,
-        decode_legacy_attach_ext, decode_legacy_pdn_connect_ext, decode_legacy_pdn_disconnect,
-        decode_legacy_rrc_capability_get, decode_legacy_rrc_capability_set,
-        decode_legacy_set_protocol_info,
+        BroadcastReport, DEVICE_INFORMATION_LEN, DEVICE_INFORMATION_OFFSET, DeviceBridge,
+        HandleError, LTE_API_RET_OFFSET, LegacyAttachDecodeError, LegacyAttachExtDecodeError,
+        LegacyAttachExtStringField, LegacyAttachStringField, LegacyPdnConnectDecodeError,
+        LegacyPdnConnectExtDecodeError, LegacyPdnConnectExtStringField,
+        LegacyPdnConnectStringField, LegacyPdnDisconnectDecodeError,
+        LegacyRrcCapabilityDecodeError, LegacySetProtocolInfoDecodeError, LegacyUiccDecodeError,
+        PS_INIT_COMPLETE_OFFSET, StartupPhase, UiccCallbackError, broadcast_result_callback,
+        decode_legacy_attach, decode_legacy_attach_ext, decode_legacy_pdn_connect_ext,
+        decode_legacy_pdn_disconnect, decode_legacy_rrc_capability_get,
+        decode_legacy_rrc_capability_set, decode_legacy_set_protocol_info,
     };
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -7218,6 +7362,136 @@ mod tests {
                 maximum: 100,
                 actual: 101,
             })
+        );
+    }
+
+    #[test]
+    fn stock_device_information_defers_then_materializes_exact_system_version() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::GetDeviceInformation as u16,
+                    device_id: 0x1122_3344,
+                    params: &[],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.command, SdkCommand::GetDeviceInformation);
+        assert_eq!(call.bytes_written, 4);
+        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(bridge.deferred_count(), 1);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![0x30, 0x02, 0, 0]
+        );
+
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                vec![0xb0, 0x03, 0, 10, 0xa0, 4, 1, 2, 3, 4, 0xa1, 2, 5, 6],
+            ),
+            Some(BroadcastReport::default())
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(bridge.deferred_count(), 0);
+        assert_eq!(read_api_ret(&mut server, id), 0);
+
+        let mut result = [0_u8; DEVICE_INFORMATION_LEN];
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .read(DEVICE_INFORMATION_OFFSET, &mut result)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(&result[0..4], &[1, 2, 3, 4]);
+        assert_eq!(&result[4..6], &[5, 6]);
+        assert_eq!(&result[6..10], &[0; 4]);
+        assert_eq!(&result[10..14], &[3, 7, 18, 2]);
+        assert_eq!(&result[14..18], &[1, 0, 2, 0]);
+        assert_eq!(&result[18..], &[0; 12]);
+    }
+
+    #[test]
+    fn malformed_device_information_fails_deferred_stock_call() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::GetDeviceInformation as u16,
+                    device_id: 1,
+                    params: &[],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(bridge.deferred_count(), 1);
+
+        let error = EventDecodeError::DeviceInformation(
+            DeviceInformationDecodeError::TruncatedRecordHeader {
+                offset: 0,
+                remaining: 1,
+            },
+        );
+        assert!(matches!(
+            bridge.handle_modem_decode_error(&mut server, &error),
+            Ok(true)
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(bridge.deferred_count(), 0);
+    }
+
+    #[test]
+    fn stock_device_information_rejects_local_parameters_before_glif() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::GetDeviceInformation as u16,
+                    device_id: 1,
+                    params: &[0],
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                expected: 0,
+                actual: 1,
+                ..
+            })
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(bridge.deferred_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
         );
     }
 

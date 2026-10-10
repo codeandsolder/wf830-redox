@@ -344,7 +344,16 @@ fn handle_glif_message(
                         route_error = Some(io::Error::other(error.to_string()));
                     }
                 }
-                Err(error) => eprintln!("gctd: malformed known event: {error:?}"),
+                Err(error) => {
+                    eprintln!("gctd: malformed known event: {error:?}");
+                    match bridge.handle_modem_decode_error(server, &error) {
+                        Ok(true) => eprintln!(
+                            "gctd: failed matching deferred stock SDK call instead of leaving it blocked"
+                        ),
+                        Ok(false) => {}
+                        Err(error) => route_error = Some(io::Error::other(error.to_string())),
+                    }
+                }
             });
             if let Some(error) = route_error {
                 return Err(error);

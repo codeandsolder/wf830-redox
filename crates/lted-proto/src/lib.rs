@@ -161,6 +161,7 @@ pub struct UnknownEvent(pub u16);
 #[repr(u16)]
 pub enum SdkCommand {
     GetPsInitComplete = 0,
+    GetDeviceInformation = 3,
     Attach = 25,
     AttachExt = 27,
     Detach = 29,
@@ -199,6 +200,7 @@ impl TryFrom<u16> for SdkCommand {
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::GetPsInitComplete),
+            3 => Ok(Self::GetDeviceInformation),
             25 => Ok(Self::Attach),
             27 => Ok(Self::AttachExt),
             29 => Ok(Self::Detach),
@@ -639,6 +641,10 @@ mod tests {
         assert_eq!(SdkCommand::try_from(125), Ok(SdkCommand::AtCommand));
         assert_eq!(SdkCommand::try_from(147), Ok(SdkCommand::UiccRequest));
         assert_eq!(SdkCommand::try_from(161), Ok(SdkCommand::UeModeChange));
+        assert_eq!(
+            SdkCommand::try_from(3),
+            Ok(SdkCommand::GetDeviceInformation)
+        );
         assert_eq!(SdkCommand::try_from(177), Ok(SdkCommand::SetProtocolInfo));
         assert_eq!(SdkCommand::try_from(207), Ok(SdkCommand::EmmTimerControl));
         assert_eq!(SdkCommand::try_from(208), Ok(SdkCommand::PsmControl));

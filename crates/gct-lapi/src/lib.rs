@@ -3483,6 +3483,113 @@ impl UiccPinCommandResponse {
     }
 }
 
+/// Zero-payload live-P4 `LTE_GET_INFORMATION` (`0x3002`) request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceInformationRequest;
+
+impl DeviceInformationRequest {
+    /// Encode the exact four-byte HCI request.
+    ///
+    /// # Errors
+    /// Returns `EncodeError::NoSpace` when output is shorter than the HCI header.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        encode_packet(public_opcode::LTE_GET_INFORMATION, &[], output)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceInformationDecodeError {
+    Response(ResponseDecodeError),
+    TruncatedRecordHeader {
+        offset: usize,
+        remaining: usize,
+    },
+    TruncatedRecordValue {
+        offset: usize,
+        declared: usize,
+        remaining: usize,
+    },
+    KnownFieldTooLong {
+        type_id: u8,
+        maximum: usize,
+        actual: usize,
+    },
+}
+
+impl From<ResponseDecodeError> for DeviceInformationDecodeError {
+    fn from(value: ResponseDecodeError) -> Self {
+        Self::Response(value)
+    }
+}
+
+/// Modem-owned portion of stock `_SYSTEM_VERSION`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceInformationResponse {
+    pub fw_revision: [u8; 4],
+    pub chip_revision: [u8; 2],
+}
+
+impl DeviceInformationResponse {
+    /// Decode the live get-information TLV stream. Unknown types are skipped.
+    ///
+    /// # Errors
+    /// Rejects another opcode, truncated TLVs, or a known value larger than its recovered slot.
+    pub fn parse(packet: Packet<'_>) -> Result<Self, DeviceInformationDecodeError> {
+        let payload = response_payload(packet, public_opcode::LTE_GET_INFORMATION_RESULT)?;
+        let mut response = Self {
+            fw_revision: [0; 4],
+            chip_revision: [0; 2],
+        };
+        let mut offset = 0_usize;
+        while offset < payload.len() {
+            let remaining = payload.len() - offset;
+            if remaining < 2 {
+                return Err(DeviceInformationDecodeError::TruncatedRecordHeader {
+                    offset,
+                    remaining,
+                });
+            }
+            let type_id = payload[offset];
+            let declared = usize::from(payload[offset + 1]);
+            let value_offset = offset + 2;
+            let remaining_value = payload.len() - value_offset;
+            if remaining_value < declared {
+                return Err(DeviceInformationDecodeError::TruncatedRecordValue {
+                    offset,
+                    declared,
+                    remaining: remaining_value,
+                });
+            }
+            let value = &payload[value_offset..value_offset + declared];
+            match type_id {
+                0xa0 => {
+                    if declared > response.fw_revision.len() {
+                        return Err(DeviceInformationDecodeError::KnownFieldTooLong {
+                            type_id,
+                            maximum: response.fw_revision.len(),
+                            actual: declared,
+                        });
+                    }
+                    response.fw_revision[..declared].copy_from_slice(value);
+                }
+                0xa1 => {
+                    if declared > response.chip_revision.len() {
+                        return Err(DeviceInformationDecodeError::KnownFieldTooLong {
+                            type_id,
+                            maximum: response.chip_revision.len(),
+                            actual: declared,
+                        });
+                    }
+                    response.chip_revision[..declared].copy_from_slice(value);
+                }
+                _ => {}
+            }
+            offset = value_offset + declared;
+        }
+        Ok(response)
+    }
+}
+
 /// Request with only the four-byte HCI header and no payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmptyRequest {
@@ -4609,8 +4716,9 @@ mod tests {
     use super::{
         ApnType, AtCommand, AttachEncodeError, AttachExtResponse, AttachField, AttachRequest,
         AttachResponse, AttachResponseDecodeError, AttachResponseKind, AttachResponsePrefix,
-        AttachTailField, DetachRequest, DetachResponse, EmptyRequest, NetworkFeatureInfo, PcoInfo,
-        PdnConnectExtRequest, PdnConnectExtResponsePrefix, PdnConnectRequest,
+        AttachTailField, DetachRequest, DetachResponse, DeviceInformationDecodeError,
+        DeviceInformationRequest, DeviceInformationResponse, EmptyRequest, NetworkFeatureInfo,
+        PcoInfo, PdnConnectExtRequest, PdnConnectExtResponsePrefix, PdnConnectRequest,
         PdnConnectResponsePrefix, PdnConnectionControl, PdnDisconnectRequest,
         PdnDisconnectResponsePrefix, PdnEncodeError, PdnField, PdnInfoContainerKind,
         PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, Positioning, QosField,
@@ -4618,7 +4726,69 @@ mod tests {
         RrcCapabilityGetResponse, RrcCapabilitySetRequest, RrcCapabilitySetResponse,
         SetProtocolInfoRequest, SetProtocolInfoResponse,
     };
-    use gct_hci::{Header, Packet, Tlv};
+    use gct_hci::{Header, Packet, Tlv, public_opcode};
+
+    #[test]
+    fn device_information_request_and_tlv_response_match_live_wire() {
+        let mut request = [0_u8; 4];
+        assert_eq!(DeviceInformationRequest.encode(&mut request), Ok(4));
+        assert_eq!(request, [0x30, 0x02, 0, 0]);
+
+        let payload = [
+            0xa2, 3, 0xaa, 0xbb, 0xcc, 0xa0, 4, 1, 2, 3, 4, 0xa1, 2, 0x12, 0x34,
+        ];
+        let packet = Packet {
+            header: Header {
+                command: public_opcode::LTE_GET_INFORMATION_RESULT,
+                payload_len: 15,
+            },
+            payload: &payload,
+        };
+        assert_eq!(
+            DeviceInformationResponse::parse(packet),
+            Ok(DeviceInformationResponse {
+                fw_revision: [1, 2, 3, 4],
+                chip_revision: [0x12, 0x34],
+            })
+        );
+    }
+
+    #[test]
+    fn device_information_rejects_truncated_and_oversized_known_tlvs() {
+        let oversized = [0xa0, 5, 1, 2, 3, 4, 5];
+        let packet = Packet {
+            header: Header {
+                command: public_opcode::LTE_GET_INFORMATION_RESULT,
+                payload_len: 7,
+            },
+            payload: &oversized,
+        };
+        assert_eq!(
+            DeviceInformationResponse::parse(packet),
+            Err(DeviceInformationDecodeError::KnownFieldTooLong {
+                type_id: 0xa0,
+                maximum: 4,
+                actual: 5,
+            })
+        );
+
+        let truncated = [0xa1, 2, 0x11];
+        let packet = Packet {
+            header: Header {
+                command: public_opcode::LTE_GET_INFORMATION_RESULT,
+                payload_len: 3,
+            },
+            payload: &truncated,
+        };
+        assert_eq!(
+            DeviceInformationResponse::parse(packet),
+            Err(DeviceInformationDecodeError::TruncatedRecordValue {
+                offset: 0,
+                declared: 2,
+                remaining: 1,
+            })
+        );
+    }
 
     #[test]
     fn set_protocol_info_shipped_shapes_match_live_p4_wire() {

@@ -1582,23 +1582,61 @@ gating, pending-state release, exact five-byte callback materialization, and
 rejection of type 9 or malformed type-specific local lengths before any GLIF
 write.
 
-### Deferred synchronous DeviceInformation
+### Live P4 DeviceInformation — deferred synchronous path implemented
 
-The same inventory showed shipped users of `LTED_GetDeviceInformation` in both
-`lteatcm` and `gdmmon`. Its modem transport is compact and already well pinned:
-live `LAPI_GetDeviceInformation@0x4174c` uses request **`0x3002`** and response
-**`0xb003`**. The blocker is instead the local stock ABI: this call is
-*synchronous*. `LTED_GetDeviceInformation@0x94f4` sends local SDK command **3**,
-waits for daemon completion, and only then copies an exact 30-byte result from
-shared context.
+Shipped P4 users of `LTED_GetDeviceInformation` exist in both `lteatcm` and
+`gdmmon`, so this is a real product path rather than generic SDK surface. The
+local ABI is synchronous: live `LTED_GetDeviceInformation@0x94f4` sends SDK
+command **3** with no parameters, waits on the per-client SysV handoff, then
+reads an exact **30-byte** `_SYSTEM_VERSION` image from shared context offset
+**`0x52a`**. The recovered layout is `fw_ver[4] | chip_ver[2] | cm_ver[4] |
+sdk_ver[4] | drv_ver[16]`.
 
-The current clean bridge deliberately completes the local SDK semaphore after
-request dispatch, before a future modem response can arrive. Implementing
-DeviceInformation now would therefore either return stale/fabricated data or
-require an architectural lie. It remains deferred until the bridge has a
-first-class deferred synchronous completion path that can hold the local call,
-correlate `0xb003`, write the recovered shared result, and only then release the
-stock client.
+The modem-owned part is compact. Live
+`LAPI_GetDeviceInformation@0x4174c` emits the zero-payload request
+**`0x3002`** and receives **`0xb003`**. The response is an ordered stream of
+one-byte type / one-byte length records. The two fields consumed by the stock
+device-information path are **`0xa0` firmware revision** (maximum four bytes)
+and **`0xa1` chip revision** (maximum two bytes); other records are not part of
+this 30-byte compatibility result and are skipped. Rust bounds-checks every
+record before copying and rejects a known field that would overflow its legacy
+slot.
+
+Two fields are produced locally by the stock SDK rather than by the modem.
+After the `0xb003` data is available, live `libltesdk.so` parses its compiled
+string **`3.7.18.2`** into bytes `[3,7,18,2]` at `_SYSTEM_VERSION.sdk_ver`.
+It then issues private net ioctl **`SIOCG_DATA = 0x8d10`**, data ID **5**,
+`GET_DRV_VER`, asking for exactly four bytes at the start of the 16-byte
+driver-version slot. The public GCT `gdm724x` driver source independently
+confirms that `GET_DRV_VER` parses the driver's `DRIVER_VERSION` dotted string
+into four numeric bytes. The live P4 `gdmlte.ko` relocation at text
+`0x3704` points to `.rodata.str1.4+0x5ac`, the literal **`1.0.2`**, so the
+shipping target returns **`[1,0,2,0]`**. The clean bridge uses that proven
+target value directly; it does not substitute unrelated module metadata such
+as the `wimax.ko` `version=0.5` string.
+
+`cm_ver[4]` is deliberately zero in the stock SDK-command-3 path. Live
+`lted::get_cm_ver` has only one callsite, the interactive
+`cmd_get_device_information` CLI printer, which post-fills CM version for that
+presentation path after calling `cm_get_device_information`. It is not part of
+the local SDK command-3 completion path.
+
+The bridge now models synchronous completion explicitly. On command 3 it
+acquires the stock daemon semaphore, clears `lte_api_ret`, sends a tracked
+`0x3002`, records which client owns the deferred `ResponseKey::DeviceInformation`,
+and **does not release the client yet**. A valid `0xb003` materializes the exact
+30-byte shared result, writes success, releases the SysV handoff, and retires
+both deferred and modem-pending state. A structurally malformed known `0xb003`
+instead writes `lte_api_ret = 1`, releases the client, and retires the state so
+corrupt modem input cannot leave a stock caller blocked forever. No speculative
+timer was added: the recovered live `wait_hci` path contains no independently
+proven timeout for this request.
+
+Tests lock the exact `30 02 00 00` request, bounded `0xb003` parsing, family
+pending key, command-3 zero-parameter validation before GLIF, deferred ownership,
+the final 30-byte image (including SDK `[3,7,18,2]`, driver `[1,0,2,0]`, and
+zero CM/trailing driver bytes), success release, and malformed-response failure
+release.
 
 ## Live P4 DMLogExt — transport proven, semantic bridge intentionally deferred
 
