@@ -9,7 +9,10 @@ use gct_lapi::{
     attach::{AttachExtProfile, AttachExtRequest, AttachRequest, Positioning},
     common::{ApnType, PcoInfo, PdnConnectionControl},
     pdn::{PdnConnectExtRequest, PdnConnectRequest, PdnDisconnectRequest},
-    rrc::{RrcCapabilityGetRequest, RrcCapabilitySetRequest, SetProtocolInfoRequest},
+    rrc::{
+        RrcCapabilityGetRequest, RrcCapabilitySetRequest, RrcFunctionGetRequest,
+        SetProtocolInfoRequest,
+    },
     uicc::{
         UiccFixedRequest, UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest,
         UiccStatusRequest, uicc_control,
@@ -48,6 +51,154 @@ const fn is_shipped_rrc_capability_type(type_id: u16) -> bool {
 /// the live SDK response converter; failures still reach callback slot 115.
 pub(crate) const fn rrc_capability_set_success_has_callback(type_id: u16) -> bool {
     matches!(type_id, 1 | 2 | 3 | 4 | 18)
+}
+
+pub const LEGACY_RRC_FUNCTION_CELL_LOCK_LEN: usize = 182;
+pub const RRC_FUNCTION_CELL_LOCK_WIRE_LEN: usize = 122;
+const RRC_FUNCTION_CELL_LOCK_MAX_EARFCNS: usize = 30;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LegacyRrcFunctionSetRequest<'a> {
+    pub type_id: u16,
+    pub data: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyRrcFunctionDecodeError {
+    Truncated {
+        minimum: usize,
+        actual: usize,
+    },
+    LengthMismatch {
+        declared: usize,
+        actual: usize,
+    },
+    UnexpectedLength {
+        type_id: u16,
+        expected: usize,
+        actual: usize,
+    },
+    UnsupportedType(u16),
+    TooManyLegacyEarfcn {
+        maximum: usize,
+        actual: usize,
+    },
+    NonzeroGetLength(u16),
+}
+
+/// Decode the finite RRC-function set surface directly exercised by shipped
+/// P4 `lteatcm`: selectors 0, 1, 2, 3 and 7. The generic diagnostic helper is
+/// deliberately not used as evidence for the remaining SDK switch cases.
+///
+/// # Errors
+/// Returns [`LegacyRrcFunctionDecodeError`] for malformed lengths, unsupported
+/// selectors, or a selector-1 EARFCN count beyond the recovered 30-entry bound.
+pub fn decode_legacy_rrc_function_set(
+    params: &[u8],
+) -> Result<LegacyRrcFunctionSetRequest<'_>, LegacyRrcFunctionDecodeError> {
+    if params.len() < 4 {
+        return Err(LegacyRrcFunctionDecodeError::Truncated {
+            minimum: 4,
+            actual: params.len(),
+        });
+    }
+    let type_id = u16::from_be_bytes([params[0], params[1]]);
+    let declared = usize::from(u16::from_be_bytes([params[2], params[3]]));
+    let data = &params[4..];
+    if declared != data.len() {
+        return Err(LegacyRrcFunctionDecodeError::LengthMismatch {
+            declared,
+            actual: data.len(),
+        });
+    }
+    let expected = match type_id {
+        0 | 7 => 1,
+        1 => LEGACY_RRC_FUNCTION_CELL_LOCK_LEN,
+        2 => 452,
+        3 => 50,
+        _ => return Err(LegacyRrcFunctionDecodeError::UnsupportedType(type_id)),
+    };
+    if data.len() != expected {
+        return Err(LegacyRrcFunctionDecodeError::UnexpectedLength {
+            type_id,
+            expected,
+            actual: data.len(),
+        });
+    }
+    if type_id == 1 {
+        let count = usize::from(u16::from_be_bytes([data[0], data[1]]));
+        if count > RRC_FUNCTION_CELL_LOCK_MAX_EARFCNS {
+            return Err(LegacyRrcFunctionDecodeError::TooManyLegacyEarfcn {
+                maximum: RRC_FUNCTION_CELL_LOCK_MAX_EARFCNS,
+                actual: count,
+            });
+        }
+    }
+    Ok(LegacyRrcFunctionSetRequest { type_id, data })
+}
+
+/// Convert the live SDK's legacy 182-byte selector-1 object into its 122-byte
+/// modem representation. The OEM leaves the unused compressed-EARFCN gap as
+/// malloc garbage; the clean implementation deterministically zeroes it.
+///
+/// # Errors
+/// Returns [`LegacyRrcFunctionDecodeError`] for a non-182-byte legacy object
+/// or an EARFCN count beyond the recovered 30-entry bound.
+pub fn materialize_rrc_function_cell_lock_wire(
+    legacy: &[u8],
+    output: &mut [u8; RRC_FUNCTION_CELL_LOCK_WIRE_LEN],
+) -> Result<(), LegacyRrcFunctionDecodeError> {
+    if legacy.len() != LEGACY_RRC_FUNCTION_CELL_LOCK_LEN {
+        return Err(LegacyRrcFunctionDecodeError::UnexpectedLength {
+            type_id: 1,
+            expected: LEGACY_RRC_FUNCTION_CELL_LOCK_LEN,
+            actual: legacy.len(),
+        });
+    }
+    let count = usize::from(u16::from_be_bytes([legacy[0], legacy[1]]));
+    if count > RRC_FUNCTION_CELL_LOCK_MAX_EARFCNS {
+        return Err(LegacyRrcFunctionDecodeError::TooManyLegacyEarfcn {
+            maximum: RRC_FUNCTION_CELL_LOCK_MAX_EARFCNS,
+            actual: count,
+        });
+    }
+    output.fill(0);
+    output[..2].copy_from_slice(&legacy[..2]);
+    for index in 0..count {
+        let src = 2 + index * 4;
+        let earfcn = u16::from_be_bytes([legacy[src + 2], legacy[src + 3]]);
+        let dst = 2 + index * 2;
+        output[dst..dst + 2].copy_from_slice(&earfcn.to_be_bytes());
+    }
+    output[62..].copy_from_slice(&legacy[122..]);
+    Ok(())
+}
+
+/// Decode the only finite shipped RRC-function get callsite: selector 7 with
+/// a zero declared data length.
+///
+/// # Errors
+/// Returns [`LegacyRrcFunctionDecodeError`] unless the object is the exact
+/// four-byte selector-7, zero-length request used by shipped P4 `lteatcm`.
+pub fn decode_legacy_rrc_function_get(
+    params: &[u8],
+) -> Result<RrcFunctionGetRequest, LegacyRrcFunctionDecodeError> {
+    if params.len() != 4 {
+        return Err(LegacyRrcFunctionDecodeError::UnexpectedLength {
+            type_id: u16::MAX,
+            expected: 4,
+            actual: params.len(),
+        });
+    }
+    let type_id = u16::from_be_bytes([params[0], params[1]]);
+    if type_id != 7 {
+        return Err(LegacyRrcFunctionDecodeError::UnsupportedType(type_id));
+    }
+    let declared = u16::from_be_bytes([params[2], params[3]]);
+    if declared != 0 {
+        return Err(LegacyRrcFunctionDecodeError::NonzeroGetLength(declared));
+    }
+    Ok(RrcFunctionGetRequest { type_id })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

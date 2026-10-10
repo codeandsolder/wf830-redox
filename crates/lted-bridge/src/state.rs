@@ -428,6 +428,15 @@ impl NicState {
         Ok(true)
     }
 
+    pub(crate) fn has_ipv4_lease_for_cid(&self, cid: u8) -> bool {
+        let interface_name = format!("lte0pdn{cid}");
+        let Some(index) = self.index_by_name(&interface_name) else {
+            return false;
+        };
+        let record = &self.records[index];
+        record[0x10d] != 0 && record[0x154..0x158] != [0, 0, 0, 0]
+    }
+
     pub(crate) fn apply_ipv6_prefix(&mut self, interface_name: &str, prefix: [u8; 16]) -> bool {
         let Some(index) = self.index_by_name(interface_name) else {
             return false;

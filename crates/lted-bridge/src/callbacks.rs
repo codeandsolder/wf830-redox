@@ -12,9 +12,14 @@ use gct_lapi::{
     emm::{ContentsResetAndDeleteResponse, EmmReattachControlReport, UeModeChangeResponse},
     misc::{IccidReadResponse, MobileIdReadResponse, MsisdnReadResponse, TemperatureReadResponse},
     pdn::{PdnConnectExtResponse, PdnConnectResponse, PdnDisconnectResponse},
-    plmn::{PlmnListResponse, PlmnSearchResponse, PlmnSearchStopResponse},
+    plmn::{
+        PlmnListResponse, PlmnSearchResponse, PlmnSearchStopResponse, QuerySelectedPlmnResponse,
+    },
     rf::{RfMeasureReportIndication, RfMeasureReportResponse, RfStatusReportControlResponse},
-    rrc::{RrcCapabilityGetResponse, RrcCapabilitySetResponse, SetProtocolInfoResponse},
+    rrc::{
+        RrcCapabilityGetResponse, RrcCapabilitySetResponse, RrcFunctionResponse,
+        SetProtocolInfoResponse,
+    },
     uicc::{UiccResponse, uicc_control},
 };
 use lted_compat::Server;
@@ -324,6 +329,74 @@ pub(crate) fn broadcast_variable_callback(
     })?;
 
     broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
+}
+
+/// Broadcast stock callback 54 through `cb_rsp[16]` (`0x84`).
+pub(crate) fn broadcast_query_selected_plmn_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: QuerySelectedPlmnResponse,
+) -> Result<BroadcastReport, HandleError> {
+    let data = [
+        response.result,
+        response.selected_plmn[0],
+        response.selected_plmn[1],
+        response.selected_plmn[2],
+    ];
+    broadcast_variable_callback(server, device_id, SdkCallbackKind::QuerySelectedPlmn, &data)
+}
+
+/// Broadcast stock callback 225 through `cb_rsp[117]` (`0x3ac`).
+/// Stock `lted` deliberately discards any response data and exposes only
+/// `result:u16 | len:u16 | type:u16`.
+pub(crate) fn broadcast_rrc_function_set_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: RrcFunctionResponse<'_>,
+) -> Result<BroadcastReport, HandleError> {
+    let len = u16::try_from(response.data.len()).map_err(|_| {
+        HandleError::Ipc(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RRC-function data too long",
+        ))
+    })?;
+    let mut data = [0_u8; 6];
+    data[0..2].copy_from_slice(&response.result.to_be_bytes());
+    data[2..4].copy_from_slice(&len.to_be_bytes());
+    data[4..6].copy_from_slice(&response.type_id.to_be_bytes());
+    broadcast_variable_callback(
+        server,
+        device_id,
+        SdkCallbackKind::RrcFunctionControl,
+        &data,
+    )
+}
+
+/// Broadcast stock callback 227 through `cb_rsp[118]` (`0x3b4`).
+/// The live daemon consumes the normalized local image
+/// `result:u16 | type:u16 | len:u16 | data[len]`.
+pub(crate) fn broadcast_rrc_function_get_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: RrcFunctionResponse<'_>,
+) -> Result<BroadcastReport, HandleError> {
+    let len = u16::try_from(response.data.len()).map_err(|_| {
+        HandleError::Ipc(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RRC-function data too long",
+        ))
+    })?;
+    let mut data = Vec::with_capacity(6 + response.data.len());
+    data.extend_from_slice(&response.result.to_be_bytes());
+    data.extend_from_slice(&response.type_id.to_be_bytes());
+    data.extend_from_slice(&len.to_be_bytes());
+    data.extend_from_slice(response.data);
+    broadcast_variable_callback(
+        server,
+        device_id,
+        SdkCallbackKind::RrcFunctionControlGet,
+        &data,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

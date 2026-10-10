@@ -32,6 +32,7 @@ pub enum SdkCallbackKind {
     PlmnSearchStop,
     ContentsResetAndDelete,
     PlmnList,
+    QuerySelectedPlmn,
     Online,
     Offline,
     PsInit,
@@ -50,6 +51,8 @@ pub enum SdkCallbackKind {
     EmmReattachControlReport,
     RrcCapabilityControl,
     RrcCapabilityControlGet,
+    RrcFunctionControl,
+    RrcFunctionControlGet,
     SetProtocolInfo,
     GetNasConfig,
 }
@@ -69,6 +72,7 @@ impl SdkCallbackKind {
             Self::PlmnSearchStop => 64,
             Self::ContentsResetAndDelete => 66,
             Self::PlmnList => 45,
+            Self::QuerySelectedPlmn => 54,
             Self::Online => 59,
             Self::Offline => 62,
             Self::PsInit => 68,
@@ -87,6 +91,8 @@ impl SdkCallbackKind {
             Self::EmmReattachControlReport => 309,
             Self::RrcCapabilityControl => 221,
             Self::RrcCapabilityControlGet => 223,
+            Self::RrcFunctionControl => 225,
+            Self::RrcFunctionControlGet => 227,
             Self::SetProtocolInfo => 178,
             Self::GetNasConfig => 305,
         }
@@ -106,6 +112,7 @@ impl SdkCallbackKind {
             Self::PlmnSearchStop => 20,
             Self::ContentsResetAndDelete => 21,
             Self::PlmnList => 11,
+            Self::QuerySelectedPlmn => 16,
             Self::Online => 18,
             Self::Offline => 19,
             Self::PsInit => 22,
@@ -124,6 +131,8 @@ impl SdkCallbackKind {
             Self::EmmReattachControlReport => 160,
             Self::RrcCapabilityControl => 115,
             Self::RrcCapabilityControlGet => 116,
+            Self::RrcFunctionControl => 117,
+            Self::RrcFunctionControlGet => 118,
             Self::SetProtocolInfo => 90,
             Self::GetNasConfig => 157,
         }
@@ -183,6 +192,8 @@ pub enum SdkCommand {
     GetApnTypeByDefaultEpsId = 16,
     DeleteApnTypeFromTidNode = 17,
     AddSpecialTid = 18,
+    CheckDhcpLeaseState = 19,
+    SetMtuSize = 20,
     Attach = 25,
     AttachExt = 27,
     Detach = 29,
@@ -192,6 +203,7 @@ pub enum SdkCommand {
     PlmnSearch = 40,
     PlmnSearchExt = 42,
     PlmnList = 44,
+    QuerySelectedPlmn = 53,
     Online = 58,
     Offline = 60,
     PlmnSearchStop = 63,
@@ -218,6 +230,8 @@ pub enum SdkCommand {
     EmmTimerStart = 213,
     RrcCapabilityControl = 220,
     RrcCapabilityControlGet = 222,
+    RrcFunctionControl = 224,
+    RrcFunctionControlGet = 226,
 }
 
 impl TryFrom<u16> for SdkCommand {
@@ -233,6 +247,8 @@ impl TryFrom<u16> for SdkCommand {
             16 => Ok(Self::GetApnTypeByDefaultEpsId),
             17 => Ok(Self::DeleteApnTypeFromTidNode),
             18 => Ok(Self::AddSpecialTid),
+            19 => Ok(Self::CheckDhcpLeaseState),
+            20 => Ok(Self::SetMtuSize),
             25 => Ok(Self::Attach),
             27 => Ok(Self::AttachExt),
             29 => Ok(Self::Detach),
@@ -242,6 +258,7 @@ impl TryFrom<u16> for SdkCommand {
             40 => Ok(Self::PlmnSearch),
             42 => Ok(Self::PlmnSearchExt),
             44 => Ok(Self::PlmnList),
+            53 => Ok(Self::QuerySelectedPlmn),
             58 => Ok(Self::Online),
             60 => Ok(Self::Offline),
             63 => Ok(Self::PlmnSearchStop),
@@ -268,6 +285,8 @@ impl TryFrom<u16> for SdkCommand {
             213 => Ok(Self::EmmTimerStart),
             220 => Ok(Self::RrcCapabilityControl),
             222 => Ok(Self::RrcCapabilityControlGet),
+            224 => Ok(Self::RrcFunctionControl),
+            226 => Ok(Self::RrcFunctionControlGet),
             _ => Err(UnknownSdkCommand(value)),
         }
     }
@@ -693,6 +712,12 @@ mod tests {
             Ok(SdkCommand::DeleteApnTypeFromTidNode)
         );
         assert_eq!(SdkCommand::try_from(18), Ok(SdkCommand::AddSpecialTid));
+        assert_eq!(
+            SdkCommand::try_from(19),
+            Ok(SdkCommand::CheckDhcpLeaseState)
+        );
+        assert_eq!(SdkCommand::try_from(20), Ok(SdkCommand::SetMtuSize));
+        assert_eq!(SdkCommand::try_from(53), Ok(SdkCommand::QuerySelectedPlmn));
         assert_eq!(SdkCommand::try_from(177), Ok(SdkCommand::SetProtocolInfo));
         assert_eq!(
             SdkCommand::try_from(187),
@@ -717,6 +742,14 @@ mod tests {
         assert_eq!(
             SdkCommand::try_from(222),
             Ok(SdkCommand::RrcCapabilityControlGet)
+        );
+        assert_eq!(
+            SdkCommand::try_from(224),
+            Ok(SdkCommand::RrcFunctionControl)
+        );
+        assert_eq!(
+            SdkCommand::try_from(226),
+            Ok(SdkCommand::RrcFunctionControlGet)
         );
         assert!(SdkCommand::try_from(0xffff).is_err());
     }
@@ -957,6 +990,25 @@ mod tests {
         assert_eq!(
             SdkCallbackKind::RrcCapabilityControlGet.registration_offset(),
             0x3a4
+        );
+    }
+
+    #[test]
+    fn remaining_lteatcm_callback_slots_match_live_p4_registration() {
+        assert_eq!(SdkCallbackKind::QuerySelectedPlmn.callback_id(), 54);
+        assert_eq!(
+            SdkCallbackKind::QuerySelectedPlmn.registration_offset(),
+            0x84
+        );
+        assert_eq!(SdkCallbackKind::RrcFunctionControl.callback_id(), 225);
+        assert_eq!(
+            SdkCallbackKind::RrcFunctionControl.registration_offset(),
+            0x3ac
+        );
+        assert_eq!(SdkCallbackKind::RrcFunctionControlGet.callback_id(), 227);
+        assert_eq!(
+            SdkCallbackKind::RrcFunctionControlGet.registration_offset(),
+            0x3b4
         );
     }
 

@@ -342,6 +342,8 @@ pub mod recovered_opcode {
     /// Live-P4 extended PLMN-search request.
     pub const PLMN_SEARCH_REQUEST_EXT: u16 = 0x315a;
     pub const PLMN_LIST_REQUEST: u16 = 0x310b;
+    /// Live-P4 selected-PLMN query.
+    pub const QUERY_SELECTED_PLMN_REQUEST: u16 = 0x310f;
     pub const PLMN_SEARCH_STOP_REQUEST: u16 = 0x3127;
     /// Live contents-reset/delete request; unlike adjacent request families this opcode is in the `0xb1xx` range.
     pub const CONTENTS_RESET_AND_DELETE_REQUEST: u16 = 0xb173;
@@ -366,6 +368,10 @@ pub mod recovered_opcode {
     pub const RRC_CAPABILITY_CONTROL_REQUEST: u16 = 0x3906;
     /// RRC-capability get request used by the shipped connection manager.
     pub const RRC_CAPABILITY_CONTROL_GET_REQUEST: u16 = 0x390d;
+    /// Live-P4 RRC function-control set request.
+    pub const RRC_FUNCTION_CONTROL_REQUEST: u16 = 0x3908;
+    /// Live-P4 RRC function-control get request.
+    pub const RRC_FUNCTION_CONTROL_GET_REQUEST: u16 = 0x390f;
 
     // Response values below are proven by recovered SDK dispatch tables.
     // Older families were cross-checked against B014; newer P4-only entries
@@ -381,6 +387,8 @@ pub mod recovered_opcode {
     /// SDK-supported EXT response; shipped P4 lted never registers its slot.
     pub const PLMN_SEARCH_RESPONSE_EXT_DORMANT: u16 = 0xb15b;
     pub const PLMN_LIST_RESPONSE: u16 = 0xb10c;
+    /// Dispatch-table response to `QUERY_SELECTED_PLMN_REQUEST`.
+    pub const QUERY_SELECTED_PLMN_RESPONSE: u16 = 0xb110;
     pub const PLMN_SEARCH_STOP_RESPONSE: u16 = 0xb128;
     /// Live dispatch-table response for contents reset/delete.
     pub const CONTENTS_RESET_AND_DELETE_RESPONSE: u16 = 0xb174;
@@ -401,6 +409,10 @@ pub mod recovered_opcode {
     pub const RRC_CAPABILITY_CONTROL_RESPONSE: u16 = 0xb907;
     /// Response to `RRC_CAPABILITY_CONTROL_GET_REQUEST`; live SDK callback slot 116.
     pub const RRC_CAPABILITY_CONTROL_GET_RESPONSE: u16 = 0xb90e;
+    /// Dispatch-table response to `RRC_FUNCTION_CONTROL_REQUEST`.
+    pub const RRC_FUNCTION_CONTROL_RESPONSE: u16 = 0xb909;
+    /// Dispatch-table response to `RRC_FUNCTION_CONTROL_GET_REQUEST`.
+    pub const RRC_FUNCTION_CONTROL_GET_RESPONSE: u16 = 0xb910;
 }
 
 #[cfg(test)]

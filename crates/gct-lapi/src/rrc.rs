@@ -4,6 +4,134 @@ use gct_hci::{EncodeError, HEADER_LEN, Header, Packet, encode_packet, recovered_
 
 use crate::common::{ResponseDecodeError, be_u16, response_payload};
 
+/// RRC function-control set request `0x3908`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RrcFunctionSetRequest<'a> {
+    pub type_id: u16,
+    pub data: &'a [u8],
+}
+
+impl RrcFunctionSetRequest<'_> {
+    /// Encode `type:u16 | len:u16 | data[len]` exactly as the live SDK.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError`] for an unrepresentable payload or short output buffer.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        encode_common_rrc_function_request(
+            recovered_opcode::RRC_FUNCTION_CONTROL_REQUEST,
+            self.type_id,
+            self.data,
+            output,
+        )
+    }
+}
+
+/// RRC function-control get request `0x390f`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RrcFunctionGetRequest {
+    pub type_id: u16,
+}
+
+impl RrcFunctionGetRequest {
+    /// Encode the live four-byte `{type, len=0}` object.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is too short.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        encode_common_rrc_function_request(
+            recovered_opcode::RRC_FUNCTION_CONTROL_GET_REQUEST,
+            self.type_id,
+            &[],
+            output,
+        )
+    }
+}
+
+fn encode_common_rrc_function_request(
+    opcode: u16,
+    type_id: u16,
+    data: &[u8],
+    output: &mut [u8],
+) -> Result<usize, EncodeError> {
+    let data_len = u16::try_from(data.len()).map_err(|_| EncodeError::PayloadTooLong)?;
+    let payload_len = 4_usize
+        .checked_add(data.len())
+        .ok_or(EncodeError::PayloadTooLong)?;
+    let payload_len_u16 = u16::try_from(payload_len).map_err(|_| EncodeError::PayloadTooLong)?;
+    let total = HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or(EncodeError::PayloadTooLong)?;
+    let Some(dst) = output.get_mut(..total) else {
+        return Err(EncodeError::NoSpace);
+    };
+    dst[..HEADER_LEN].copy_from_slice(
+        &Header {
+            command: opcode,
+            payload_len: payload_len_u16,
+        }
+        .encode(),
+    );
+    dst[4..6].copy_from_slice(&type_id.to_be_bytes());
+    dst[6..8].copy_from_slice(&data_len.to_be_bytes());
+    dst[8..].copy_from_slice(data);
+    Ok(total)
+}
+
+/// Common live modem response shape for RRC function-control set/get.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RrcFunctionResponse<'a> {
+    pub result: u16,
+    pub type_id: u16,
+    pub data: &'a [u8],
+}
+
+impl<'a> RrcFunctionResponse<'a> {
+    fn parse_for(packet: Packet<'a>, opcode: u16) -> Result<Self, ResponseDecodeError> {
+        let payload = response_payload(packet, opcode)?;
+        if payload.len() < 6 {
+            return Err(ResponseDecodeError::TruncatedPrefix {
+                minimum: 6,
+                actual: payload.len(),
+            });
+        }
+        let declared = usize::from(be_u16(payload, 2));
+        let expected =
+            6_usize
+                .checked_add(declared)
+                .ok_or(ResponseDecodeError::UnexpectedLength {
+                    expected: usize::MAX,
+                    actual: payload.len(),
+                })?;
+        if payload.len() != expected {
+            return Err(ResponseDecodeError::UnexpectedLength {
+                expected,
+                actual: payload.len(),
+            });
+        }
+        Ok(Self {
+            result: be_u16(payload, 0),
+            type_id: be_u16(payload, 4),
+            data: &payload[6..],
+        })
+    }
+
+    /// Decode live response `0xb909` (`result | len | type | data`).
+    ///
+    /// # Errors
+    /// Returns [`ResponseDecodeError`] for another opcode or malformed declared length.
+    pub fn parse_set(packet: Packet<'a>) -> Result<Self, ResponseDecodeError> {
+        Self::parse_for(packet, recovered_opcode::RRC_FUNCTION_CONTROL_RESPONSE)
+    }
+
+    /// Decode live response `0xb910` (`result | len | type | data`).
+    ///
+    /// # Errors
+    /// Returns [`ResponseDecodeError`] for another opcode or malformed declared length.
+    pub fn parse_get(packet: Packet<'a>) -> Result<Self, ResponseDecodeError> {
+        Self::parse_for(packet, recovered_opcode::RRC_FUNCTION_CONTROL_GET_RESPONSE)
+    }
+}
+
 /// RRC-capability set request `0x3906`.
 ///
 /// Live P4 `LAPI_RRCCapabilityControlRequest` serializes a common

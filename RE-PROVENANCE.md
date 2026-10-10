@@ -2006,3 +2006,101 @@ false compatibility claim and would recreate a large legacy conversion switch
 without product-demand evidence. The proven transport facts are retained here
 for later work; implementation stays deferred until the used record grammar is
 narrowed by real callsites or captures.
+
+## Live P4 remaining shipped `lteatcm` compatibility — selected PLMN, RRC function control and host-network helpers
+
+A rootfs-wide consumer census after the `lteautocm` milestone leaves `lteatcm`
+as the only broad stock client with useful modem-facing operations not already
+covered. This pass intentionally implements the finite operations exercised by
+that shipped binary rather than treating the SDK's larger dormant API surface
+as a product requirement.
+
+### Selected PLMN query
+
+Live `liblted.so::LTED_QuerySelectedPLMNRequest` sends stock SDK command **53**
+with zero parameter bytes. Shipped P4 `lteatcm` registers its four-byte result
+handler through **`cb_rsp[16]`**, stock registration offset **`0x84`**, and the
+daemon emits stock callback **54**. The callback object is exactly:
+
+```text
+result:u8 | selected_plmn:[u8;3]
+```
+
+Live `libltesdk.so::LAPI_QuerySelectedPLMNRequest` emits the header-only modem
+request **`0x310f`**. The live SDK receive table independently maps response
+**`0xb110`** to its selected-PLMN converter (internal SDK response slot 15), so
+neither opcode is inferred by adjacency. Rust tracks this request independently
+and retires it only on a structurally valid `0xb110`, then materializes stock
+callback 54 unchanged.
+
+### RRC function control — finite shipped selector surface
+
+Live stock wrappers prove SDK command **224** / callback **225** for Set and
+command **226** / callback **227** for Get. Shipped `lteatcm` registers those
+callbacks at **`cb_rsp[117]`** and **`cb_rsp[118]`**, stock offsets **`0x3ac`**
+and **`0x3b4`**. The modem transport is independently fixed by the live SDK:
+
+- Set request **`0x3908`**, response **`0xb909`**;
+- Get request **`0x390f`**, response **`0xb910`**.
+
+Both requests use the common local/modem prefix `type:u16 | len:u16`; Set then
+carries `data[len]`. Both modem responses use
+`result:u16 | len:u16 | type:u16 | data[len]`. Stock callback 225 deliberately
+keeps only `result | len | type`, while callback 227 exposes the normalized
+`result | type | len | data` image consumed by `lteatcm`.
+
+The shipped binary has finite Set callsites for selectors **0, 1, 2, 3 and 7**
+and a finite Get callsite for selector **7**. Their recovered stock Set object
+lengths are respectively **1, 182, 452, 50 and 1 bytes**. Generic diagnostic
+helpers can reach more SDK switch cases, but those are not evidence that the
+normal shipped product requires them; unsupported selectors are rejected before
+GLIF rather than advertised as compatibility.
+
+Selector 1 is the one shape-changing path. With the live P4 SDK's legacy EARFCN
+mode (the recovered configuration default, with no shipped caller found that
+enables extended mode), the **182-byte** stock cell-lock object is converted to
+**122 modem bytes**:
+
+```text
+stock: u16 count | u32 earfcn[30] | tail[60]
+wire:  u16 count | u16 earfcn[30] | tail[60]
+```
+
+The OEM converter truncates each used `u32` EARFCN to its low `u16`, copies the
+60-byte tail, and leaves unused bytes in the compressed EARFCN area as allocator
+contents. The clean implementation preserves the same meaningful representation
+but zero-fills that unused gap deterministically instead of sending heap garbage.
+Counts above 30 and malformed lengths are rejected before modem output.
+
+### Commands 19/20 are host-local, not modem HCI
+
+Fresh live-P4 disassembly corrects an easy cataloguing trap: the constants seen
+inside the stock wrappers are field-copy metadata, not hidden modem opcodes.
+Both functions are ordinary stock `SDK_API` calls and terminate on the host.
+
+`LTED_GetDHCPLeaseStateByCID` is stock command **19** with exactly one CID byte.
+The daemon writes its one-byte synchronous result at shared-context offset
+**`0x977e`**. The shipped `lteatcm` caller only distinguishes **zero vs nonzero**;
+its richer lease display/count path is separate. OEM `lted` obtains that value
+by parsing dhcpcd lease text. The clean bridge instead derives the same product
+semantic from its already-authoritative typed PDN/NIC state: a CID is leased
+when the corresponding `lte0pdn<CID>` record has an active data path and a
+nonzero IPv4 address. This avoids retaining an obsolete text-file parser while
+preserving the observable caller contract.
+
+`LTED_SetMtuSize` is stock command **20** with an exact **258-byte** parameter
+object: a 256-byte interface-name buffer followed by a big-endian `u16` MTU.
+Live `LAPI_SetMTUSize` performs no modem send. Its `net_nic_mtuset` helper zeros
+an `ifreq`, `strncpy`s at most 15 interface-name bytes, stores the MTU at the
+`ifreq` union offset, and calls Linux **`SIOCSIFMTU` (`0x8922`)** on the SDK's
+host socket. The Rust bridge therefore emits a typed host action rather than a
+fake HCI packet. Production `gctd` executes the equivalent `ip link set dev ...
+mtu ...` operation without a shell; failure propagates through the stock
+synchronous `lte_api_ret` result. Tests inject the host executor and never alter
+real interfaces.
+
+This closes the useful finite compatibility pass without importing diagnostic
+escape hatches (`VendorSpecificHCI`, raw DM controls), eMBMS/CSG feature fossils,
+or unexercised SDK switch cases. Further compatibility work should be driven by
+a concrete shipped client or live-target failure rather than API-count
+completionism.

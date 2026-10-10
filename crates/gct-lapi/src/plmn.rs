@@ -4,6 +4,41 @@ use gct_hci::{EncodeError, Packet, TlvCursor, TlvDecodeError, encode_packet, rec
 
 use crate::common::{ResponseDecodeError, be_u16, be_u32, exact_payload, prefix_payload};
 
+/// Zero-payload selected-PLMN query `0x310f`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuerySelectedPlmnRequest;
+
+impl QuerySelectedPlmnRequest {
+    /// Encode the exact empty request.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than one HCI header.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        encode_packet(recovered_opcode::QUERY_SELECTED_PLMN_REQUEST, &[], output)
+    }
+}
+
+/// Live-P4 selected-PLMN response `0xb110`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuerySelectedPlmnResponse {
+    pub result: u8,
+    pub selected_plmn: [u8; 3],
+}
+
+impl QuerySelectedPlmnResponse {
+    /// Decode the exact four bytes forwarded by the live SDK/daemon.
+    ///
+    /// # Errors
+    /// Returns [`ResponseDecodeError`] for another opcode or non-four-byte payload.
+    pub fn parse(packet: Packet<'_>) -> Result<Self, ResponseDecodeError> {
+        let payload = exact_payload(packet, recovered_opcode::QUERY_SELECTED_PLMN_RESPONSE, 4)?;
+        Ok(Self {
+            result: payload[0],
+            selected_plmn: [payload[1], payload[2], payload[3]],
+        })
+    }
+}
+
 /// One semantic PLMN record assembled from the three TLVs used by GCT.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlmnInfo {

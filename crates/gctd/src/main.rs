@@ -3,8 +3,11 @@ use std::{
     ffi::OsStr,
     fs::File,
     io::{self, Read},
-    os::{fd::AsFd, unix::net::UnixDatagram},
-    process::ExitCode,
+    os::{
+        fd::AsFd,
+        unix::{ffi::OsStrExt, net::UnixDatagram},
+    },
+    process::{Command, ExitCode},
     thread::{self, JoinHandle},
 };
 
@@ -15,7 +18,7 @@ use gct_runtime::{
 };
 use gct_transport::{HciStreamDecoder, OEM_READ_BUFFER_LEN};
 use ipv6_prefix::{Ipv6PrefixSource, interface_name};
-use lted_bridge::DeviceBridge;
+use lted_bridge::{DeviceBridge, HostAction};
 use lted_compat::{Error as CompatError, Server};
 use lted_proto::{Event, Packet, SdkApiRequest, parse_api_close};
 use rustix::event::{PollFd, PollFlags, poll};
@@ -349,7 +352,13 @@ fn handle_client_datagram(
             let request = SdkApiRequest::parse(packet).map_err(|error| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}"))
             })?;
-            match bridge.handle_sdk_api(server, modem, client_id, request) {
+            match bridge.handle_sdk_api_with_host(
+                server,
+                modem,
+                client_id,
+                request,
+                execute_host_action,
+            ) {
                 Ok(call) => eprintln!(
                     "gctd: client {client_id} SDK command {} -> {} HCI bytes",
                     call.command as u16, call.bytes_written
@@ -364,6 +373,27 @@ fn handle_client_datagram(
         }
     }
     Ok(())
+}
+
+fn execute_host_action(action: HostAction) -> io::Result<()> {
+    match action {
+        HostAction::SetMtu { mtu, .. } => {
+            let interface_name = OsStr::from_bytes(action.interface_name_bytes());
+            let status = Command::new("/sbin/ip")
+                .args([OsStr::new("link"), OsStr::new("set"), OsStr::new("dev")])
+                .arg(interface_name)
+                .arg("mtu")
+                .arg(mtu.to_string())
+                .status()?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "ip link set mtu {mtu} exited with {status}"
+                )))
+            }
+        }
+    }
 }
 
 fn handle_glif_message(

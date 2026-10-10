@@ -22,10 +22,12 @@ use callbacks::{
     broadcast_iccid_callback, broadcast_mobile_id_callback, broadcast_msisdn_callback,
     broadcast_pdn_connect_callback, broadcast_pdn_connect_ext_callback,
     broadcast_pdn_disconnect_callback, broadcast_plmn_list_callback,
-    broadcast_plmn_search_callback, broadcast_plmn_search_stop_callback, broadcast_result_callback,
+    broadcast_plmn_search_callback, broadcast_plmn_search_stop_callback,
+    broadcast_query_selected_plmn_callback, broadcast_result_callback,
     broadcast_rf_measure_report_callback, broadcast_rf_measure_report_indication_callback,
     broadcast_rf_status_report_control_callback, broadcast_rrc_capability_get_callback,
-    broadcast_rrc_capability_set_callback, broadcast_set_protocol_info_callback,
+    broadcast_rrc_capability_set_callback, broadcast_rrc_function_get_callback,
+    broadcast_rrc_function_set_callback, broadcast_set_protocol_info_callback,
     broadcast_temperature_callback, broadcast_ue_mode_change_callback, broadcast_uicc_callback,
 };
 pub use delivery::BroadcastReport;
@@ -36,11 +38,13 @@ use legacy::{
 use legacy::{
     LegacyAttachDecodeError, LegacyAttachExtDecodeError, LegacyPdnConnectDecodeError,
     LegacyPdnConnectExtDecodeError, LegacyPdnDisconnectDecodeError, LegacyRrcCapabilityDecodeError,
-    LegacySetProtocolInfoDecodeError, LegacyUiccDecodeError, LegacyUiccRequest,
-    decode_legacy_attach, decode_legacy_attach_ext, decode_legacy_pdn_connect,
-    decode_legacy_pdn_connect_ext, decode_legacy_pdn_disconnect, decode_legacy_rrc_capability_get,
-    decode_legacy_rrc_capability_set, decode_legacy_set_protocol_info, decode_legacy_uicc,
-    rrc_capability_set_success_has_callback,
+    LegacyRrcFunctionDecodeError, LegacySetProtocolInfoDecodeError, LegacyUiccDecodeError,
+    LegacyUiccRequest, RRC_FUNCTION_CELL_LOCK_WIRE_LEN, decode_legacy_attach,
+    decode_legacy_attach_ext, decode_legacy_pdn_connect, decode_legacy_pdn_connect_ext,
+    decode_legacy_pdn_disconnect, decode_legacy_rrc_capability_get,
+    decode_legacy_rrc_capability_set, decode_legacy_rrc_function_get,
+    decode_legacy_rrc_function_set, decode_legacy_set_protocol_info, decode_legacy_uicc,
+    materialize_rrc_function_cell_lock_wire, rrc_capability_set_success_has_callback,
 };
 use state::{ApnState, NicState, SpecialTidRecord};
 pub use state::{ApnStateError, ConnectionStateError};
@@ -61,10 +65,13 @@ use gct_lapi::{
     pdn::{PdnConnectResponse, PdnDisconnectResponse},
     plmn::{
         PlmnInfoDecodeError, PlmnListResponse, PlmnSearchExtRequest, PlmnSearchRequest,
-        PlmnSearchStopRequest,
+        PlmnSearchStopRequest, QuerySelectedPlmnRequest, QuerySelectedPlmnResponse,
     },
     rf::{RfMeasureReportRequest, RfStatusReportControlRequest},
-    rrc::{RrcCapabilityGetResponse, RrcCapabilitySetResponse, SetProtocolInfoResponse},
+    rrc::{
+        RrcCapabilityGetResponse, RrcCapabilitySetResponse, RrcFunctionResponse,
+        RrcFunctionSetRequest, SetProtocolInfoResponse,
+    },
     uicc::UiccResponse,
 };
 use gct_runtime::{
@@ -91,10 +98,42 @@ pub const STOCK_SDK_VERSION: [u8; 4] = [3, 7, 18, 2];
 pub const STOCK_DRIVER_VERSION: [u8; 4] = [1, 0, 2, 0];
 /// One-byte stock APN-type query result near the end of the shared context.
 pub const APN_TYPE_RESULT_OFFSET: usize = 0x977d;
+/// One-byte result slot read by stock command 19 (`LTED_GetDHCPLeaseStateByCID`).
+pub const DHCP_LEASE_STATE_RESULT_OFFSET: usize = 0x977e;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostAction {
+    SetMtu {
+        interface_name: [u8; 15],
+        name_len: u8,
+        mtu: u16,
+    },
+}
+
+impl HostAction {
+    #[must_use]
+    pub fn interface_name_bytes(&self) -> &[u8] {
+        match self {
+            Self::SetMtu {
+                interface_name,
+                name_len,
+                ..
+            } => &interface_name[..usize::from(*name_len)],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostRequestError {
+    EmptyInterfaceName,
+    ZeroMtu,
+}
 
 #[derive(Debug)]
 pub enum HandleError {
     Ipc(io::Error),
+    Host(io::Error),
+    HostRequest(HostRequestError),
     UnsupportedCommand(u16),
     UnexpectedParameters {
         command: u16,
@@ -112,6 +151,7 @@ pub enum HandleError {
     LegacyPdnDisconnect(LegacyPdnDisconnectDecodeError),
     LegacyUicc(LegacyUiccDecodeError),
     LegacyRrcCapability(LegacyRrcCapabilityDecodeError),
+    LegacyRrcFunction(LegacyRrcFunctionDecodeError),
     LegacySetProtocolInfo(LegacySetProtocolInfoDecodeError),
     RrcCapabilityCallback(RrcCapabilityCallbackError),
     UiccCallback(UiccCallbackError),
@@ -133,6 +173,8 @@ impl std::fmt::Display for HandleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Ipc(error) => write!(f, "lted IPC error: {error}"),
+            Self::Host(error) => write!(f, "host networking action failed: {error}"),
+            Self::HostRequest(error) => write!(f, "invalid stock host-network request: {error:?}"),
             Self::UnsupportedCommand(command) => {
                 write!(f, "unsupported recovered lted SDK command {command}")
             }
@@ -167,6 +209,9 @@ impl std::fmt::Display for HandleError {
             Self::LegacyUicc(error) => write!(f, "invalid stock UICC request: {error:?}"),
             Self::LegacyRrcCapability(error) => {
                 write!(f, "invalid stock RRC-capability request: {error:?}")
+            }
+            Self::LegacyRrcFunction(error) => {
+                write!(f, "invalid stock RRC-function request: {error:?}")
             }
             Self::LegacySetProtocolInfo(error) => {
                 write!(f, "invalid stock set-protocol-info request: {error:?}")
@@ -205,8 +250,9 @@ impl std::fmt::Display for HandleError {
 impl std::error::Error for HandleError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Ipc(error) => Some(error),
-            Self::UnsupportedCommand(_)
+            Self::Ipc(error) | Self::Host(error) => Some(error),
+            Self::HostRequest(_)
+            | Self::UnsupportedCommand(_)
             | Self::UnexpectedParameters { .. }
             | Self::UnknownDevice { .. }
             | Self::LegacyAttach(_)
@@ -216,6 +262,7 @@ impl std::error::Error for HandleError {
             | Self::LegacyPdnDisconnect(_)
             | Self::LegacyUicc(_)
             | Self::LegacyRrcCapability(_)
+            | Self::LegacyRrcFunction(_)
             | Self::LegacySetProtocolInfo(_)
             | Self::RrcCapabilityCallback(_)
             | Self::UiccCallback(_)
@@ -394,7 +441,9 @@ impl DeviceBridge {
     /// Returns [`HandleError`] for an unused client slot, System V IPC failure,
     /// a request for another physical device, an unsupported/not-yet-translated
     /// command, unexpected legacy parameters, or a modem encode/write/pending
-    /// failure.
+    /// failure. Host-local requests such as Set MTU fail closed here; production
+    /// callers that can perform those side effects must use
+    /// [`Self::handle_sdk_api_with_host`].
     pub fn handle_sdk_api<T: Write>(
         &mut self,
         server: &mut Server,
@@ -402,6 +451,33 @@ impl DeviceBridge {
         client_id: u8,
         request: SdkApiRequest<'_>,
     ) -> Result<HandledCall, HandleError> {
+        self.handle_sdk_api_with_host(server, modem, client_id, request, |_| {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "host action executor required",
+            ))
+        })
+    }
+
+    /// Execute one stock SDK request while delegating recovered host-network
+    /// side effects to the caller. This keeps the bridge testable without
+    /// privileges and lets the production daemon surface real host failures
+    /// through the stock synchronous `lte_api_ret` path.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::handle_sdk_api`] plus
+    /// [`HandleError::Host`] when the injected host operation fails.
+    pub fn handle_sdk_api_with_host<T: Write, F>(
+        &mut self,
+        server: &mut Server,
+        modem: &mut Modem<T>,
+        client_id: u8,
+        request: SdkApiRequest<'_>,
+        mut host_action: F,
+    ) -> Result<HandledCall, HandleError>
+    where
+        F: FnMut(HostAction) -> io::Result<()>,
+    {
         let context = server.client_context(client_id)?;
         context.daemon_acquire()?;
         if let Err(error) = context.write_i32_be(LTE_API_RET_OFFSET, 0) {
@@ -422,6 +498,13 @@ impl DeviceBridge {
                     .dispatch_connection_info(request, |snapshot| {
                         context.write(CONNECTION_INFO_OFFSET, snapshot)
                     }),
+                Ok(SdkCommand::CheckDhcpLeaseState) => self
+                    .dispatch_check_dhcp_lease_state(request, |value| {
+                        context.write(DHCP_LEASE_STATE_RESULT_OFFSET, &[value])
+                    }),
+                Ok(SdkCommand::SetMtuSize) => {
+                    Self::dispatch_set_mtu_size(request, &mut host_action)
+                }
                 Ok(
                     SdkCommand::SetApnType
                     | SdkCommand::GetApnType
@@ -440,6 +523,9 @@ impl DeviceBridge {
                 Ok(SdkCommand::PlmnSearch) => self.dispatch_plmn_search(modem, request),
                 Ok(SdkCommand::PlmnSearchExt) => self.dispatch_plmn_search_ext(modem, request),
                 Ok(SdkCommand::PlmnSearchStop) => self.dispatch_plmn_search_stop(modem, request),
+                Ok(SdkCommand::QuerySelectedPlmn) => {
+                    self.dispatch_query_selected_plmn(modem, request)
+                }
                 Ok(SdkCommand::ContentsResetAndDelete) => {
                     self.dispatch_contents_reset_and_delete(modem, request)
                 }
@@ -466,12 +552,12 @@ impl DeviceBridge {
                 Ok(SdkCommand::EmmNiReattachControl) => {
                     self.dispatch_emm_ni_reattach_control(modem, request)
                 }
-                Ok(SdkCommand::RrcCapabilityControl) => {
-                    self.dispatch_rrc_capability_set(modem, request)
-                }
-                Ok(SdkCommand::RrcCapabilityControlGet) => {
-                    self.dispatch_rrc_capability_get(modem, request)
-                }
+                Ok(
+                    command @ (SdkCommand::RrcCapabilityControl
+                    | SdkCommand::RrcCapabilityControlGet
+                    | SdkCommand::RrcFunctionControl
+                    | SdkCommand::RrcFunctionControlGet),
+                ) => self.dispatch_rrc_request(modem, request, command),
                 Ok(_) => self.dispatch_zero_parameter(modem, request),
                 Err(_) => Err(HandleError::UnsupportedCommand(request.command)),
             }
@@ -495,6 +581,72 @@ impl DeviceBridge {
         status_result?;
         release_result?;
         dispatch
+    }
+
+    fn dispatch_check_dhcp_lease_state<F>(
+        &self,
+        request: SdkApiRequest<'_>,
+        write_result: F,
+    ) -> Result<HandledCall, HandleError>
+    where
+        F: FnOnce(u8) -> io::Result<()>,
+    {
+        let [cid] = request.params else {
+            return Err(HandleError::UnexpectedParameters {
+                command: request.command,
+                expected: 1,
+                actual: request.params.len(),
+            });
+        };
+        write_result(u8::from(self.nic_state.has_ipv4_lease_for_cid(*cid)))?;
+        Ok(HandledCall {
+            command: SdkCommand::CheckDhcpLeaseState,
+            device_id: request.device_id,
+            bytes_written: 0,
+        })
+    }
+
+    fn dispatch_set_mtu_size<F>(
+        request: SdkApiRequest<'_>,
+        host_action: &mut F,
+    ) -> Result<HandledCall, HandleError>
+    where
+        F: FnMut(HostAction) -> io::Result<()>,
+    {
+        if request.params.len() != 258 {
+            return Err(HandleError::UnexpectedParameters {
+                command: request.command,
+                expected: 258,
+                actual: request.params.len(),
+            });
+        }
+        let name_source = &request.params[..15];
+        let name_len = name_source
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(name_source.len());
+        if name_len == 0 {
+            return Err(HandleError::HostRequest(
+                HostRequestError::EmptyInterfaceName,
+            ));
+        }
+        let mtu = u16::from_be_bytes([request.params[256], request.params[257]]);
+        if mtu == 0 {
+            return Err(HandleError::HostRequest(HostRequestError::ZeroMtu));
+        }
+        let mut interface_name = [0_u8; 15];
+        interface_name[..name_len].copy_from_slice(&name_source[..name_len]);
+        host_action(HostAction::SetMtu {
+            interface_name,
+            name_len: u8::try_from(name_len).unwrap_or(15),
+            mtu,
+        })
+        .map_err(HandleError::Host)?;
+        Ok(HandledCall {
+            command: SdkCommand::SetMtuSize,
+            device_id: request.device_id,
+            bytes_written: 0,
+        })
     }
 
     fn dispatch_ps_init_complete<F>(
@@ -599,6 +751,48 @@ impl DeviceBridge {
             return Ok(None);
         }
         let report = broadcast_rrc_capability_get_callback(server, self.device_id, response)?;
+        self.pending.remove(key);
+        Ok(Some(report))
+    }
+
+    fn handle_query_selected_plmn_event(
+        &mut self,
+        server: &mut Server,
+        response: QuerySelectedPlmnResponse,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        let key = ResponseKey::QuerySelectedPlmn;
+        if !self.pending.contains(key) {
+            return Ok(None);
+        }
+        let report = broadcast_query_selected_plmn_callback(server, self.device_id, response)?;
+        self.pending.remove(key);
+        Ok(Some(report))
+    }
+
+    fn handle_rrc_function_set_event(
+        &mut self,
+        server: &mut Server,
+        response: RrcFunctionResponse<'_>,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        let key = ResponseKey::RrcFunctionSet(response.type_id);
+        if !self.pending.contains(key) {
+            return Ok(None);
+        }
+        let report = broadcast_rrc_function_set_callback(server, self.device_id, response)?;
+        self.pending.remove(key);
+        Ok(Some(report))
+    }
+
+    fn handle_rrc_function_get_event(
+        &mut self,
+        server: &mut Server,
+        response: RrcFunctionResponse<'_>,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        let key = ResponseKey::RrcFunctionGet(response.type_id);
+        if !self.pending.contains(key) {
+            return Ok(None);
+        }
+        let report = broadcast_rrc_function_get_callback(server, self.device_id, response)?;
         self.pending.remove(key);
         Ok(Some(report))
     }
@@ -857,6 +1051,28 @@ impl DeviceBridge {
         broadcast_pdn_disconnect_callback(server, self.device_id, response).map(Some)
     }
 
+    fn handle_rrc_event(
+        &mut self,
+        server: &mut Server,
+        event: &ModemEvent<'_>,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        match event {
+            ModemEvent::RrcCapabilitySet(response) => {
+                self.handle_rrc_capability_set_event(server, *response)
+            }
+            ModemEvent::RrcCapabilityGet(response) => {
+                self.handle_rrc_capability_get_event(server, *response)
+            }
+            ModemEvent::RrcFunctionSet(response) => {
+                self.handle_rrc_function_set_event(server, *response)
+            }
+            ModemEvent::RrcFunctionGet(response) => {
+                self.handle_rrc_function_get_event(server, *response)
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Route one decoded modem event through the asynchronous stock callback
     /// path implemented so far.
     ///
@@ -904,11 +1120,12 @@ impl DeviceBridge {
                 response.command,
             )
             .map(Some),
-            ModemEvent::RrcCapabilitySet(response) => {
-                self.handle_rrc_capability_set_event(server, *response)
-            }
-            ModemEvent::RrcCapabilityGet(response) => {
-                self.handle_rrc_capability_get_event(server, *response)
+            event @ (ModemEvent::RrcCapabilitySet(_)
+            | ModemEvent::RrcCapabilityGet(_)
+            | ModemEvent::RrcFunctionSet(_)
+            | ModemEvent::RrcFunctionGet(_)) => self.handle_rrc_event(server, event),
+            ModemEvent::QuerySelectedPlmn(response) => {
+                self.handle_query_selected_plmn_event(server, *response)
             }
             ModemEvent::SetProtocolInfo(response) => {
                 self.handle_set_protocol_info_event(server, *response)
@@ -1153,6 +1370,21 @@ impl DeviceBridge {
         })
     }
 
+    fn dispatch_rrc_request<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+        command: SdkCommand,
+    ) -> Result<HandledCall, HandleError> {
+        match command {
+            SdkCommand::RrcCapabilityControl => self.dispatch_rrc_capability_set(modem, request),
+            SdkCommand::RrcCapabilityControlGet => self.dispatch_rrc_capability_get(modem, request),
+            SdkCommand::RrcFunctionControl => self.dispatch_rrc_function_set(modem, request),
+            SdkCommand::RrcFunctionControlGet => self.dispatch_rrc_function_get(modem, request),
+            _ => Err(HandleError::UnsupportedCommand(request.command)),
+        }
+    }
+
     fn dispatch_rrc_capability_set<T: Write>(
         &mut self,
         modem: &mut Modem<T>,
@@ -1184,6 +1416,76 @@ impl DeviceBridge {
         )?;
         Ok(HandledCall {
             command: SdkCommand::RrcCapabilityControlGet,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_query_selected_plmn<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        if !request.params.is_empty() {
+            return Err(HandleError::UnexpectedParameters {
+                command: request.command,
+                expected: 0,
+                actual: request.params.len(),
+            });
+        }
+        let bytes_written = modem.send_tracked_command(
+            &mut self.pending,
+            ModemCommand::QuerySelectedPlmn(QuerySelectedPlmnRequest),
+        )?;
+        Ok(HandledCall {
+            command: SdkCommand::QuerySelectedPlmn,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_rrc_function_set<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let legacy = decode_legacy_rrc_function_set(request.params)
+            .map_err(HandleError::LegacyRrcFunction)?;
+        let mut converted = [0_u8; RRC_FUNCTION_CELL_LOCK_WIRE_LEN];
+        let data = if legacy.type_id == 1 {
+            materialize_rrc_function_cell_lock_wire(legacy.data, &mut converted)
+                .map_err(HandleError::LegacyRrcFunction)?;
+            converted.as_slice()
+        } else {
+            legacy.data
+        };
+        let bytes_written = modem.send_tracked_command(
+            &mut self.pending,
+            ModemCommand::RrcFunctionSet(RrcFunctionSetRequest {
+                type_id: legacy.type_id,
+                data,
+            }),
+        )?;
+        Ok(HandledCall {
+            command: SdkCommand::RrcFunctionControl,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_rrc_function_get<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let modem_request = decode_legacy_rrc_function_get(request.params)
+            .map_err(HandleError::LegacyRrcFunction)?;
+        let bytes_written = modem.send_tracked_command(
+            &mut self.pending,
+            ModemCommand::RrcFunctionGet(modem_request),
+        )?;
+        Ok(HandledCall {
+            command: SdkCommand::RrcFunctionControlGet,
             device_id: request.device_id,
             bytes_written,
         })
@@ -1901,15 +2203,16 @@ mod tests {
     };
     use super::{
         APN_TYPE_RESULT_OFFSET, ApnStateError, BroadcastReport, CONNECTION_INFO_LEN,
-        CONNECTION_INFO_OFFSET, DEVICE_INFORMATION_LEN, DEVICE_INFORMATION_OFFSET, DeviceBridge,
-        HandleError, LTE_API_RET_OFFSET, LegacyAttachDecodeError, LegacyAttachExtDecodeError,
+        CONNECTION_INFO_OFFSET, DEVICE_INFORMATION_LEN, DEVICE_INFORMATION_OFFSET,
+        DHCP_LEASE_STATE_RESULT_OFFSET, DeviceBridge, HandleError, HostAction, HostRequestError,
+        LTE_API_RET_OFFSET, LegacyAttachDecodeError, LegacyAttachExtDecodeError,
         LegacyPdnConnectDecodeError, LegacyPdnConnectExtDecodeError,
         LegacyPdnDisconnectDecodeError, LegacyRrcCapabilityDecodeError,
-        LegacySetProtocolInfoDecodeError, LegacyUiccDecodeError, PS_INIT_COMPLETE_OFFSET,
-        StartupPhase, UiccCallbackError, broadcast_result_callback, decode_legacy_attach,
-        decode_legacy_attach_ext, decode_legacy_pdn_connect_ext, decode_legacy_pdn_disconnect,
-        decode_legacy_rrc_capability_get, decode_legacy_rrc_capability_set,
-        decode_legacy_set_protocol_info,
+        LegacyRrcFunctionDecodeError, LegacySetProtocolInfoDecodeError, LegacyUiccDecodeError,
+        PS_INIT_COMPLETE_OFFSET, StartupPhase, UiccCallbackError, broadcast_result_callback,
+        decode_legacy_attach, decode_legacy_attach_ext, decode_legacy_pdn_connect_ext,
+        decode_legacy_pdn_disconnect, decode_legacy_rrc_capability_get,
+        decode_legacy_rrc_capability_set, decode_legacy_set_protocol_info,
     };
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -7057,6 +7360,427 @@ mod tests {
         assert_eq!(
             modem.into_transport().into_inner().into_inner(),
             Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn stock_query_selected_plmn_round_trips_exact_live_p4_contract() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (client, id) = open_client(&mut server, &dir, 0);
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::QuerySelectedPlmn.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::QuerySelectedPlmn as u16,
+                    device_id: 0x1122_3344,
+                    params: &[],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.bytes_written, 4);
+        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![0x31, 0x0f, 0, 0]
+        );
+
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                vec![0xb1, 0x10, 0, 4, 0, 0x21, 0xf3, 0x54],
+            ),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        let mut frame = [0_u8; 32];
+        let len = client
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(
+            Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 54);
+        assert_eq!(callback.data, &[0, 0x21, 0xf3, 0x54]);
+    }
+
+    #[test]
+    fn stock_rrc_function_set_get_round_trip_exact_shipped_selector7() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (client, id) = open_client(&mut server, &dir, 0);
+        for kind in [
+            SdkCallbackKind::RrcFunctionControl,
+            SdkCallbackKind::RrcFunctionControlGet,
+        ] {
+            server
+                .client_context(id)
+                .unwrap_or_else(|_| std::process::abort())
+                .write_u32_be(kind.registration_offset(), 1)
+                .unwrap_or_else(|_| std::process::abort());
+        }
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::RrcFunctionControl as u16,
+                    device_id: 1,
+                    params: &[0, 7, 0, 1, 1],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::RrcFunctionControlGet as u16,
+                    device_id: 1,
+                    params: &[0, 7, 0, 0],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(bridge.pending_count(), 2);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![
+                0x39, 0x08, 0, 5, 0, 7, 0, 1, 1, 0x39, 0x0f, 0, 4, 0, 7, 0, 0,
+            ]
+        );
+
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                vec![0xb9, 0x09, 0, 7, 0, 0, 0, 1, 0, 7, 0xaa],
+            ),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                vec![0xb9, 0x10, 0, 7, 0, 0, 0, 1, 0, 7, 0xbb],
+            ),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 32];
+        let len = client
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(
+            Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 225);
+        assert_eq!(callback.data, &[0, 0, 0, 1, 0, 7]);
+
+        let len = client
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(
+            Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 227);
+        assert_eq!(callback.data, &[0, 0, 0, 7, 0, 1, 0xbb]);
+    }
+
+    #[test]
+    fn stock_rrc_function_selector1_compresses_legacy_earfcns_deterministically() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        let mut params = vec![0_u8; 4 + 182];
+        params[..4].copy_from_slice(&[0, 1, 0, 182]);
+        params[4..6].copy_from_slice(&2_u16.to_be_bytes());
+        params[6..10].copy_from_slice(&0x1234_u32.to_be_bytes());
+        params[10..14].copy_from_slice(&0x1_2345_u32.to_be_bytes());
+        for (index, byte) in params[4 + 122..4 + 182].iter_mut().enumerate() {
+            *byte = u8::try_from(index).unwrap_or(0).wrapping_add(0xa0);
+        }
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::RrcFunctionControl as u16,
+                    device_id: 1,
+                    params: &params,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+
+        let wire = modem.into_transport().into_inner().into_inner();
+        assert_eq!(&wire[..8], &[0x39, 0x08, 0, 126, 0, 1, 0, 122]);
+        assert_eq!(&wire[8..14], &[0, 2, 0x12, 0x34, 0x23, 0x45]);
+        assert!(wire[14..70].iter().all(|byte| *byte == 0));
+        assert_eq!(&wire[70..130], &params[126..186]);
+    }
+
+    #[test]
+    fn unshipped_rrc_function_selector_is_rejected_before_modem_write() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::RrcFunctionControl as u16,
+                    device_id: 1,
+                    params: &[0, 8, 0, 0],
+                },
+            ),
+            Err(HandleError::LegacyRrcFunction(
+                LegacyRrcFunctionDecodeError::UnsupportedType(8)
+            ))
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn stock_set_mtu_requires_explicit_host_executor() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let mut params = [0_u8; 258];
+        params[..9].copy_from_slice(b"lte0pdn3\0");
+        params[256..].copy_from_slice(&1500_u16.to_be_bytes());
+
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::SetMtuSize as u16,
+                    device_id: 1,
+                    params: &params,
+                },
+            ),
+            Err(HandleError::Host(_))
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn stock_set_mtu_is_host_local_and_propagates_host_failure() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let mut params = [0_u8; 258];
+        params[..9].copy_from_slice(b"lte0pdn3\0");
+        params[256..].copy_from_slice(&1500_u16.to_be_bytes());
+
+        let mut captured = None;
+        let call = bridge
+            .handle_sdk_api_with_host(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::SetMtuSize as u16,
+                    device_id: 1,
+                    params: &params,
+                },
+                |action| {
+                    captured = Some(action);
+                    Ok(())
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.bytes_written, 0);
+        assert_eq!(read_api_ret(&mut server, id), 0);
+        assert_eq!(
+            captured,
+            Some(HostAction::SetMtu {
+                interface_name: [
+                    b'l', b't', b'e', b'0', b'p', b'd', b'n', b'3', 0, 0, 0, 0, 0, 0, 0,
+                ],
+                name_len: 8,
+                mtu: 1500,
+            })
+        );
+
+        let error = bridge.handle_sdk_api_with_host(
+            &mut server,
+            &mut modem,
+            id,
+            SdkApiRequest {
+                command: SdkCommand::SetMtuSize as u16,
+                device_id: 1,
+                params: &params,
+            },
+            |_| Err(io::Error::from_raw_os_error(1)),
+        );
+        assert!(matches!(error, Err(HandleError::Host(_))));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn stock_set_mtu_rejects_zero_mtu_before_host_action() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let mut params = [0_u8; 258];
+        params[..9].copy_from_slice(b"lte0pdn3\0");
+        let mut called = false;
+        assert!(matches!(
+            bridge.handle_sdk_api_with_host(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::SetMtuSize as u16,
+                    device_id: 1,
+                    params: &params,
+                },
+                |_| {
+                    called = true;
+                    Ok(())
+                },
+            ),
+            Err(HandleError::HostRequest(HostRequestError::ZeroMtu))
+        ));
+        assert!(!called);
+        assert_eq!(read_api_ret(&mut server, id), 1);
+    }
+
+    #[test]
+    fn stock_dhcp_lease_state_tracks_typed_ipv4_connection_state() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::CheckDhcpLeaseState as u16,
+                    device_id: 1,
+                    params: &[3],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            read_shared_byte(&mut server, id, DHCP_LEASE_STATE_RESULT_OFFSET),
+            0
+        );
+
+        let mut attach = [0_u8; 352];
+        attach[0] = 1;
+        attach[0x067] = 4;
+        attach[0x152] = 3;
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::Attach as u16,
+                    device_id: 1,
+                    params: &attach,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        let mut attach_rsp = vec![
+            0, 0, 0, 0, 0x12, 0x34, 0, 9, 1, 4, 0, 0, 0, 0, 0, 0x20, 1, 1, 0x04, 8, b'i', b'n',
+            b't', b'e', b'r', b'n', b'e', b't',
+        ];
+        let pdn_fields = [
+            0x05, 1, 3, 0x07, 4, 10, 20, 30, 40, 0x08, 4, 1, 1, 1, 1, 0x09, 4, 8, 8, 8, 8,
+        ];
+        attach_rsp.push(0xf0);
+        attach_rsp.push(u8::try_from(pdn_fields.len()).unwrap_or(0));
+        attach_rsp.extend_from_slice(&pdn_fields);
+        assert_eq!(
+            route_one_hci(&mut bridge, &mut server, hci_frame(0xb102, &attach_rsp)),
+            Some(BroadcastReport::default())
+        );
+
+        bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::CheckDhcpLeaseState as u16,
+                    device_id: 1,
+                    params: &[3],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            read_shared_byte(&mut server, id, DHCP_LEASE_STATE_RESULT_OFFSET),
+            1
         );
     }
 }

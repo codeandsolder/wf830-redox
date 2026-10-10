@@ -17,12 +17,80 @@ use super::{
         PdnConnectResponsePrefix, PdnDisconnectRequest, PdnDisconnectResponsePrefix,
         PdnEncodeError, PdnField,
     },
+    plmn::{QuerySelectedPlmnRequest, QuerySelectedPlmnResponse},
     rrc::{
         RrcCapabilityGetRequest, RrcCapabilityGetResponse, RrcCapabilitySetRequest,
-        RrcCapabilitySetResponse, SetProtocolInfoRequest, SetProtocolInfoResponse,
+        RrcCapabilitySetResponse, RrcFunctionGetRequest, RrcFunctionResponse,
+        RrcFunctionSetRequest, SetProtocolInfoRequest, SetProtocolInfoResponse,
     },
 };
 use gct_hci::{Header, Packet, Tlv, public_opcode};
+
+#[test]
+fn query_selected_plmn_matches_live_p4_wire() {
+    let mut request = [0_u8; 4];
+    assert_eq!(QuerySelectedPlmnRequest.encode(&mut request), Ok(4));
+    assert_eq!(request, [0x31, 0x0f, 0, 0]);
+
+    let response = [0xb1, 0x10, 0, 4, 0, 0x21, 0xf3, 0x54];
+    let Ok(packet) = Packet::parse(&response) else {
+        return;
+    };
+    assert_eq!(
+        QuerySelectedPlmnResponse::parse(packet),
+        Ok(QuerySelectedPlmnResponse {
+            result: 0,
+            selected_plmn: [0x21, 0xf3, 0x54],
+        })
+    );
+}
+
+#[test]
+fn rrc_function_frames_match_live_p4_common_grammar() {
+    let mut set = [0_u8; 9];
+    assert_eq!(
+        (RrcFunctionSetRequest {
+            type_id: 7,
+            data: &[1],
+        })
+        .encode(&mut set),
+        Ok(9)
+    );
+    assert_eq!(set, [0x39, 0x08, 0, 5, 0, 7, 0, 1, 1]);
+
+    let mut get = [0_u8; 8];
+    assert_eq!(
+        (RrcFunctionGetRequest { type_id: 7 }).encode(&mut get),
+        Ok(8)
+    );
+    assert_eq!(get, [0x39, 0x0f, 0, 4, 0, 7, 0, 0]);
+
+    let set_response = [0xb9, 0x09, 0, 7, 0, 0, 0, 1, 0, 7, 0xaa];
+    let Ok(packet) = Packet::parse(&set_response) else {
+        return;
+    };
+    assert_eq!(
+        RrcFunctionResponse::parse_set(packet),
+        Ok(RrcFunctionResponse {
+            result: 0,
+            type_id: 7,
+            data: &[0xaa],
+        })
+    );
+
+    let get_response = [0xb9, 0x10, 0, 7, 0, 0, 0, 1, 0, 7, 0xbb];
+    let Ok(packet) = Packet::parse(&get_response) else {
+        return;
+    };
+    assert_eq!(
+        RrcFunctionResponse::parse_get(packet),
+        Ok(RrcFunctionResponse {
+            result: 0,
+            type_id: 7,
+            data: &[0xbb],
+        })
+    );
+}
 
 #[test]
 fn nas_config_requests_match_live_p4_wire_and_bounds() {

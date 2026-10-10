@@ -43,6 +43,7 @@ use gct_lapi::{
     plmn::{
         PlmnListResponse, PlmnSearchDecodeError, PlmnSearchExtEncodeError, PlmnSearchExtRequest,
         PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
+        QuerySelectedPlmnRequest, QuerySelectedPlmnResponse,
     },
     rf::{
         RfControlDecodeError, RfMeasureReportIndication, RfMeasureReportRequest,
@@ -50,7 +51,8 @@ use gct_lapi::{
     },
     rrc::{
         RrcCapabilityGetRequest, RrcCapabilityGetResponse, RrcCapabilitySetRequest,
-        RrcCapabilitySetResponse, SetProtocolInfoRequest, SetProtocolInfoResponse,
+        RrcCapabilitySetResponse, RrcFunctionGetRequest, RrcFunctionResponse,
+        RrcFunctionSetRequest, SetProtocolInfoRequest, SetProtocolInfoResponse,
     },
     uicc::{
         UiccAuthenticateEncodeError, UiccAuthenticateRequest, UiccFixedRequest,
@@ -185,6 +187,7 @@ pub enum ModemEvent<'a> {
     PlmnSearchStop(PlmnSearchStopResponse),
     ContentsResetAndDelete(ContentsResetAndDeleteResponse),
     PlmnList(PlmnListResponse<'a>),
+    QuerySelectedPlmn(QuerySelectedPlmnResponse),
     MobileIdRead(MobileIdReadResponse<'a>),
     IccidRead(IccidReadResponse<'a>),
     MsisdnRead(MsisdnReadResponse<'a>),
@@ -209,6 +212,8 @@ pub enum ModemEvent<'a> {
     Uicc(UiccResponse<'a>),
     RrcCapabilitySet(RrcCapabilitySetResponse<'a>),
     RrcCapabilityGet(RrcCapabilityGetResponse<'a>),
+    RrcFunctionSet(RrcFunctionResponse<'a>),
+    RrcFunctionGet(RrcFunctionResponse<'a>),
     SetProtocolInfo(SetProtocolInfoResponse<'a>),
     DeviceInformation(DeviceInformationResponse),
     Unknown(Packet<'a>),
@@ -244,6 +249,7 @@ pub enum ModemCommand<'a> {
     PlmnSearch(PlmnSearchRequest),
     PlmnSearchExt(PlmnSearchExtRequest<'a>),
     PlmnSearchStop(PlmnSearchStopRequest),
+    QuerySelectedPlmn(QuerySelectedPlmnRequest),
     ContentsResetAndDelete(ContentsResetAndDeleteRequest),
     MobileIdRead(MobileIdReadRequest),
     IccidRead(IccidReadRequest),
@@ -270,6 +276,8 @@ pub enum ModemCommand<'a> {
     UiccPinCommand(UiccPinCommandRequest<'a>),
     RrcCapabilitySet(RrcCapabilitySetRequest<'a>),
     RrcCapabilityGet(RrcCapabilityGetRequest),
+    RrcFunctionSet(RrcFunctionSetRequest<'a>),
+    RrcFunctionGet(RrcFunctionGetRequest),
     SetProtocolInfo(SetProtocolInfoRequest<'a>),
     DeviceInformation(DeviceInformationRequest),
     NasConfigSet(NasConfigSetRequest<'a>),
@@ -294,6 +302,7 @@ pub enum ResponseKey {
     PlmnSearchStop(u8),
     ContentsResetAndDelete,
     PlmnList,
+    QuerySelectedPlmn,
     MiscRead,
     UeModeChange,
     EmmNiReattachControl,
@@ -303,6 +312,8 @@ pub enum ResponseKey {
     Uicc(u16),
     RrcCapabilitySet(u16),
     RrcCapabilityGet(u16),
+    RrcFunctionSet(u16),
+    RrcFunctionGet(u16),
     SetProtocolInfo(u16),
     DeviceInformation,
 }
@@ -326,6 +337,7 @@ impl ModemCommand<'_> {
             }
             Self::PlmnSearch(_) | Self::PlmnSearchExt(_) => Some(ResponseKey::PlmnSearch),
             Self::PlmnSearchStop(request) => Some(ResponseKey::PlmnSearchStop(request.search_type)),
+            Self::QuerySelectedPlmn(_) => Some(ResponseKey::QuerySelectedPlmn),
             Self::ContentsResetAndDelete(_) => Some(ResponseKey::ContentsResetAndDelete),
             Self::MobileIdRead(_)
             | Self::IccidRead(_)
@@ -363,6 +375,8 @@ impl ModemCommand<'_> {
             Self::UiccPinCommand(_) => Some(ResponseKey::Uicc(uicc_control::PIN_COMMAND)),
             Self::RrcCapabilitySet(request) => Some(ResponseKey::RrcCapabilitySet(request.type_id)),
             Self::RrcCapabilityGet(request) => Some(ResponseKey::RrcCapabilityGet(request.type_id)),
+            Self::RrcFunctionSet(request) => Some(ResponseKey::RrcFunctionSet(request.type_id)),
+            Self::RrcFunctionGet(request) => Some(ResponseKey::RrcFunctionGet(request.type_id)),
             Self::SetProtocolInfo(request) => Some(ResponseKey::SetProtocolInfo(request.type_id)),
             Self::DeviceInformation(_) => Some(ResponseKey::DeviceInformation),
         }
@@ -397,6 +411,7 @@ impl ModemEvent<'_> {
             }
             Self::ContentsResetAndDelete(_) => Some(ResponseKey::ContentsResetAndDelete),
             Self::PlmnList(_) => Some(ResponseKey::PlmnList),
+            Self::QuerySelectedPlmn(_) => Some(ResponseKey::QuerySelectedPlmn),
             Self::MobileIdRead(_)
             | Self::IccidRead(_)
             | Self::MsisdnRead(_)
@@ -414,6 +429,8 @@ impl ModemEvent<'_> {
             Self::RrcCapabilityGet(response) => {
                 Some(ResponseKey::RrcCapabilityGet(response.type_id))
             }
+            Self::RrcFunctionSet(response) => Some(ResponseKey::RrcFunctionSet(response.type_id)),
+            Self::RrcFunctionGet(response) => Some(ResponseKey::RrcFunctionGet(response.type_id)),
             Self::SetProtocolInfo(response) => Some(ResponseKey::SetProtocolInfo(response.type_id)),
             Self::DeviceInformation(_) => Some(ResponseKey::DeviceInformation),
         }
@@ -611,6 +628,7 @@ pub fn encode_command(
         ModemCommand::PlmnSearch(request) => Ok(request.encode(output)?),
         ModemCommand::PlmnSearchExt(request) => Ok(request.encode(output)?),
         ModemCommand::PlmnSearchStop(request) => Ok(request.encode(output)?),
+        ModemCommand::QuerySelectedPlmn(request) => Ok(request.encode(output)?),
         ModemCommand::ContentsResetAndDelete(request) => Ok(request.encode(output)?),
         ModemCommand::MobileIdRead(request) => Ok(request.encode(output)?),
         ModemCommand::IccidRead(request) => Ok(request.encode(output)?),
@@ -637,6 +655,8 @@ pub fn encode_command(
         ModemCommand::UiccPinCommand(request) => Ok(request.encode(output)?),
         ModemCommand::RrcCapabilitySet(request) => Ok(request.encode(output)?),
         ModemCommand::RrcCapabilityGet(request) => Ok(request.encode(output)?),
+        ModemCommand::RrcFunctionSet(request) => Ok(request.encode(output)?),
+        ModemCommand::RrcFunctionGet(request) => Ok(request.encode(output)?),
         ModemCommand::SetProtocolInfo(request) => Ok(request.encode(output)?),
         ModemCommand::DeviceInformation(request) => Ok(request.encode(output)?),
         ModemCommand::NasConfigSet(request) => Ok(request.encode(output)?),
@@ -715,6 +735,24 @@ fn decode_misc_read_event(packet: Packet<'_>) -> Result<ModemEvent<'_>, EventDec
     }
 }
 
+fn decode_rrc_event(packet: Packet<'_>) -> Result<ModemEvent<'_>, EventDecodeError> {
+    match packet.header.command {
+        recovered_opcode::RRC_CAPABILITY_CONTROL_RESPONSE => Ok(ModemEvent::RrcCapabilitySet(
+            RrcCapabilitySetResponse::parse(packet)?,
+        )),
+        recovered_opcode::RRC_CAPABILITY_CONTROL_GET_RESPONSE => Ok(ModemEvent::RrcCapabilityGet(
+            RrcCapabilityGetResponse::parse(packet)?,
+        )),
+        recovered_opcode::RRC_FUNCTION_CONTROL_RESPONSE => Ok(ModemEvent::RrcFunctionSet(
+            RrcFunctionResponse::parse_set(packet)?,
+        )),
+        recovered_opcode::RRC_FUNCTION_CONTROL_GET_RESPONSE => Ok(ModemEvent::RrcFunctionGet(
+            RrcFunctionResponse::parse_get(packet)?,
+        )),
+        _ => Ok(ModemEvent::Unknown(packet)),
+    }
+}
+
 /// Decode one complete HCI packet into the proven typed P0 surface.
 ///
 /// Unknown opcodes remain available through [`ModemEvent::Unknown`]. Known
@@ -754,6 +792,9 @@ pub fn decode_event(packet: Packet<'_>) -> Result<ModemEvent<'_>, EventDecodeErr
         recovered_opcode::PLMN_LIST_RESPONSE => {
             Ok(ModemEvent::PlmnList(PlmnListResponse::parse(packet)?))
         }
+        recovered_opcode::QUERY_SELECTED_PLMN_RESPONSE => Ok(ModemEvent::QuerySelectedPlmn(
+            QuerySelectedPlmnResponse::parse(packet)?,
+        )),
         recovered_opcode::ONLINE_RESPONSE => Ok(ModemEvent::Result {
             kind: ResultResponseKind::Online,
             response: ResultResponse::parse(ResultResponseKind::Online, packet)?,
@@ -803,12 +844,10 @@ pub fn decode_event(packet: Packet<'_>) -> Result<ModemEvent<'_>, EventDecodeErr
             },
             _ => Ok(ModemEvent::Unknown(packet)),
         },
-        recovered_opcode::RRC_CAPABILITY_CONTROL_RESPONSE => Ok(ModemEvent::RrcCapabilitySet(
-            RrcCapabilitySetResponse::parse(packet)?,
-        )),
-        recovered_opcode::RRC_CAPABILITY_CONTROL_GET_RESPONSE => Ok(ModemEvent::RrcCapabilityGet(
-            RrcCapabilityGetResponse::parse(packet)?,
-        )),
+        recovered_opcode::RRC_CAPABILITY_CONTROL_RESPONSE
+        | recovered_opcode::RRC_CAPABILITY_CONTROL_GET_RESPONSE
+        | recovered_opcode::RRC_FUNCTION_CONTROL_RESPONSE
+        | recovered_opcode::RRC_FUNCTION_CONTROL_GET_RESPONSE => decode_rrc_event(packet),
         recovered_opcode::SET_PROTOCOL_INFO_RESPONSE => Ok(ModemEvent::SetProtocolInfo(
             SetProtocolInfoResponse::parse(packet)?,
         )),
