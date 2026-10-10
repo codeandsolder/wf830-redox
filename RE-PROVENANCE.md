@@ -1524,6 +1524,82 @@ and field orders, callback 221/223 registration slots, subscription gating,
 per-type correlation, type-4 bounds rejection before unsafe exposure, silent
 successful type-11 completion, and the asymmetric type-11 failure callback.
 
+## Live P4 SetProtocolInfo — shipped side-effect-free subset
+
+A fresh live-P4 importer audit found real shipped users in both `usr/lte/lteatcm`
+and `bin/gdmmon`. The generic SDK surface is substantially broader than the
+product demand: the shipped callers use set-protocol types **1, 8, and 9**.
+Types 1 and 8 are direct, bounded wire requests; type 9 is not. The replacement
+therefore implements only the proven side-effect-free shipped subset **{1,8}**
+and rejects type 9 before GLIF until its stock configuration semantics are
+modeled rather than silently discarded.
+
+The live `liblted.so` wrappers are authoritative for the local command IDs:
+`LTED_GetProtocolInfoRequest@0x12274` emits command **175**, while
+`LTED_SetProtocolInfoRequest@0x12424` emits command **177**. This corrects older
+notes that assigned different command numbers. No shipped consumer of the get
+wrapper was found in the current `lteatcm`, `gdmmon`, or `embmsd` inventory, so
+the clean bridge does not expose speculative get compatibility.
+
+The three observed set callsites narrow the local objects precisely. `gdmmon`
+uses type **1** with exactly four bytes after the big-endian type word;
+`lteatcm` uses type **8** with exactly one byte after the type word; its other
+callsite uses type **9**. The live type-9 `liblted` branch performs substantial
+filesystem/configuration work and rewrites the request into modem protocol type
+2 before calling the lower SDK. Reproducing only that final modem request would
+lose externally visible stock behavior, so Rust explicitly returns an
+unsupported-type error for 9 rather than claiming partial compatibility.
+
+Live `libltesdk.so::LAPI_SetProtocolInfoRequest@0x5ce04` emits HCI
+**`0x3151`** with common modem payload
+`type:u16 | len:u16 | data[len]`. For the implemented shapes this is exactly
+`00 01 00 04 <4 bytes>` and `00 08 00 01 <1 byte>`. The live response dispatch
+table independently maps **`0xb152`** to handler `0x2ffc0`, whose SDK response
+slot is **89**. That converter consumes the common raw response envelope
+`result:u16 | type:u16 | len:u16 | data[len]`; for types 1 and 8 it preserves
+the declared data bytes after common-word conversion.
+
+The local daemon boundary is much smaller. Live
+`ind_set_protocol_info_response@0x31ad8` emits stock callback **178**. Its DWARF
+fixes `_SET_PROTOCOL_INFO_RSP` at exactly **5 bytes**:
+`result:u16@0 | ps_info_type:u16@2 | value:u8@4`. The response buffer is
+zero-initialized; a nonzero result therefore exposes value zero, while a
+successful response exposes only the first converted data byte through this
+legacy object.
+
+The stock callback slot is proven directly from the live P4 receive switch,
+not inferred from neighboring registrations. `lted_sdk_recv_cb_handler`
+subtracts 22 from the callback selector before indexing its branch table;
+selector 178 therefore selects table entry 156 at `0x5998`, which branches to
+`0x7644`. That case loads the callback/context pair at **`0x2d4/0x2d8`**,
+i.e. **`cb_rsp[90]`**. The Rust bridge consequently registers callback kind
+178 at slot 90 and materializes the exact five-byte callback image.
+
+Requests are correlated by exact protocol `type_id`. Tests cover exact type-1
+and type-8 local-to-HCI byte images, response length validation, exact response
+keying, command 177, callback 178 / slot 90 / offset `0x2d4`, subscription
+gating, pending-state release, exact five-byte callback materialization, and
+rejection of type 9 or malformed type-specific local lengths before any GLIF
+write.
+
+### Deferred synchronous DeviceInformation
+
+The same inventory showed shipped users of `LTED_GetDeviceInformation` in both
+`lteatcm` and `gdmmon`. Its modem transport is compact and already well pinned:
+live `LAPI_GetDeviceInformation@0x4174c` uses request **`0x3002`** and response
+**`0xb003`**. The blocker is instead the local stock ABI: this call is
+*synchronous*. `LTED_GetDeviceInformation@0x94f4` sends local SDK command **3**,
+waits for daemon completion, and only then copies an exact 30-byte result from
+shared context.
+
+The current clean bridge deliberately completes the local SDK semaphore after
+request dispatch, before a future modem response can arrive. Implementing
+DeviceInformation now would therefore either return stale/fabricated data or
+require an architectural lie. It remains deferred until the bridge has a
+first-class deferred synchronous completion path that can hold the local call,
+correlate `0xb003`, write the recovered shared result, and only then release the
+stock client.
+
 ## Live P4 DMLogExt — transport proven, semantic bridge intentionally deferred
 
 Live P4 proves the DMLogExt transport contract completely: stock SDK command

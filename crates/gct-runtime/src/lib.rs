@@ -26,11 +26,11 @@ use gct_lapi::{
     PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest,
     PlmnSearchStopResponse, PsmControlRequest, ResponseDecodeError, ResultResponse,
     ResultResponseKind, RrcCapabilityGetRequest, RrcCapabilityGetResponse, RrcCapabilitySetRequest,
-    RrcCapabilitySetResponse, TemperatureReadRequest, TemperatureReadResponse, UeModeChangeRequest,
-    UeModeChangeResponse, UiccAuthenticateEncodeError, UiccAuthenticateRequest, UiccFixedRequest,
-    UiccFixedRequestError, UiccPinCommandRequest, UiccPinEncodeError, UiccPinStatusRequest,
-    UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse, UiccResponseDecodeError,
-    UiccStatusRequest, uicc_control,
+    RrcCapabilitySetResponse, SetProtocolInfoRequest, SetProtocolInfoResponse,
+    TemperatureReadRequest, TemperatureReadResponse, UeModeChangeRequest, UeModeChangeResponse,
+    UiccAuthenticateEncodeError, UiccAuthenticateRequest, UiccFixedRequest, UiccFixedRequestError,
+    UiccPinCommandRequest, UiccPinEncodeError, UiccPinStatusRequest, UiccReadBinaryRequest,
+    UiccReadRecordRequest, UiccResponse, UiccResponseDecodeError, UiccStatusRequest, uicc_control,
 };
 use gct_transport::{
     GlifTransport, HciIo, HciStreamDecoder, MAX_HCI_FRAME_LEN, OEM_READ_BUFFER_LEN,
@@ -178,6 +178,7 @@ pub enum ModemEvent<'a> {
     Uicc(UiccResponse<'a>),
     RrcCapabilitySet(RrcCapabilitySetResponse<'a>),
     RrcCapabilityGet(RrcCapabilityGetResponse<'a>),
+    SetProtocolInfo(SetProtocolInfoResponse<'a>),
     Unknown(Packet<'a>),
 }
 
@@ -232,6 +233,7 @@ pub enum ModemCommand<'a> {
     UiccPinCommand(UiccPinCommandRequest<'a>),
     RrcCapabilitySet(RrcCapabilitySetRequest<'a>),
     RrcCapabilityGet(RrcCapabilityGetRequest),
+    SetProtocolInfo(SetProtocolInfoRequest<'a>),
 }
 
 /// Identity available on both sides of a proven request/response exchange.
@@ -258,6 +260,7 @@ pub enum ResponseKey {
     Uicc(u16),
     RrcCapabilitySet(u16),
     RrcCapabilityGet(u16),
+    SetProtocolInfo(u16),
 }
 
 impl ModemCommand<'_> {
@@ -311,6 +314,7 @@ impl ModemCommand<'_> {
             Self::UiccPinCommand(_) => Some(ResponseKey::Uicc(uicc_control::PIN_COMMAND)),
             Self::RrcCapabilitySet(request) => Some(ResponseKey::RrcCapabilitySet(request.type_id)),
             Self::RrcCapabilityGet(request) => Some(ResponseKey::RrcCapabilityGet(request.type_id)),
+            Self::SetProtocolInfo(request) => Some(ResponseKey::SetProtocolInfo(request.type_id)),
         }
     }
 }
@@ -356,6 +360,7 @@ impl ModemEvent<'_> {
             Self::RrcCapabilityGet(response) => {
                 Some(ResponseKey::RrcCapabilityGet(response.type_id))
             }
+            Self::SetProtocolInfo(response) => Some(ResponseKey::SetProtocolInfo(response.type_id)),
         }
     }
 }
@@ -567,6 +572,7 @@ pub fn encode_command(
         ModemCommand::UiccPinCommand(request) => Ok(request.encode(output)?),
         ModemCommand::RrcCapabilitySet(request) => Ok(request.encode(output)?),
         ModemCommand::RrcCapabilityGet(request) => Ok(request.encode(output)?),
+        ModemCommand::SetProtocolInfo(request) => Ok(request.encode(output)?),
     }
 }
 
@@ -683,6 +689,9 @@ pub fn decode_event(packet: Packet<'_>) -> Result<ModemEvent<'_>, EventDecodeErr
         )),
         recovered_opcode::RRC_CAPABILITY_CONTROL_GET_RESPONSE => Ok(ModemEvent::RrcCapabilityGet(
             RrcCapabilityGetResponse::parse(packet)?,
+        )),
+        recovered_opcode::SET_PROTOCOL_INFO_RESPONSE => Ok(ModemEvent::SetProtocolInfo(
+            SetProtocolInfoResponse::parse(packet)?,
         )),
         recovered_opcode::MISC_READ_RESPONSE => match MiscReadResponse::parse(packet)? {
             MiscReadResponse::MobileId(response) => Ok(ModemEvent::MobileIdRead(response)),
@@ -883,8 +892,8 @@ mod tests {
         IccidReadRequest, LcsControlRequest, LppControlRequest, MobileIdReadRequest,
         MsisdnReadRequest, PcoInfo, PinData, PlmnSearchExtRequest, PlmnSearchRequest,
         PlmnSearchStopRequest, PsmControlRequest, ResponseDecodeError, ResultResponseKind,
-        RrcCapabilityGetRequest, RrcCapabilitySetRequest, TemperatureReadRequest,
-        UiccPinCommandRequest,
+        RrcCapabilityGetRequest, RrcCapabilitySetRequest, SetProtocolInfoRequest,
+        TemperatureReadRequest, UiccPinCommandRequest,
     };
     use gct_transport::HciIo;
 
@@ -1517,6 +1526,31 @@ mod tests {
             get_event.response_key(),
             Some(ResponseKey::RrcCapabilityGet(4))
         );
+    }
+
+    #[test]
+    fn set_protocol_info_tracks_exact_type_and_decodes_live_response() {
+        let command = ModemCommand::SetProtocolInfo(SetProtocolInfoRequest {
+            type_id: 8,
+            data: &[0x55],
+        });
+        assert_eq!(
+            command.response_key(),
+            Some(ResponseKey::SetProtocolInfo(8))
+        );
+
+        let payload = [0, 0, 0, 8, 0, 1, 0x55];
+        let packet = Packet {
+            header: Header {
+                command: recovered_opcode::SET_PROTOCOL_INFO_RESPONSE,
+                payload_len: 7,
+            },
+            payload: &payload,
+        };
+        let Ok(event) = decode_event(packet) else {
+            std::process::abort();
+        };
+        assert_eq!(event.response_key(), Some(ResponseKey::SetProtocolInfo(8)));
     }
 
     #[test]

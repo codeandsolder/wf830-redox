@@ -354,6 +354,8 @@ pub mod recovered_opcode {
     pub const UE_MODE_CHANGE_REQUEST: u16 = 0x3118;
     /// Shared EMM control request used by timer-control and NI-reattach families.
     pub const EMM_CONTROL_REQUEST: u16 = 0x3155;
+    /// Set-protocol-info request used by shipped P4 `lteatcm`/`gdmmon`.
+    pub const SET_PROTOCOL_INFO_REQUEST: u16 = 0x3151;
     /// RRC-capability set request used by the shipped connection manager.
     pub const RRC_CAPABILITY_CONTROL_REQUEST: u16 = 0x3906;
     /// RRC-capability get request used by the shipped connection manager.
@@ -385,6 +387,8 @@ pub mod recovered_opcode {
     pub const EMM_CONTROL_RESPONSE: u16 = 0xb156;
     /// Shared unsolicited EMM-control report envelope.
     pub const EMM_CONTROL_REPORT: u16 = 0xb164;
+    /// Response to `SET_PROTOCOL_INFO_REQUEST`; live SDK internal response slot 89.
+    pub const SET_PROTOCOL_INFO_RESPONSE: u16 = 0xb152;
     /// Response to `RRC_CAPABILITY_CONTROL_REQUEST`; live SDK callback slot 115.
     pub const RRC_CAPABILITY_CONTROL_RESPONSE: u16 = 0xb907;
     /// Response to `RRC_CAPABILITY_CONTROL_GET_REQUEST`; live SDK callback slot 116.

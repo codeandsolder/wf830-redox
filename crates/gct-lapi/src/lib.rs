@@ -4515,6 +4515,95 @@ impl<'a> RrcCapabilityGetResponse<'a> {
     }
 }
 
+/// Live-P4 set-protocol-info request `0x3151`.
+///
+/// `LAPI_SetProtocolInfoRequest` serializes the common modem envelope as
+/// `type:u16 | len:u16 | data[len]`. Policy about which product-used type IDs
+/// are supported belongs at the compatibility boundary, not in this wire codec.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SetProtocolInfoRequest<'a> {
+    pub type_id: u16,
+    pub data: &'a [u8],
+}
+
+impl SetProtocolInfoRequest<'_> {
+    /// Encode the exact live-P4 common set-protocol frame.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::PayloadTooLong`] when the common prefix plus data
+    /// cannot fit the HCI u16 payload length, or [`EncodeError::NoSpace`] when
+    /// `output` is too small.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        let data_len = u16::try_from(self.data.len()).map_err(|_| EncodeError::PayloadTooLong)?;
+        let payload_len = 4_usize
+            .checked_add(self.data.len())
+            .ok_or(EncodeError::PayloadTooLong)?;
+        let payload_len_u16 =
+            u16::try_from(payload_len).map_err(|_| EncodeError::PayloadTooLong)?;
+        let total = HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or(EncodeError::PayloadTooLong)?;
+        let Some(dst) = output.get_mut(..total) else {
+            return Err(EncodeError::NoSpace);
+        };
+        dst[..HEADER_LEN].copy_from_slice(
+            &Header {
+                command: recovered_opcode::SET_PROTOCOL_INFO_REQUEST,
+                payload_len: payload_len_u16,
+            }
+            .encode(),
+        );
+        dst[4..6].copy_from_slice(&self.type_id.to_be_bytes());
+        dst[6..8].copy_from_slice(&data_len.to_be_bytes());
+        dst[8..].copy_from_slice(self.data);
+        Ok(total)
+    }
+}
+
+/// Live-P4 set-protocol-info response `0xb152` before daemon-side narrowing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SetProtocolInfoResponse<'a> {
+    pub result: u16,
+    pub type_id: u16,
+    pub data: &'a [u8],
+}
+
+impl<'a> SetProtocolInfoResponse<'a> {
+    /// Decode `result:u16 | type:u16 | len:u16 | data[len]`.
+    ///
+    /// # Errors
+    /// Returns [`ResponseDecodeError`] for another opcode, a short prefix, or
+    /// a declared data length inconsistent with the complete HCI frame.
+    pub fn parse(packet: Packet<'a>) -> Result<Self, ResponseDecodeError> {
+        let payload = response_payload(packet, recovered_opcode::SET_PROTOCOL_INFO_RESPONSE)?;
+        if payload.len() < 6 {
+            return Err(ResponseDecodeError::TruncatedPrefix {
+                minimum: 6,
+                actual: payload.len(),
+            });
+        }
+        let declared = usize::from(be_u16(payload, 4));
+        let expected =
+            6_usize
+                .checked_add(declared)
+                .ok_or(ResponseDecodeError::UnexpectedLength {
+                    expected: usize::MAX,
+                    actual: payload.len(),
+                })?;
+        if payload.len() != expected {
+            return Err(ResponseDecodeError::UnexpectedLength {
+                expected,
+                actual: payload.len(),
+            });
+        }
+        Ok(Self {
+            result: be_u16(payload, 0),
+            type_id: be_u16(payload, 2),
+            data: &payload[6..],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -4527,8 +4616,68 @@ mod tests {
         PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, Positioning, QosField,
         ResponseDecodeError, ResultResponse, ResultResponseKind, RrcCapabilityGetRequest,
         RrcCapabilityGetResponse, RrcCapabilitySetRequest, RrcCapabilitySetResponse,
+        SetProtocolInfoRequest, SetProtocolInfoResponse,
     };
     use gct_hci::{Header, Packet, Tlv};
+
+    #[test]
+    fn set_protocol_info_shipped_shapes_match_live_p4_wire() {
+        let mut type1 = [0_u8; 12];
+        let n = SetProtocolInfoRequest {
+            type_id: 1,
+            data: &[0x11, 0x22, 0x33, 0x44],
+        }
+        .encode(&mut type1);
+        assert_eq!(n, Ok(12));
+        assert_eq!(
+            type1,
+            [0x31, 0x51, 0, 8, 0, 1, 0, 4, 0x11, 0x22, 0x33, 0x44]
+        );
+
+        let mut type8 = [0_u8; 9];
+        let n = SetProtocolInfoRequest {
+            type_id: 8,
+            data: &[0x7f],
+        }
+        .encode(&mut type8);
+        assert_eq!(n, Ok(9));
+        assert_eq!(type8, [0x31, 0x51, 0, 5, 0, 8, 0, 1, 0x7f]);
+    }
+
+    #[test]
+    fn set_protocol_info_response_checks_declared_extent() {
+        let bytes = [0, 0, 0, 8, 0, 1, 0x42];
+        let packet = Packet {
+            header: Header {
+                command: 0xb152,
+                payload_len: 7,
+            },
+            payload: &bytes,
+        };
+        assert_eq!(
+            SetProtocolInfoResponse::parse(packet),
+            Ok(SetProtocolInfoResponse {
+                result: 0,
+                type_id: 8,
+                data: &[0x42]
+            })
+        );
+
+        let short = Packet {
+            header: Header {
+                command: 0xb152,
+                payload_len: 6,
+            },
+            payload: &[0, 0, 0, 8, 0, 1],
+        };
+        assert_eq!(
+            SetProtocolInfoResponse::parse(short),
+            Err(ResponseDecodeError::UnexpectedLength {
+                expected: 7,
+                actual: 6
+            })
+        );
+    }
 
     #[test]
     fn empty_requests_match_oem_four_byte_frames() {

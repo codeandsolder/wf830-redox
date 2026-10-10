@@ -22,10 +22,10 @@ use gct_lapi::{
     PlmnListResponse, PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchResponse,
     PlmnSearchStopRequest, PlmnSearchStopResponse, Positioning, PsmControlRequest, QosField,
     ResultResponse, ResultResponseKind, RrcCapabilityGetRequest, RrcCapabilityGetResponse,
-    RrcCapabilitySetRequest, RrcCapabilitySetResponse, TemperatureReadRequest,
-    TemperatureReadResponse, UeModeChangeRequest, UeModeChangeResponse, UiccFixedRequest,
-    UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest, UiccResponse,
-    UiccStatusRequest, uicc_control,
+    RrcCapabilitySetRequest, RrcCapabilitySetResponse, SetProtocolInfoRequest,
+    SetProtocolInfoResponse, TemperatureReadRequest, TemperatureReadResponse, UeModeChangeRequest,
+    UeModeChangeResponse, UiccFixedRequest, UiccPinStatusRequest, UiccReadBinaryRequest,
+    UiccReadRecordRequest, UiccResponse, UiccStatusRequest, uicc_control,
 };
 use gct_runtime::{
     Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey, SendCommandError,
@@ -60,6 +60,7 @@ pub enum HandleError {
     LegacyPdnDisconnect(LegacyPdnDisconnectDecodeError),
     LegacyUicc(LegacyUiccDecodeError),
     LegacyRrcCapability(LegacyRrcCapabilityDecodeError),
+    LegacySetProtocolInfo(LegacySetProtocolInfoDecodeError),
     RrcCapabilityCallback(RrcCapabilityCallbackError),
     UiccCallback(UiccCallbackError),
     AttachCallback(AttachCallbackError),
@@ -113,6 +114,9 @@ impl std::fmt::Display for HandleError {
             Self::LegacyRrcCapability(error) => {
                 write!(f, "invalid stock RRC-capability request: {error:?}")
             }
+            Self::LegacySetProtocolInfo(error) => {
+                write!(f, "invalid stock set-protocol-info request: {error:?}")
+            }
             Self::RrcCapabilityCallback(error) => {
                 write!(f, "invalid RRC-capability callback payload: {error:?}")
             }
@@ -156,6 +160,7 @@ impl std::error::Error for HandleError {
             | Self::LegacyPdnDisconnect(_)
             | Self::LegacyUicc(_)
             | Self::LegacyRrcCapability(_)
+            | Self::LegacySetProtocolInfo(_)
             | Self::RrcCapabilityCallback(_)
             | Self::UiccCallback(_)
             | Self::AttachCallback(_)
@@ -210,6 +215,51 @@ const fn is_shipped_rrc_capability_type(type_id: u16) -> bool {
 /// the live SDK response converter; failures still reach callback slot 115.
 const fn rrc_capability_set_success_has_callback(type_id: u16) -> bool {
     matches!(type_id, 1 | 2 | 3 | 4 | 18)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacySetProtocolInfoDecodeError {
+    Truncated { minimum: usize, actual: usize },
+    UnexpectedLength { expected: usize, actual: usize },
+    UnsupportedType(u16),
+}
+
+/// Decode the shipped, side-effect-free subset of live SDK command 177.
+///
+/// Live P4 has three shipped callers: type 1 (four data bytes), type 8 (one
+/// byte), and type 9. Type 9 is deliberately rejected here because stock
+/// `liblted.so` performs substantial filesystem/configuration side effects and
+/// rewrites it into modem type 2; reproducing only its final HCI write would be
+/// false compatibility.
+///
+/// # Errors
+/// Rejects a short selector, a wrong type-specific object length, or a type not
+/// in the proven side-effect-free shipped subset.
+pub fn decode_legacy_set_protocol_info(
+    params: &[u8],
+) -> Result<SetProtocolInfoRequest<'_>, LegacySetProtocolInfoDecodeError> {
+    if params.len() < 2 {
+        return Err(LegacySetProtocolInfoDecodeError::Truncated {
+            minimum: 2,
+            actual: params.len(),
+        });
+    }
+    let type_id = u16::from_be_bytes([params[0], params[1]]);
+    let expected = match type_id {
+        1 => 6,
+        8 => 3,
+        _ => return Err(LegacySetProtocolInfoDecodeError::UnsupportedType(type_id)),
+    };
+    if params.len() != expected {
+        return Err(LegacySetProtocolInfoDecodeError::UnexpectedLength {
+            expected,
+            actual: params.len(),
+        });
+    }
+    Ok(SetProtocolInfoRequest {
+        type_id,
+        data: &params[2..],
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1832,6 +1882,30 @@ pub fn broadcast_rrc_capability_get_callback(
     )
 }
 
+/// Broadcast live-P4 callback 178 through `cb_rsp[90]` (`0x2d4`).
+///
+/// Live daemon DWARF fixes `_SET_PROTOCOL_INFO_RSP` at five bytes:
+/// `result:u16 | ps_info_type:u16 | value:u8`. The SDK response buffer is
+/// zero-initialized, so a failure or zero-length success exposes value zero;
+/// otherwise only the first converted data byte crosses this legacy boundary.
+///
+/// # Errors
+/// Returns [`HandleError::Ipc`] for callback encoding/shared-context/socket
+/// failures.
+pub fn broadcast_set_protocol_info_callback(
+    server: &mut Server,
+    device_id: u32,
+    response: SetProtocolInfoResponse<'_>,
+) -> Result<BroadcastReport, HandleError> {
+    let mut data = [0_u8; 5];
+    data[0..2].copy_from_slice(&response.result.to_be_bytes());
+    data[2..4].copy_from_slice(&response.type_id.to_be_bytes());
+    if response.result == 0 {
+        data[4] = response.data.first().copied().unwrap_or(0);
+    }
+    broadcast_variable_callback(server, device_id, SdkCallbackKind::SetProtocolInfo, &data)
+}
+
 /// Broadcast callback 126 (`AT_COMMAND_FROM_DEVICE`) as raw command bytes.
 ///
 /// The live stock client reconstructs its historical `{cmd pointer, length}`
@@ -2609,6 +2683,7 @@ impl DeviceBridge {
                 Ok(SdkCommand::AtCommandExt) => Self::dispatch_at_ext(modem, request),
                 Ok(SdkCommand::UiccRequest) => self.dispatch_uicc(modem, request),
                 Ok(SdkCommand::UeModeChange) => self.dispatch_ue_mode_change(modem, request),
+                Ok(SdkCommand::SetProtocolInfo) => self.dispatch_set_protocol_info(modem, request),
                 Ok(SdkCommand::EmmTimerControl) => Self::dispatch_emm_timer_control(modem, request),
                 Ok(SdkCommand::PsmControl) => Self::dispatch_psm_control(modem, request),
                 Ok(SdkCommand::LcsControl) => Self::dispatch_lcs_control(modem, request),
@@ -2685,6 +2760,20 @@ impl DeviceBridge {
             return Ok(None);
         }
         let report = broadcast_rrc_capability_get_callback(server, self.device_id, response)?;
+        self.pending.remove(key);
+        Ok(Some(report))
+    }
+
+    fn handle_set_protocol_info_event(
+        &mut self,
+        server: &mut Server,
+        response: SetProtocolInfoResponse<'_>,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        let key = ResponseKey::SetProtocolInfo(response.type_id);
+        if !self.pending.contains(key) {
+            return Ok(None);
+        }
+        let report = broadcast_set_protocol_info_callback(server, self.device_id, response)?;
         self.pending.remove(key);
         Ok(Some(report))
     }
@@ -2854,6 +2943,9 @@ impl DeviceBridge {
             ModemEvent::RrcCapabilityGet(response) => {
                 self.handle_rrc_capability_get_event(server, *response)
             }
+            ModemEvent::SetProtocolInfo(response) => {
+                self.handle_set_protocol_info_event(server, *response)
+            }
             ModemEvent::Uicc(response) => self.handle_uicc_event(server, *response),
             ModemEvent::UeModeChange(response) => {
                 self.handle_ue_mode_change_event(server, *response)
@@ -2907,6 +2999,24 @@ impl DeviceBridge {
             }
         }
         Err(HandleError::TransactionIdsExhausted)
+    }
+
+    fn dispatch_set_protocol_info<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let modem_request = decode_legacy_set_protocol_info(request.params)
+            .map_err(HandleError::LegacySetProtocolInfo)?;
+        let bytes_written = modem.send_tracked_command(
+            &mut self.pending,
+            ModemCommand::SetProtocolInfo(modem_request),
+        )?;
+        Ok(HandledCall {
+            command: SdkCommand::SetProtocolInfo,
+            device_id: request.device_id,
+            bytes_written,
+        })
     }
 
     fn dispatch_rrc_capability_set<T: Write>(
@@ -3540,11 +3650,12 @@ mod tests {
         LegacyAttachExtDecodeError, LegacyAttachExtStringField, LegacyAttachStringField,
         LegacyPdnConnectDecodeError, LegacyPdnConnectExtDecodeError,
         LegacyPdnConnectExtStringField, LegacyPdnConnectStringField,
-        LegacyPdnDisconnectDecodeError, LegacyRrcCapabilityDecodeError, LegacyUiccDecodeError,
-        PS_INIT_COMPLETE_OFFSET, StartupPhase, UiccCallbackError, broadcast_result_callback,
-        decode_legacy_attach, decode_legacy_attach_ext, decode_legacy_pdn_connect_ext,
-        decode_legacy_pdn_disconnect, decode_legacy_rrc_capability_get,
-        decode_legacy_rrc_capability_set,
+        LegacyPdnDisconnectDecodeError, LegacyRrcCapabilityDecodeError,
+        LegacySetProtocolInfoDecodeError, LegacyUiccDecodeError, PS_INIT_COMPLETE_OFFSET,
+        StartupPhase, UiccCallbackError, broadcast_result_callback, decode_legacy_attach,
+        decode_legacy_attach_ext, decode_legacy_pdn_connect_ext, decode_legacy_pdn_disconnect,
+        decode_legacy_rrc_capability_get, decode_legacy_rrc_capability_set,
+        decode_legacy_set_protocol_info,
     };
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -7107,6 +7218,136 @@ mod tests {
                 maximum: 100,
                 actual: 101,
             })
+        );
+    }
+
+    #[test]
+    fn stock_set_protocol_info_type8_round_trips_exact_live_p4_contract() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (subscribed, id) = open_client(&mut server, &dir, 0);
+        let (_unsubscribed, _) = open_client(&mut server, &dir, 1);
+        server
+            .client_context(id)
+            .unwrap_or_else(|_| std::process::abort())
+            .write_u32_be(SdkCallbackKind::SetProtocolInfo.registration_offset(), 1)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::SetProtocolInfo as u16,
+                    device_id: 0x1122_3344,
+                    params: &[0, 8, 0x55],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.bytes_written, 9);
+        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![0x31, 0x51, 0, 5, 0, 8, 0, 1, 0x55]
+        );
+
+        assert_eq!(
+            route_one_hci(
+                &mut bridge,
+                &mut server,
+                vec![0xb1, 0x52, 0, 7, 0, 0, 0, 8, 0, 1, 0x55],
+            ),
+            Some(BroadcastReport {
+                registered_clients: 1,
+                sent_clients: 1,
+            })
+        );
+        assert_eq!(bridge.pending_count(), 0);
+
+        let mut frame = [0_u8; 32];
+        let len = subscribed
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        let callback = SdkCallback::parse(
+            Packet::parse(&frame[..len]).unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(callback.callback_id, 178);
+        assert_eq!(callback.device_id, 0x1122_3344);
+        assert_eq!(callback.data, &[0, 0, 0, 8, 0x55]);
+    }
+
+    #[test]
+    fn stock_set_protocol_info_type1_uses_exact_four_byte_data_shape() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        let call = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::SetProtocolInfo as u16,
+                    device_id: 1,
+                    params: &[0, 1, 0x11, 0x22, 0x33, 0x44],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(call.bytes_written, 12);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![0x31, 0x51, 0, 8, 0, 1, 0, 4, 0x11, 0x22, 0x33, 0x44]
+        );
+    }
+
+    #[test]
+    fn set_protocol_info_rejects_type9_and_bad_lengths_before_glif() {
+        assert_eq!(
+            decode_legacy_set_protocol_info(&[0, 9, 0]),
+            Err(LegacySetProtocolInfoDecodeError::UnsupportedType(9))
+        );
+        assert_eq!(
+            decode_legacy_set_protocol_info(&[0, 8]),
+            Err(LegacySetProtocolInfoDecodeError::UnexpectedLength {
+                expected: 3,
+                actual: 2,
+            })
+        );
+
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::SetProtocolInfo as u16,
+                    device_id: 1,
+                    params: &[0, 9, 0],
+                },
+            ),
+            Err(HandleError::LegacySetProtocolInfo(
+                LegacySetProtocolInfoDecodeError::UnsupportedType(9)
+            ))
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
         );
     }
 

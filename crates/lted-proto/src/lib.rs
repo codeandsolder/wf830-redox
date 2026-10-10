@@ -46,6 +46,7 @@ pub enum SdkCallbackKind {
     EmmReattachControlReport,
     RrcCapabilityControl,
     RrcCapabilityControlGet,
+    SetProtocolInfo,
 }
 
 impl SdkCallbackKind {
@@ -77,6 +78,7 @@ impl SdkCallbackKind {
             Self::EmmReattachControlReport => 309,
             Self::RrcCapabilityControl => 221,
             Self::RrcCapabilityControlGet => 223,
+            Self::SetProtocolInfo => 178,
         }
     }
 
@@ -108,6 +110,7 @@ impl SdkCallbackKind {
             Self::EmmReattachControlReport => 160,
             Self::RrcCapabilityControl => 115,
             Self::RrcCapabilityControlGet => 116,
+            Self::SetProtocolInfo => 90,
         }
     }
 
@@ -179,6 +182,7 @@ pub enum SdkCommand {
     AtCommandExt = 127,
     UiccRequest = 147,
     UeModeChange = 161,
+    SetProtocolInfo = 177,
     EmmTimerControl = 207,
     PsmControl = 208,
     LcsControl = 209,
@@ -216,6 +220,7 @@ impl TryFrom<u16> for SdkCommand {
             127 => Ok(Self::AtCommandExt),
             147 => Ok(Self::UiccRequest),
             161 => Ok(Self::UeModeChange),
+            177 => Ok(Self::SetProtocolInfo),
             207 => Ok(Self::EmmTimerControl),
             208 => Ok(Self::PsmControl),
             209 => Ok(Self::LcsControl),
@@ -634,6 +639,7 @@ mod tests {
         assert_eq!(SdkCommand::try_from(125), Ok(SdkCommand::AtCommand));
         assert_eq!(SdkCommand::try_from(147), Ok(SdkCommand::UiccRequest));
         assert_eq!(SdkCommand::try_from(161), Ok(SdkCommand::UeModeChange));
+        assert_eq!(SdkCommand::try_from(177), Ok(SdkCommand::SetProtocolInfo));
         assert_eq!(SdkCommand::try_from(207), Ok(SdkCommand::EmmTimerControl));
         assert_eq!(SdkCommand::try_from(208), Ok(SdkCommand::PsmControl));
         assert_eq!(SdkCommand::try_from(209), Ok(SdkCommand::LcsControl));
@@ -839,6 +845,12 @@ mod tests {
         assert_eq!(SdkCallbackKind::UiccFromDevice.registration_offset(), 0x23c);
         assert_eq!(SdkCallbackKind::UeModeChange.callback_id(), 162);
         assert_eq!(SdkCallbackKind::UeModeChange.registration_offset(), 0x294);
+        assert_eq!(SdkCallbackKind::SetProtocolInfo.callback_id(), 178);
+        assert_eq!(SdkCallbackKind::SetProtocolInfo.registration_index(), 90);
+        assert_eq!(
+            SdkCallbackKind::SetProtocolInfo.registration_offset(),
+            0x2d4
+        );
         assert_eq!(SdkCallbackKind::EmmNiReattachControl.callback_id(), 308);
         assert_eq!(
             SdkCallbackKind::EmmNiReattachControl.registration_offset(),
