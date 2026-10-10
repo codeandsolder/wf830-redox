@@ -8,8 +8,11 @@
 
 use std::{io, io::Write};
 
+mod delivery;
 mod state;
 
+pub use delivery::BroadcastReport;
+use delivery::broadcast_registered;
 use state::{ApnState, NicState, SpecialTidRecord};
 pub use state::{ApnStateError, ConnectionStateError};
 
@@ -1205,7 +1208,7 @@ fn materialize_attach_callback(
 /// # Errors
 /// Returns [`HandleError::AttachCallback`] for malformed proven response
 /// fields or [`HandleError::Ipc`] for callback/shared-context/socket failures.
-pub fn broadcast_attach_callback(
+fn broadcast_attach_callback(
     server: &mut Server,
     device_id: u32,
     response: AttachResponse<'_>,
@@ -1227,20 +1230,7 @@ pub fn broadcast_attach_callback(
         ))
     })?;
 
-    let mut report = BroadcastReport::default();
-    for client_id in server.client_ids() {
-        let registered = server
-            .client_context(client_id)?
-            .read_u32_be(callback_kind.registration_offset())?
-            != 0;
-        if !registered {
-            continue;
-        }
-        report.registered_clients += 1;
-        server.send_to_client(client_id, &frame[..frame_len])?;
-        report.sent_clients += 1;
-    }
-    Ok(report)
+    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
 }
 
 const STOCK_ATTACH_EXT_CALLBACK_DATA_LEN: usize = 700;
@@ -1294,7 +1284,7 @@ fn materialize_attach_ext_callback(
 /// # Errors
 /// Returns [`HandleError::AttachExtCallback`] for malformed proven nested PDN
 /// fields or [`HandleError::Ipc`] for callback/shared-context/socket failures.
-pub fn broadcast_attach_ext_callback(
+fn broadcast_attach_ext_callback(
     server: &mut Server,
     device_id: u32,
     response: AttachExtResponse<'_>,
@@ -1316,20 +1306,7 @@ pub fn broadcast_attach_ext_callback(
         ))
     })?;
 
-    let mut report = BroadcastReport::default();
-    for client_id in server.client_ids() {
-        let registered = server
-            .client_context(client_id)?
-            .read_u32_be(callback_kind.registration_offset())?
-            != 0;
-        if !registered {
-            continue;
-        }
-        report.registered_clients += 1;
-        server.send_to_client(client_id, &frame[..frame_len])?;
-        report.sent_clients += 1;
-    }
-    Ok(report)
+    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
 }
 
 const STOCK_DETACH_CALLBACK_DATA_LEN: usize = 8;
@@ -1343,7 +1320,7 @@ const STOCK_DETACH_CALLBACK_FRAME_LEN: usize = 12 + STOCK_DETACH_CALLBACK_DATA_L
 ///
 /// # Errors
 /// Returns [`HandleError::Ipc`] for callback/shared-context/socket failures.
-pub fn broadcast_detach_callback(
+fn broadcast_detach_callback(
     server: &mut Server,
     device_id: u32,
     response: DetachResponse,
@@ -1368,20 +1345,7 @@ pub fn broadcast_detach_callback(
         ))
     })?;
 
-    let mut report = BroadcastReport::default();
-    for client_id in server.client_ids() {
-        let registered = server
-            .client_context(client_id)?
-            .read_u32_be(callback_kind.registration_offset())?
-            != 0;
-        if !registered {
-            continue;
-        }
-        report.registered_clients += 1;
-        server.send_to_client(client_id, &frame[..frame_len])?;
-        report.sent_clients += 1;
-    }
-    Ok(report)
+    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
 }
 
 const STOCK_DETACH_REQUIRED_CALLBACK_DATA_LEN: usize = 4;
@@ -1398,7 +1362,7 @@ const STOCK_DETACH_REQUIRED_CALLBACK_FRAME_LEN: usize =
 ///
 /// # Errors
 /// Returns [`HandleError::Ipc`] for callback/shared-context/socket failures.
-pub fn broadcast_detach_required_callback(
+fn broadcast_detach_required_callback(
     server: &mut Server,
     device_id: u32,
     indication: DetachRequiredIndication,
@@ -1419,20 +1383,7 @@ pub fn broadcast_detach_required_callback(
         ))
     })?;
 
-    let mut report = BroadcastReport::default();
-    for client_id in server.client_ids() {
-        let registered = server
-            .client_context(client_id)?
-            .read_u32_be(callback_kind.registration_offset())?
-            != 0;
-        if !registered {
-            continue;
-        }
-        report.registered_clients += 1;
-        server.send_to_client(client_id, &frame[..frame_len])?;
-        report.sent_clients += 1;
-    }
-    Ok(report)
+    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
 }
 
 const STOCK_PDN_CONNECT_CALLBACK_DATA_LEN: usize = 0x2e6;
@@ -1521,7 +1472,7 @@ fn materialize_pdn_connect_callback(
 /// # Errors
 /// Returns [`HandleError::PdnConnectCallback`] for malformed proven response
 /// fields or [`HandleError::Ipc`] for callback/shared-context/socket failures.
-pub fn broadcast_pdn_connect_callback(
+fn broadcast_pdn_connect_callback(
     server: &mut Server,
     device_id: u32,
     response: PdnConnectResponse<'_>,
@@ -1544,20 +1495,7 @@ pub fn broadcast_pdn_connect_callback(
         ))
     })?;
 
-    let mut report = BroadcastReport::default();
-    for client_id in server.client_ids() {
-        let registered = server
-            .client_context(client_id)?
-            .read_u32_be(callback_kind.registration_offset())?
-            != 0;
-        if !registered {
-            continue;
-        }
-        report.registered_clients += 1;
-        server.send_to_client(client_id, &frame[..frame_len])?;
-        report.sent_clients += 1;
-    }
-    Ok(report)
+    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
 }
 
 const STOCK_PDN_CONNECT_EXT_CALLBACK_DATA_LEN: usize = 0x2b9;
@@ -1615,7 +1553,7 @@ fn materialize_pdn_connect_ext_callback(
 /// Returns [`HandleError::PdnConnectExtCallback`] for malformed proven nested
 /// PDN fields or [`HandleError::Ipc`] for callback/shared-context/socket
 /// failures.
-pub fn broadcast_pdn_connect_ext_callback(
+fn broadcast_pdn_connect_ext_callback(
     server: &mut Server,
     device_id: u32,
     response: PdnConnectExtResponse<'_>,
@@ -1638,20 +1576,7 @@ pub fn broadcast_pdn_connect_ext_callback(
         ))
     })?;
 
-    let mut report = BroadcastReport::default();
-    for client_id in server.client_ids() {
-        let registered = server
-            .client_context(client_id)?
-            .read_u32_be(callback_kind.registration_offset())?
-            != 0;
-        if !registered {
-            continue;
-        }
-        report.registered_clients += 1;
-        server.send_to_client(client_id, &frame[..frame_len])?;
-        report.sent_clients += 1;
-    }
-    Ok(report)
+    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
 }
 
 const STOCK_PDN_DISCONNECT_CALLBACK_DATA_LEN: usize = 0xb0;
@@ -1708,7 +1633,7 @@ fn materialize_pdn_disconnect_callback(
 /// # Errors
 /// Returns [`HandleError::PdnDisconnectCallback`] for malformed proven response
 /// fields or [`HandleError::Ipc`] for callback/shared-context/socket failures.
-pub fn broadcast_pdn_disconnect_callback(
+fn broadcast_pdn_disconnect_callback(
     server: &mut Server,
     device_id: u32,
     response: PdnDisconnectResponse<'_>,
@@ -1731,20 +1656,7 @@ pub fn broadcast_pdn_disconnect_callback(
         ))
     })?;
 
-    let mut report = BroadcastReport::default();
-    for client_id in server.client_ids() {
-        let registered = server
-            .client_context(client_id)?
-            .read_u32_be(callback_kind.registration_offset())?
-            != 0;
-        if !registered {
-            continue;
-        }
-        report.registered_clients += 1;
-        server.send_to_client(client_id, &frame[..frame_len])?;
-        report.sent_clients += 1;
-    }
-    Ok(report)
+    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
 }
 
 const MAX_PLMN_RECORDS: usize = 32;
@@ -1785,12 +1697,6 @@ struct DeferredSdkCall {
     key: ResponseKey,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct BroadcastReport {
-    pub registered_clients: usize,
-    pub sent_clients: usize,
-}
-
 fn broadcast_variable_callback(
     server: &mut Server,
     device_id: u32,
@@ -1817,20 +1723,7 @@ fn broadcast_variable_callback(
         ))
     })?;
 
-    let mut report = BroadcastReport::default();
-    for client_id in server.client_ids() {
-        let registered = server
-            .client_context(client_id)?
-            .read_u32_be(callback_kind.registration_offset())?
-            != 0;
-        if !registered {
-            continue;
-        }
-        report.registered_clients += 1;
-        server.send_to_client(client_id, &frame[..frame_len])?;
-        report.sent_clients += 1;
-    }
-    Ok(report)
+    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1877,7 +1770,7 @@ fn validate_rrc_capability_get_callback(
 /// Returns [`HandleError::RrcCapabilityCallback`] if the data length cannot be
 /// represented by the stock u16 field, or [`HandleError::Ipc`] for callback
 /// encoding/shared-context/socket failures.
-pub fn broadcast_rrc_capability_set_callback(
+fn broadcast_rrc_capability_set_callback(
     server: &mut Server,
     device_id: u32,
     response: RrcCapabilitySetResponse<'_>,
@@ -1910,7 +1803,7 @@ pub fn broadcast_rrc_capability_set_callback(
 /// Returns [`HandleError::RrcCapabilityCallback`] for an unsafe type-4 list or
 /// unrepresentable data length, or [`HandleError::Ipc`] for callback
 /// encoding/shared-context/socket failures.
-pub fn broadcast_rrc_capability_get_callback(
+fn broadcast_rrc_capability_get_callback(
     server: &mut Server,
     device_id: u32,
     response: RrcCapabilityGetResponse<'_>,
@@ -1944,7 +1837,7 @@ pub fn broadcast_rrc_capability_get_callback(
 /// # Errors
 /// Returns [`HandleError::Ipc`] for callback encoding/shared-context/socket
 /// failures.
-pub fn broadcast_set_protocol_info_callback(
+fn broadcast_set_protocol_info_callback(
     server: &mut Server,
     device_id: u32,
     response: SetProtocolInfoResponse<'_>,
@@ -1967,7 +1860,7 @@ pub fn broadcast_set_protocol_info_callback(
 /// # Errors
 /// Returns [`HandleError::Ipc`] for an unrepresentable callback length or an
 /// IPC/socket failure.
-pub fn broadcast_at_callback(
+fn broadcast_at_callback(
     server: &mut Server,
     device_id: u32,
     command: &[u8],
@@ -1989,7 +1882,7 @@ pub fn broadcast_at_callback(
 /// # Errors
 /// Returns [`HandleError::Ipc`] for an unrepresentable callback length or an
 /// IPC/socket failure.
-pub fn broadcast_at_ext_callback(
+fn broadcast_at_ext_callback(
     server: &mut Server,
     device_id: u32,
     channel: u8,
@@ -2018,7 +1911,7 @@ const STOCK_UICC_READ_RECORD_RSP_MAX_LEN: usize = 2038;
 /// # Errors
 /// Returns [`HandleError::Ipc`] for an unrepresentable local callback or IPC
 /// failure.
-pub fn broadcast_mobile_id_callback(
+fn broadcast_mobile_id_callback(
     server: &mut Server,
     device_id: u32,
     response: MobileIdReadResponse<'_>,
@@ -2045,7 +1938,7 @@ pub fn broadcast_mobile_id_callback(
 ///
 /// # Errors
 /// Returns [`HandleError::Ipc`] for local IPC failures.
-pub fn broadcast_temperature_callback(
+fn broadcast_temperature_callback(
     server: &mut Server,
     device_id: u32,
     response: TemperatureReadResponse,
@@ -2067,7 +1960,7 @@ pub fn broadcast_temperature_callback(
 ///
 /// # Errors
 /// Returns [`HandleError::Ipc`] for a malformed typed response or IPC failure.
-pub fn broadcast_iccid_callback(
+fn broadcast_iccid_callback(
     server: &mut Server,
     device_id: u32,
     response: IccidReadResponse<'_>,
@@ -2093,7 +1986,7 @@ pub fn broadcast_iccid_callback(
 /// # Errors
 /// Returns [`HandleError::Ipc`] for an unrepresentable callback length or IPC
 /// failure.
-pub fn broadcast_msisdn_callback(
+fn broadcast_msisdn_callback(
     server: &mut Server,
     device_id: u32,
     response: MsisdnReadResponse<'_>,
@@ -2269,7 +2162,7 @@ fn validate_uicc_callback_response(response: UiccResponse<'_>) -> Result<usize, 
 /// # Errors
 /// Returns [`HandleError::UiccCallback`] for a malformed proven subtype or
 /// [`HandleError::Ipc`] for local callback transport failures.
-pub fn broadcast_uicc_callback(
+fn broadcast_uicc_callback(
     server: &mut Server,
     device_id: u32,
     response: UiccResponse<'_>,
@@ -2301,7 +2194,7 @@ pub fn broadcast_uicc_callback(
 ///
 /// # Errors
 /// Returns [`HandleError::Ipc`] for shared-context or UNIX-datagram failures.
-pub fn broadcast_result_callback(
+fn broadcast_result_callback(
     server: &mut Server,
     kind: ResultResponseKind,
     device_id: u32,
@@ -2327,20 +2220,7 @@ pub fn broadcast_result_callback(
         ))
     })?;
 
-    let mut report = BroadcastReport::default();
-    for client_id in server.client_ids() {
-        let registered = server
-            .client_context(client_id)?
-            .read_u32_be(callback_kind.registration_offset())?
-            != 0;
-        if !registered {
-            continue;
-        }
-        report.registered_clients += 1;
-        server.send_to_client(client_id, &frame[..frame_len])?;
-        report.sent_clients += 1;
-    }
-    Ok(report)
+    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
 }
 
 /// Broadcast live-P4 callback 308 (`EMM_NI_REATTACH_CTRL_RSP`) through
@@ -2348,7 +2228,7 @@ pub fn broadcast_result_callback(
 ///
 /// # Errors
 /// Returns [`HandleError::Ipc`] for local IPC failures.
-pub fn broadcast_emm_ni_reattach_callback(
+fn broadcast_emm_ni_reattach_callback(
     server: &mut Server,
     device_id: u32,
     result: u32,
@@ -2366,7 +2246,7 @@ pub fn broadcast_emm_ni_reattach_callback(
 ///
 /// # Errors
 /// Returns [`HandleError::Ipc`] for local IPC failures.
-pub fn broadcast_emm_reattach_report_callback(
+fn broadcast_emm_reattach_report_callback(
     server: &mut Server,
     device_id: u32,
     report: EmmReattachControlReport,
@@ -2386,7 +2266,7 @@ pub fn broadcast_emm_reattach_report_callback(
 ///
 /// # Errors
 /// Returns [`HandleError::Ipc`] for shared-context or UNIX-datagram failures.
-pub fn broadcast_ue_mode_change_callback(
+fn broadcast_ue_mode_change_callback(
     server: &mut Server,
     device_id: u32,
     response: UeModeChangeResponse,
@@ -2411,7 +2291,7 @@ const STOCK_PLMN_SEARCH_STOP_CALLBACK_FRAME_LEN: usize =
 ///
 /// # Errors
 /// Returns [`HandleError::Ipc`] for callback/shared-context/socket failures.
-pub fn broadcast_plmn_search_stop_callback(
+fn broadcast_plmn_search_stop_callback(
     server: &mut Server,
     device_id: u32,
     response: PlmnSearchStopResponse,
@@ -2433,20 +2313,7 @@ pub fn broadcast_plmn_search_stop_callback(
             "fixed-size PLMN-search-stop callback failed to encode",
         ))
     })?;
-    let mut report = BroadcastReport::default();
-    for client_id in server.client_ids() {
-        let registered = server
-            .client_context(client_id)?
-            .read_u32_be(callback_kind.registration_offset())?
-            != 0;
-        if !registered {
-            continue;
-        }
-        report.registered_clients += 1;
-        server.send_to_client(client_id, &frame[..frame_len])?;
-        report.sent_clients += 1;
-    }
-    Ok(report)
+    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
 }
 
 const STOCK_PLMN_SEARCH_CALLBACK_DATA_LEN: usize = 436;
@@ -2464,7 +2331,7 @@ const STOCK_PLMN_SEARCH_SIB1_OFFSET: usize = 387;
 /// # Errors
 /// Returns [`HandleError::PlmnSearch`] for malformed record streams or
 /// [`HandleError::Ipc`] for callback/shared-context/socket failures.
-pub fn broadcast_plmn_search_callback(
+fn broadcast_plmn_search_callback(
     server: &mut Server,
     device_id: u32,
     response: PlmnSearchResponse<'_>,
@@ -2518,20 +2385,7 @@ pub fn broadcast_plmn_search_callback(
         ))
     })?;
 
-    let mut report = BroadcastReport::default();
-    for client_id in server.client_ids() {
-        let registered = server
-            .client_context(client_id)?
-            .read_u32_be(callback_kind.registration_offset())?
-            != 0;
-        if !registered {
-            continue;
-        }
-        report.registered_clients += 1;
-        server.send_to_client(client_id, &frame[..frame_len])?;
-        report.sent_clients += 1;
-    }
-    Ok(report)
+    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
 }
 
 /// Materialize and broadcast stock callback 45 (`PLMN List`).
@@ -2543,7 +2397,7 @@ pub fn broadcast_plmn_search_callback(
 /// # Errors
 /// Returns [`HandleError::PlmnList`] for a malformed semantic record stream,
 /// or [`HandleError::Ipc`] for callback encoding/shared-context/socket errors.
-pub fn broadcast_plmn_list_callback(
+fn broadcast_plmn_list_callback(
     server: &mut Server,
     device_id: u32,
     response: PlmnListResponse<'_>,
@@ -2577,20 +2431,7 @@ pub fn broadcast_plmn_list_callback(
         ))
     })?;
 
-    let mut report = BroadcastReport::default();
-    for client_id in server.client_ids() {
-        let registered = server
-            .client_context(client_id)?
-            .read_u32_be(callback_kind.registration_offset())?
-            != 0;
-        if !registered {
-            continue;
-        }
-        report.registered_clients += 1;
-        server.send_to_client(client_id, &frame[..frame_len])?;
-        report.sent_clients += 1;
-    }
-    Ok(report)
+    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
