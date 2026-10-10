@@ -14,6 +14,14 @@ use gct_lapi::{
 };
 
 pub const LEGACY_ATTACH_PARAMS_LEN: usize = 0x160;
+use gct_lapi::{
+    AttachExtResponse, AttachResponse, AttachTailDecodeError, AttachTailField,
+    EmergencyNumberDecodeError, PdnConnectExtResponse, PdnConnectResponse,
+    PdnConnectTailDecodeError, PdnConnectTailField, PdnDisconnectField,
+    PdnDisconnectFieldDecodeError, PdnDisconnectResponse, PdnInfoContainers, PdnInfoField,
+    PdnInfoFieldLengthError, QosField,
+};
+
 pub const LEGACY_ATTACH_EXT_PARAMS_LEN: usize = 0x1e4;
 pub const LEGACY_PDN_CONNECT_PARAMS_LEN: usize = 0x1a4;
 pub const LEGACY_PDN_CONNECT_EXT_PARAMS_LEN: usize = 0x0f4;
@@ -804,4 +812,397 @@ pub fn decode_legacy_pdn_disconnect(
         transaction_id,
         apn_ni: &params[0x004..],
     })
+}
+
+// Stock callback data-image materialization.
+pub(crate) const STOCK_ATTACH_CALLBACK_DATA_LEN: usize = 0x88b;
+pub(crate) const STOCK_ATTACH_CALLBACK_FRAME_LEN: usize = 12 + STOCK_ATTACH_CALLBACK_DATA_LEN;
+const ATTACH_PDN_OFFSET: usize = 0x04b;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachCallbackError {
+    PdnContainerTlv,
+    PdnInnerTlv,
+    PdnField(PdnInfoFieldLengthError),
+    Tail(AttachTailDecodeError),
+    Emergency(EmergencyNumberDecodeError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PdnInfoMaterializeError {
+    ContainerTlv,
+    InnerTlv,
+    Field(PdnInfoFieldLengthError),
+}
+
+fn materialize_pdn_info_field(data: &mut [u8], base: usize, field: PdnInfoField<'_>) -> bool {
+    match field {
+        PdnInfoField::AccessPointName(value) => {
+            data[base..base + value.len()].copy_from_slice(value);
+        }
+        PdnInfoField::PdnType(value) => data[base + 0x080] = value,
+        PdnInfoField::PdnTypeCause(value) => {
+            data[base + 0x081..base + 0x085].copy_from_slice(&value.to_be_bytes());
+        }
+        PdnInfoField::Ipv4Address(value) => {
+            data[base + 0x085..base + 0x089].copy_from_slice(&value);
+        }
+        PdnInfoField::Ipv4DnsPrimary(value) => {
+            data[base + 0x089..base + 0x08d].copy_from_slice(&value);
+        }
+        PdnInfoField::Ipv4DnsSecondary(value) => {
+            data[base + 0x08d..base + 0x091].copy_from_slice(&value);
+        }
+        PdnInfoField::Ipv6DnsPrimary(value) => {
+            data[base + 0x091..base + 0x0a1].copy_from_slice(&value);
+        }
+        PdnInfoField::Ipv6DnsSecondary(value) => {
+            data[base + 0x0a1..base + 0x0b1].copy_from_slice(&value);
+        }
+        PdnInfoField::Ipv6InterfaceId(value) => {
+            data[base + 0x0b1..base + 0x0b9].copy_from_slice(&value);
+        }
+        PdnInfoField::PcscfIpv6 { index, address } => {
+            let offset = base + 0x0b9 + usize::from(index - 1) * 16;
+            data[offset..offset + 16].copy_from_slice(&address);
+        }
+        PdnInfoField::PcscfIpv4 { index, address } => {
+            let offset = base + 0x109 + usize::from(index - 1) * 4;
+            data[offset..offset + 4].copy_from_slice(&address);
+        }
+        PdnInfoField::Qos { field, value } => {
+            let word = match field {
+                QosField::Qci => 0,
+                QosField::MaxBitRateUl => 1,
+                QosField::MaxBitRateDl => 2,
+                QosField::GuaranteedBitRateUl => 3,
+                QosField::GuaranteedBitRateDl => 4,
+            };
+            let offset = base + 0x216 + word * 4;
+            data[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+        }
+        PdnInfoField::Unknown(_) => return false,
+    }
+    true
+}
+
+fn materialize_pdn_containers(
+    mut containers: PdnInfoContainers<'_>,
+    data: &mut [u8],
+    base: usize,
+) -> Result<(), PdnInfoMaterializeError> {
+    let mut stop_after_unknown = false;
+    while let Some(container) = containers
+        .next_container()
+        .map_err(|_| PdnInfoMaterializeError::ContainerTlv)?
+    {
+        if stop_after_unknown {
+            break;
+        }
+        let mut fields = container.fields();
+        while let Some(tlv) = fields
+            .next_tlv()
+            .map_err(|_| PdnInfoMaterializeError::InnerTlv)?
+        {
+            let field = PdnInfoField::parse(tlv).map_err(PdnInfoMaterializeError::Field)?;
+            if !materialize_pdn_info_field(data, base, field) {
+                stop_after_unknown = true;
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn materialize_attach_pdn(
+    response: AttachResponse<'_>,
+    data: &mut [u8; STOCK_ATTACH_CALLBACK_DATA_LEN],
+) -> Result<(), AttachCallbackError> {
+    materialize_pdn_containers(response.pdn_info_containers(), data, ATTACH_PDN_OFFSET).map_err(
+        |error| match error {
+            PdnInfoMaterializeError::ContainerTlv => AttachCallbackError::PdnContainerTlv,
+            PdnInfoMaterializeError::InnerTlv => AttachCallbackError::PdnInnerTlv,
+            PdnInfoMaterializeError::Field(error) => AttachCallbackError::PdnField(error),
+        },
+    )
+}
+
+pub(crate) fn materialize_attach_callback(
+    response: AttachResponse<'_>,
+    data: &mut [u8; STOCK_ATTACH_CALLBACK_DATA_LEN],
+) -> Result<(), AttachCallbackError> {
+    data.fill(0);
+    data[0x000..0x002].copy_from_slice(&response.register_result1.to_be_bytes());
+    data[0x002..0x004].copy_from_slice(&response.register_result2.to_be_bytes());
+    data[0x004..0x006].copy_from_slice(&response.default_eps_id.to_be_bytes());
+    data[0x006..0x008].copy_from_slice(&response.eps_id.to_be_bytes());
+    data[0x008] = response.data_path;
+    data[0x009] = response.ip_alloc;
+    data[0x00a] = u8::try_from(response.apn_ni.payload.len()).unwrap_or(0);
+    data[0x00b..0x00b + response.apn_ni.payload.len()].copy_from_slice(response.apn_ni.payload);
+    data[0x275] = response.network_features.ims_voice_over_ps;
+    data[0x276] = response.network_features.emc_bc;
+    data[0x277] = response.network_features.epc_lcs;
+    data[0x278] = response.network_features.sc_lcs;
+    data[0x279] = response.network_features.ext_sr;
+    data[0x27a] = response.transaction_id;
+
+    materialize_attach_pdn(response, data)?;
+
+    let mut tail = response.trailing_fields();
+    while let Some(field) = tail.next_field().map_err(AttachCallbackError::Tail)? {
+        match field {
+            AttachTailField::LowerLayerReason(value) => data[0x27b] = value,
+            AttachTailField::EpsAttachResult(value) => data[0x27c] = value,
+            AttachTailField::EsmCause(value) => data[0x27d] = value,
+            AttachTailField::Ipv4LinkMtu(value) => {
+                data[0x27e..0x280].copy_from_slice(&value.to_be_bytes());
+            }
+            AttachTailField::OperatorPco(value) => {
+                if !value.is_empty() {
+                    data[0x280] = 1;
+                    data[0x281] = u8::try_from(value.len()).unwrap_or(0);
+                    data[0x282..0x282 + value.len()].copy_from_slice(value);
+                }
+            }
+            AttachTailField::T3402(value) => {
+                data[0x2e6..0x2ea].copy_from_slice(&value.to_be_bytes());
+            }
+            AttachTailField::ApnAmbr { uplink, downlink } => {
+                data[0x2ea..0x2ee].copy_from_slice(&uplink.to_be_bytes());
+                data[0x2ee..0x2f2].copy_from_slice(&downlink.to_be_bytes());
+            }
+            AttachTailField::EmergencyNumbers(list) => {
+                let mut count = 0_u8;
+                let mut records = list.records();
+                while let Some(record) = records
+                    .next_record()
+                    .map_err(AttachCallbackError::Emergency)?
+                {
+                    let offset = 0x2f3 + usize::from(count) * 94;
+                    data[offset] = u8::try_from(record.number.len() + 1).unwrap_or(0);
+                    data[offset + 1] = record.category;
+                    data[offset + 2..offset + 2 + record.number.len()]
+                        .copy_from_slice(record.number);
+                    count += 1;
+                }
+                data[0x2f2] = count;
+            }
+            AttachTailField::Msisdn(value) => {
+                data[0x875] = u8::try_from(value.len()).unwrap_or(0);
+                data[0x876..0x876 + value.len()].copy_from_slice(value);
+            }
+            AttachTailField::Unknown(_) => {}
+        }
+    }
+    Ok(())
+}
+
+pub(crate) const STOCK_ATTACH_EXT_CALLBACK_DATA_LEN: usize = 700;
+pub(crate) const STOCK_ATTACH_EXT_CALLBACK_FRAME_LEN: usize =
+    12 + STOCK_ATTACH_EXT_CALLBACK_DATA_LEN;
+const ATTACH_EXT_PDN_OFFSET: usize = 0x08d;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachExtCallbackError {
+    PdnContainerTlv,
+    PdnInnerTlv,
+    PdnField(PdnInfoFieldLengthError),
+}
+
+pub(crate) fn materialize_attach_ext_callback(
+    response: AttachExtResponse<'_>,
+    data: &mut [u8; STOCK_ATTACH_EXT_CALLBACK_DATA_LEN],
+) -> Result<(), AttachExtCallbackError> {
+    data.fill(0);
+    data[0x000..0x002].copy_from_slice(&response.register_result1.to_be_bytes());
+    data[0x002..0x004].copy_from_slice(&response.register_result2.to_be_bytes());
+    data[0x004] = u8::try_from(response.requested_apn_ni.payload.len()).unwrap_or(0);
+    data[0x005..0x005 + response.requested_apn_ni.payload.len()]
+        .copy_from_slice(response.requested_apn_ni.payload);
+    data[0x045] = u8::try_from(response.received_apn_ni.payload.len()).unwrap_or(0);
+    data[0x046..0x046 + response.received_apn_ni.payload.len()]
+        .copy_from_slice(response.received_apn_ni.payload);
+    data[0x086..0x088].copy_from_slice(&response.default_eps_id.to_be_bytes());
+    data[0x088..0x08a].copy_from_slice(&response.eps_id.to_be_bytes());
+    data[0x08a] = response.data_path;
+    data[0x08b] = response.ip_alloc;
+    data[0x08c] = response.apn_class;
+    materialize_pdn_containers(response.pdn_info_containers(), data, ATTACH_EXT_PDN_OFFSET)
+        .map_err(|error| match error {
+            PdnInfoMaterializeError::ContainerTlv => AttachExtCallbackError::PdnContainerTlv,
+            PdnInfoMaterializeError::InnerTlv => AttachExtCallbackError::PdnInnerTlv,
+            PdnInfoMaterializeError::Field(error) => AttachExtCallbackError::PdnField(error),
+        })?;
+    data[0x2b7] = response.network_features.ims_voice_over_ps;
+    data[0x2b8] = response.network_features.emc_bc;
+    data[0x2b9] = response.network_features.epc_lcs;
+    data[0x2ba] = response.network_features.sc_lcs;
+    data[0x2bb] = response.network_features.ext_sr;
+    Ok(())
+}
+
+pub(crate) const STOCK_PDN_CONNECT_CALLBACK_DATA_LEN: usize = 0x2e6;
+pub(crate) const STOCK_PDN_CONNECT_CALLBACK_FRAME_LEN: usize =
+    12 + STOCK_PDN_CONNECT_CALLBACK_DATA_LEN;
+const PDN_CONNECT_PDN_OFFSET: usize = 0x04c;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdnConnectCallbackError {
+    PdnContainerTlv,
+    PdnInnerTlv,
+    PdnField(PdnInfoFieldLengthError),
+    Tail(PdnConnectTailDecodeError),
+}
+
+fn map_pdn_connect_materialize_error(error: PdnInfoMaterializeError) -> PdnConnectCallbackError {
+    match error {
+        PdnInfoMaterializeError::ContainerTlv => PdnConnectCallbackError::PdnContainerTlv,
+        PdnInfoMaterializeError::InnerTlv => PdnConnectCallbackError::PdnInnerTlv,
+        PdnInfoMaterializeError::Field(error) => PdnConnectCallbackError::PdnField(error),
+    }
+}
+
+pub(crate) fn materialize_pdn_connect_callback(
+    response: PdnConnectResponse<'_>,
+    data: &mut [u8; STOCK_PDN_CONNECT_CALLBACK_DATA_LEN],
+) -> Result<(), PdnConnectCallbackError> {
+    data.fill(0);
+    data[0x000..0x002].copy_from_slice(&response.result.to_be_bytes());
+    data[0x002..0x004].copy_from_slice(&response.reject_cause1.to_be_bytes());
+    data[0x004..0x006].copy_from_slice(&response.reject_cause2.to_be_bytes());
+    data[0x006..0x008].copy_from_slice(&response.default_eps_id.to_be_bytes());
+    data[0x008] = response.data_path;
+    data[0x009] = response.ip_alloc;
+    data[0x00a] = response.transaction_id;
+    data[0x00b] = u8::try_from(response.apn_ni.payload.len()).unwrap_or(0);
+    data[0x00c..0x00c + response.apn_ni.payload.len()].copy_from_slice(response.apn_ni.payload);
+
+    materialize_pdn_containers(response.pdn_info_containers(), data, PDN_CONNECT_PDN_OFFSET)
+        .map_err(map_pdn_connect_materialize_error)?;
+
+    let mut tail = response.trailing_fields();
+    while let Some(field) = tail.next_field().map_err(PdnConnectCallbackError::Tail)? {
+        match field {
+            PdnConnectTailField::Ipv4LinkMtu(value) => {
+                data[0x276..0x278].copy_from_slice(&value.to_be_bytes());
+            }
+            PdnConnectTailField::OperatorPco(value) => {
+                if !value.is_empty() {
+                    data[0x278] = 1;
+                    data[0x279] = u8::try_from(value.len()).unwrap_or(0);
+                    data[0x27a..0x27a + value.len()].copy_from_slice(value);
+                }
+            }
+            PdnConnectTailField::PdnInfo(_) => {
+                let Some(mut fields) = field.pdn_info_fields() else {
+                    continue;
+                };
+                while let Some(tlv) = fields
+                    .next_tlv()
+                    .map_err(|_| PdnConnectCallbackError::PdnInnerTlv)?
+                {
+                    let parsed =
+                        PdnInfoField::parse(tlv).map_err(PdnConnectCallbackError::PdnField)?;
+                    if !materialize_pdn_info_field(data, PDN_CONNECT_PDN_OFFSET, parsed) {
+                        break;
+                    }
+                }
+            }
+            PdnConnectTailField::ApnAmbr { uplink, downlink } => {
+                data[0x2de..0x2e2].copy_from_slice(&uplink.to_be_bytes());
+                data[0x2e2..0x2e6].copy_from_slice(&downlink.to_be_bytes());
+            }
+            PdnConnectTailField::Unknown(_) => {}
+        }
+    }
+    Ok(())
+}
+
+pub(crate) const STOCK_PDN_CONNECT_EXT_CALLBACK_DATA_LEN: usize = 0x2b9;
+pub(crate) const STOCK_PDN_CONNECT_EXT_CALLBACK_FRAME_LEN: usize =
+    12 + STOCK_PDN_CONNECT_EXT_CALLBACK_DATA_LEN;
+const PDN_CONNECT_EXT_PDN_OFFSET: usize = 0x08f;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdnConnectExtCallbackError {
+    PdnContainerTlv,
+    PdnInnerTlv,
+    PdnField(PdnInfoFieldLengthError),
+}
+
+pub(crate) fn materialize_pdn_connect_ext_callback(
+    response: PdnConnectExtResponse<'_>,
+    data: &mut [u8; STOCK_PDN_CONNECT_EXT_CALLBACK_DATA_LEN],
+) -> Result<(), PdnConnectExtCallbackError> {
+    data.fill(0);
+    data[0x000..0x002].copy_from_slice(&response.result.to_be_bytes());
+    data[0x002..0x004].copy_from_slice(&response.reject_cause1.to_be_bytes());
+    data[0x004..0x006].copy_from_slice(&response.reject_cause2.to_be_bytes());
+    data[0x006..0x008].copy_from_slice(&response.default_eps_id.to_be_bytes());
+    data[0x008] = response.data_path;
+    data[0x009] = response.ip_alloc;
+    data[0x00a..0x00c].copy_from_slice(&response.throttle_time.to_be_bytes());
+    data[0x00c] = response.apn_class;
+    data[0x00d] = u8::try_from(response.requested_apn_ni.payload.len()).unwrap_or(0);
+    data[0x00e..0x00e + response.requested_apn_ni.payload.len()]
+        .copy_from_slice(response.requested_apn_ni.payload);
+    data[0x04e] = u8::try_from(response.received_apn_ni.payload.len()).unwrap_or(0);
+    data[0x04f..0x04f + response.received_apn_ni.payload.len()]
+        .copy_from_slice(response.received_apn_ni.payload);
+
+    materialize_pdn_containers(
+        response.pdn_info_containers(),
+        data,
+        PDN_CONNECT_EXT_PDN_OFFSET,
+    )
+    .map_err(|error| match error {
+        PdnInfoMaterializeError::ContainerTlv => PdnConnectExtCallbackError::PdnContainerTlv,
+        PdnInfoMaterializeError::InnerTlv => PdnConnectExtCallbackError::PdnInnerTlv,
+        PdnInfoMaterializeError::Field(error) => PdnConnectExtCallbackError::PdnField(error),
+    })?;
+    Ok(())
+}
+
+pub(crate) const STOCK_PDN_DISCONNECT_CALLBACK_DATA_LEN: usize = 0xb0;
+pub(crate) const STOCK_PDN_DISCONNECT_CALLBACK_FRAME_LEN: usize =
+    12 + STOCK_PDN_DISCONNECT_CALLBACK_DATA_LEN;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdnDisconnectCallbackError {
+    Tail(PdnDisconnectFieldDecodeError),
+}
+
+pub(crate) fn materialize_pdn_disconnect_callback(
+    response: PdnDisconnectResponse<'_>,
+    data: &mut [u8; STOCK_PDN_DISCONNECT_CALLBACK_DATA_LEN],
+) -> Result<(), PdnDisconnectCallbackError> {
+    data.fill(0);
+    data[0x000..0x002].copy_from_slice(&response.result.to_be_bytes());
+    data[0x002..0x004].copy_from_slice(&response.reject_cause1.to_be_bytes());
+    data[0x004..0x006].copy_from_slice(&response.reject_cause2.to_be_bytes());
+    data[0x006..0x008].copy_from_slice(&response.default_eps_id.to_be_bytes());
+    data[0x008] = response.transaction_id;
+
+    let mut tail = response.trailing_fields();
+    while let Some(field) = tail
+        .next_field()
+        .map_err(PdnDisconnectCallbackError::Tail)?
+    {
+        match field {
+            PdnDisconnectField::ApnNetworkIdentifier(value) => {
+                data[0x009] = u8::try_from(value.len()).unwrap_or(0);
+                data[0x00a..0x00a + value.len()].copy_from_slice(value);
+            }
+            PdnDisconnectField::OperatorPco(value) => {
+                if !value.is_empty() {
+                    data[0x04a] = 1;
+                    data[0x04b] = u8::try_from(value.len()).unwrap_or(0);
+                    data[0x04c..0x04c + value.len()].copy_from_slice(value);
+                }
+            }
+            PdnDisconnectField::Unknown(_) => {}
+        }
+    }
+    Ok(())
 }
