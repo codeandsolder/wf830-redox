@@ -15,18 +15,18 @@ use gct_lapi::{
     EmergencyNumberDecodeError, EmmNiReattachControlRequest, EmmReattachControlReport,
     EmmTimerControlRequest, EmmTimerStartRequest, EmptyRequest, IccidReadRequest,
     IccidReadResponse, LcsControlRequest, LppControlRequest, MobileIdReadRequest,
-    MobileIdReadResponse, MsisdnReadRequest, MsisdnReadResponse, PcoInfo, PdnConnectExtRequest,
-    PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse, PdnConnectTailDecodeError,
-    PdnConnectTailField, PdnConnectionControl, PdnDisconnectField, PdnDisconnectFieldDecodeError,
-    PdnDisconnectRequest, PdnDisconnectResponse, PdnInfoContainers, PdnInfoField,
-    PdnInfoFieldLengthError, PlmnInfoDecodeError, PlmnListResponse, PlmnSearchExtRequest,
-    PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
-    Positioning, PsmControlRequest, QosField, ResultResponse, ResultResponseKind,
-    RrcCapabilityGetRequest, RrcCapabilityGetResponse, RrcCapabilitySetRequest,
-    RrcCapabilitySetResponse, SetProtocolInfoRequest, SetProtocolInfoResponse,
-    TemperatureReadRequest, TemperatureReadResponse, UeModeChangeRequest, UeModeChangeResponse,
-    UiccFixedRequest, UiccPinStatusRequest, UiccReadBinaryRequest, UiccReadRecordRequest,
-    UiccResponse, UiccStatusRequest, uicc_control,
+    MobileIdReadResponse, MsisdnReadRequest, MsisdnReadResponse, NasConfigGetRequest,
+    NasConfigSetRequest, PcoInfo, PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest,
+    PdnConnectResponse, PdnConnectTailDecodeError, PdnConnectTailField, PdnConnectionControl,
+    PdnDisconnectField, PdnDisconnectFieldDecodeError, PdnDisconnectRequest, PdnDisconnectResponse,
+    PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, PlmnInfoDecodeError,
+    PlmnListResponse, PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchResponse,
+    PlmnSearchStopRequest, PlmnSearchStopResponse, Positioning, PsmControlRequest, QosField,
+    ResultResponse, ResultResponseKind, RrcCapabilityGetRequest, RrcCapabilityGetResponse,
+    RrcCapabilitySetRequest, RrcCapabilitySetResponse, SetProtocolInfoRequest,
+    SetProtocolInfoResponse, TemperatureReadRequest, TemperatureReadResponse, UeModeChangeRequest,
+    UeModeChangeResponse, UiccFixedRequest, UiccPinStatusRequest, UiccReadBinaryRequest,
+    UiccReadRecordRequest, UiccResponse, UiccStatusRequest, uicc_control,
 };
 use gct_runtime::{
     EventDecodeError, Modem, ModemCommand, ModemEvent, PendingRequests, ResponseKey,
@@ -2843,6 +2843,8 @@ impl DeviceBridge {
                 Ok(SdkCommand::UiccRequest) => self.dispatch_uicc(modem, request),
                 Ok(SdkCommand::UeModeChange) => self.dispatch_ue_mode_change(modem, request),
                 Ok(SdkCommand::SetProtocolInfo) => self.dispatch_set_protocol_info(modem, request),
+                Ok(SdkCommand::SetNasConfig) => Self::dispatch_nas_config_set(modem, request),
+                Ok(SdkCommand::GetNasConfig) => Self::dispatch_nas_config_get(modem, request),
                 Ok(SdkCommand::EmmTimerControl) => Self::dispatch_emm_timer_control(modem, request),
                 Ok(SdkCommand::PsmControl) => Self::dispatch_psm_control(modem, request),
                 Ok(SdkCommand::LcsControl) => Self::dispatch_lcs_control(modem, request),
@@ -3324,6 +3326,48 @@ impl DeviceBridge {
         )?;
         Ok(HandledCall {
             command: SdkCommand::GetDeviceInformation,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_nas_config_set<T: Write>(
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        if request.params.len() != 33 {
+            return Err(HandleError::UnexpectedParameters {
+                command: request.command,
+                expected: 33,
+                actual: request.params.len(),
+            });
+        }
+        let modem_request = NasConfigSetRequest {
+            count: request.params[0],
+            pairs: &request.params[1..],
+        };
+        let bytes_written = modem.send_command(ModemCommand::NasConfigSet(modem_request))?;
+        Ok(HandledCall {
+            command: SdkCommand::SetNasConfig,
+            device_id: request.device_id,
+            bytes_written,
+        })
+    }
+
+    fn dispatch_nas_config_get<T: Write>(
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        if !request.params.is_empty() {
+            return Err(HandleError::UnexpectedParameters {
+                command: request.command,
+                expected: 0,
+                actual: request.params.len(),
+            });
+        }
+        let bytes_written = modem.send_command(ModemCommand::NasConfigGet(NasConfigGetRequest))?;
+        Ok(HandledCall {
+            command: SdkCommand::GetNasConfig,
             device_id: request.device_id,
             bytes_written,
         })
@@ -7855,6 +7899,151 @@ mod tests {
                 id,
                 SdkApiRequest {
                     command: SdkCommand::GetDeviceInformation as u16,
+                    device_id: 1,
+                    params: &[0],
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                expected: 0,
+                actual: 1,
+                ..
+            })
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(bridge.deferred_count(), 0);
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn stock_nas_config_set_get_match_live_request_wire_without_synthetic_completion() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(0x1122_3344);
+
+        let mut params = [0_u8; 33];
+        params[0] = 3;
+        params[1..7].copy_from_slice(&[0x80, 1, 0x85, 2, 0x8a, 3]);
+        let set = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::SetNasConfig as u16,
+                    device_id: 0x1122_3344,
+                    params: &params,
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(set.command, SdkCommand::SetNasConfig);
+        assert_eq!(set.bytes_written, 13);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(bridge.deferred_count(), 0);
+        assert_eq!(read_api_ret(&mut server, id), 0);
+
+        let get = bridge
+            .handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::GetNasConfig as u16,
+                    device_id: 0x1122_3344,
+                    params: &[],
+                },
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(get.command, SdkCommand::GetNasConfig);
+        assert_eq!(get.bytes_written, 4);
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(bridge.deferred_count(), 0);
+        assert_eq!(read_api_ret(&mut server, id), 0);
+
+        assert_eq!(
+            modem.into_transport().into_inner().into_inner(),
+            vec![
+                0x33, 0x70, 0, 9, 0x80, 1, 1, 0x85, 1, 2, 0x8a, 1, 3, 0x33, 0x72, 0, 0,
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_nas_config_is_rejected_before_glif() {
+        let dir = TestDir::new();
+        let mut server = bind_server(&dir);
+        let (_client, id) = open_client(&mut server, &dir, 0);
+        let transport = HciIo::new(Cursor::new(Vec::new()));
+        let mut modem = Modem::new(transport);
+        let mut bridge = DeviceBridge::new(1);
+
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::SetNasConfig as u16,
+                    device_id: 1,
+                    params: &[0; 32],
+                },
+            ),
+            Err(HandleError::UnexpectedParameters {
+                expected: 33,
+                actual: 32,
+                ..
+            })
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+
+        let mut too_many = [0_u8; 33];
+        too_many[0] = 17;
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::SetNasConfig as u16,
+                    device_id: 1,
+                    params: &too_many,
+                },
+            ),
+            Err(HandleError::Send(_))
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+
+        let mut bad_tag = [0_u8; 33];
+        bad_tag[0] = 1;
+        bad_tag[1] = 0x7f;
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::SetNasConfig as u16,
+                    device_id: 1,
+                    params: &bad_tag,
+                },
+            ),
+            Err(HandleError::Send(_))
+        ));
+        assert_eq!(read_api_ret(&mut server, id), 1);
+
+        assert!(matches!(
+            bridge.handle_sdk_api(
+                &mut server,
+                &mut modem,
+                id,
+                SdkApiRequest {
+                    command: SdkCommand::GetNasConfig as u16,
                     device_id: 1,
                     params: &[0],
                 },

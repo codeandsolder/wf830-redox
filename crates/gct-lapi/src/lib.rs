@@ -3483,6 +3483,99 @@ impl UiccPinCommandResponse {
     }
 }
 
+/// Validation failure for the shipped NAS configuration request surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NasConfigEncodeError {
+    TooManyPairs { maximum: usize, actual: usize },
+    TruncatedPairs { required: usize, actual: usize },
+    UnsupportedTag(u8),
+    Hci(EncodeError),
+}
+
+impl From<EncodeError> for NasConfigEncodeError {
+    fn from(value: EncodeError) -> Self {
+        Self::Hci(value)
+    }
+}
+
+/// Live-P4 NAS configuration setter (`0x3370`).
+///
+/// The stock local object is `count:u8` plus storage for sixteen `(tag,value)`
+/// pairs. The modem wire expands each used pair into `tag | 1 | value`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NasConfigSetRequest<'a> {
+    pub count: u8,
+    /// Alternating `tag,value` bytes; unused capacity may follow the active pairs.
+    pub pairs: &'a [u8],
+}
+
+impl NasConfigSetRequest<'_> {
+    /// Encode the exact shipped NAS TLV stream.
+    ///
+    /// # Errors
+    /// Rejects more than sixteen pairs, insufficient pair storage, tags outside
+    /// the shipped `0x80..=0x8a` set, or insufficient output space.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, NasConfigEncodeError> {
+        let count = usize::from(self.count);
+        if count > 16 {
+            return Err(NasConfigEncodeError::TooManyPairs {
+                maximum: 16,
+                actual: count,
+            });
+        }
+        let required = count.saturating_mul(2);
+        if self.pairs.len() < required {
+            return Err(NasConfigEncodeError::TruncatedPairs {
+                required,
+                actual: self.pairs.len(),
+            });
+        }
+        for pair in self.pairs[..required].as_chunks::<2>().0 {
+            if !(0x80..=0x8a).contains(&pair[0]) {
+                return Err(NasConfigEncodeError::UnsupportedTag(pair[0]));
+            }
+        }
+        let payload_len = count.saturating_mul(3);
+        let payload_len_u16 =
+            u16::try_from(payload_len).map_err(|_| EncodeError::PayloadTooLong)?;
+        let total = HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or(EncodeError::PayloadTooLong)?;
+        let Some(dst) = output.get_mut(..total) else {
+            return Err(EncodeError::NoSpace.into());
+        };
+        dst[..HEADER_LEN].copy_from_slice(
+            &Header {
+                command: recovered_opcode::NAS_CONFIG_SET_REQUEST,
+                payload_len: payload_len_u16,
+            }
+            .encode(),
+        );
+        let mut offset = HEADER_LEN;
+        for pair in self.pairs[..required].as_chunks::<2>().0 {
+            dst[offset] = pair[0];
+            dst[offset + 1] = 1;
+            dst[offset + 2] = pair[1];
+            offset += 3;
+        }
+        Ok(total)
+    }
+}
+
+/// Header-only live-P4 NAS configuration getter (`0x3372`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NasConfigGetRequest;
+
+impl NasConfigGetRequest {
+    /// Encode the exact four-byte request.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::NoSpace`] when `output` is shorter than four bytes.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+        encode_packet(recovered_opcode::NAS_CONFIG_GET_REQUEST, &[], output)
+    }
+}
+
 /// Zero-payload live-P4 `LTE_GET_INFORMATION` (`0x3002`) request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeviceInformationRequest;
@@ -4717,8 +4810,9 @@ mod tests {
         ApnType, AtCommand, AttachEncodeError, AttachExtResponse, AttachField, AttachRequest,
         AttachResponse, AttachResponseDecodeError, AttachResponseKind, AttachResponsePrefix,
         AttachTailField, DetachRequest, DetachResponse, DeviceInformationDecodeError,
-        DeviceInformationRequest, DeviceInformationResponse, EmptyRequest, NetworkFeatureInfo,
-        PcoInfo, PdnConnectExtRequest, PdnConnectExtResponsePrefix, PdnConnectRequest,
+        DeviceInformationRequest, DeviceInformationResponse, EmptyRequest, NasConfigEncodeError,
+        NasConfigGetRequest, NasConfigSetRequest, NetworkFeatureInfo, PcoInfo,
+        PdnConnectExtRequest, PdnConnectExtResponsePrefix, PdnConnectRequest,
         PdnConnectResponsePrefix, PdnConnectionControl, PdnDisconnectRequest,
         PdnDisconnectResponsePrefix, PdnEncodeError, PdnField, PdnInfoContainerKind,
         PdnInfoContainers, PdnInfoField, PdnInfoFieldLengthError, Positioning, QosField,
@@ -4727,6 +4821,45 @@ mod tests {
         SetProtocolInfoRequest, SetProtocolInfoResponse,
     };
     use gct_hci::{Header, Packet, Tlv, public_opcode};
+
+    #[test]
+    fn nas_config_requests_match_live_p4_wire_and_bounds() {
+        let storage = [0x80, 1, 0x8a, 2, 0, 0];
+        let mut set = [0_u8; 10];
+        assert_eq!(
+            (NasConfigSetRequest {
+                count: 2,
+                pairs: &storage,
+            })
+            .encode(&mut set),
+            Ok(10)
+        );
+        assert_eq!(set, [0x33, 0x70, 0, 6, 0x80, 1, 1, 0x8a, 1, 2]);
+
+        let mut get = [0_u8; 4];
+        assert_eq!(NasConfigGetRequest.encode(&mut get), Ok(4));
+        assert_eq!(get, [0x33, 0x72, 0, 0]);
+
+        assert_eq!(
+            (NasConfigSetRequest {
+                count: 17,
+                pairs: &[0; 34],
+            })
+            .encode(&mut [0; 64]),
+            Err(NasConfigEncodeError::TooManyPairs {
+                maximum: 16,
+                actual: 17,
+            })
+        );
+        assert_eq!(
+            (NasConfigSetRequest {
+                count: 1,
+                pairs: &[0x7f, 1],
+            })
+            .encode(&mut [0; 8]),
+            Err(NasConfigEncodeError::UnsupportedTag(0x7f))
+        );
+    }
 
     #[test]
     fn device_information_request_and_tlv_response_match_live_wire() {

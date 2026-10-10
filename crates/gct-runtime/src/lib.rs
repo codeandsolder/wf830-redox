@@ -21,12 +21,13 @@ use gct_lapi::{
     EmmReattachControlReport, EmmTimerControlRequest, EmmTimerStartRequest, EmptyRequest,
     IccidReadRequest, IccidReadResponse, LcsControlRequest, LppControlRequest, MiscReadDecodeError,
     MiscReadResponse, MobileIdReadRequest, MobileIdReadResponse, MsisdnReadRequest,
-    MsisdnReadResponse, PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest,
-    PdnConnectResponse, PdnDisconnectRequest, PdnDisconnectResponse, PdnEncodeError,
-    PdnResponseDecodeError, PlmnListResponse, PlmnSearchDecodeError, PlmnSearchExtEncodeError,
-    PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest,
-    PlmnSearchStopResponse, PsmControlRequest, ResponseDecodeError, ResultResponse,
-    ResultResponseKind, RrcCapabilityGetRequest, RrcCapabilityGetResponse, RrcCapabilitySetRequest,
+    MsisdnReadResponse, NasConfigEncodeError, NasConfigGetRequest, NasConfigSetRequest,
+    PdnConnectExtRequest, PdnConnectExtResponse, PdnConnectRequest, PdnConnectResponse,
+    PdnDisconnectRequest, PdnDisconnectResponse, PdnEncodeError, PdnResponseDecodeError,
+    PlmnListResponse, PlmnSearchDecodeError, PlmnSearchExtEncodeError, PlmnSearchExtRequest,
+    PlmnSearchRequest, PlmnSearchResponse, PlmnSearchStopRequest, PlmnSearchStopResponse,
+    PsmControlRequest, ResponseDecodeError, ResultResponse, ResultResponseKind,
+    RrcCapabilityGetRequest, RrcCapabilityGetResponse, RrcCapabilitySetRequest,
     RrcCapabilitySetResponse, SetProtocolInfoRequest, SetProtocolInfoResponse,
     TemperatureReadRequest, TemperatureReadResponse, UeModeChangeRequest, UeModeChangeResponse,
     UiccAuthenticateEncodeError, UiccAuthenticateRequest, UiccFixedRequest, UiccFixedRequestError,
@@ -238,6 +239,8 @@ pub enum ModemCommand<'a> {
     RrcCapabilityGet(RrcCapabilityGetRequest),
     SetProtocolInfo(SetProtocolInfoRequest<'a>),
     DeviceInformation(DeviceInformationRequest),
+    NasConfigSet(NasConfigSetRequest<'a>),
+    NasConfigGet(NasConfigGetRequest),
 }
 
 /// Identity available on both sides of a proven request/response exchange.
@@ -309,7 +312,9 @@ impl ModemCommand<'_> {
             | Self::EmmTimerStart(_)
             | Self::PsmControl(_)
             | Self::LcsControl(_)
-            | Self::LppControl(_) => None,
+            | Self::LppControl(_)
+            | Self::NasConfigSet(_)
+            | Self::NasConfigGet(_) => None,
             Self::UiccStatus(_) => Some(ResponseKey::Uicc(uicc_control::STATUS)),
             Self::UiccFixed(request) => Some(ResponseKey::Uicc(request.kind())),
             Self::UiccReadBinary(_) => Some(ResponseKey::Uicc(uicc_control::READ_BINARY)),
@@ -449,6 +454,13 @@ pub enum CommandEncodeError {
     UiccAuthenticate(UiccAuthenticateEncodeError),
     UiccFixed(UiccFixedRequestError),
     UiccPin(UiccPinEncodeError),
+    NasConfig(NasConfigEncodeError),
+}
+
+impl From<NasConfigEncodeError> for CommandEncodeError {
+    fn from(value: NasConfigEncodeError) -> Self {
+        Self::NasConfig(value)
+    }
 }
 
 impl From<EncodeError> for CommandEncodeError {
@@ -581,6 +593,8 @@ pub fn encode_command(
         ModemCommand::RrcCapabilityGet(request) => Ok(request.encode(output)?),
         ModemCommand::SetProtocolInfo(request) => Ok(request.encode(output)?),
         ModemCommand::DeviceInformation(request) => Ok(request.encode(output)?),
+        ModemCommand::NasConfigSet(request) => Ok(request.encode(output)?),
+        ModemCommand::NasConfigGet(request) => Ok(request.encode(output)?),
     }
 }
 
@@ -907,9 +921,9 @@ mod tests {
         AtCommand, AtCommandExt, AtCommandFromDevice, AttachExtProfile, AttachExtRequest,
         DeviceInformationRequest, EmmNiReattachControlRequest, EmmTimerControlRequest,
         EmmTimerStartRequest, EmptyRequest, IccidReadRequest, LcsControlRequest, LppControlRequest,
-        MobileIdReadRequest, MsisdnReadRequest, PcoInfo, PinData, PlmnSearchExtRequest,
-        PlmnSearchRequest, PlmnSearchStopRequest, PsmControlRequest, ResponseDecodeError,
-        ResultResponseKind, RrcCapabilityGetRequest, RrcCapabilitySetRequest,
+        MobileIdReadRequest, MsisdnReadRequest, NasConfigGetRequest, NasConfigSetRequest, PcoInfo,
+        PinData, PlmnSearchExtRequest, PlmnSearchRequest, PlmnSearchStopRequest, PsmControlRequest,
+        ResponseDecodeError, ResultResponseKind, RrcCapabilityGetRequest, RrcCapabilitySetRequest,
         SetProtocolInfoRequest, TemperatureReadRequest, UiccPinCommandRequest,
     };
     use gct_transport::HciIo;
@@ -1594,6 +1608,24 @@ mod tests {
                 chip_revision: [5, 6],
             })
         );
+    }
+
+    #[test]
+    fn nas_config_requests_are_deliberately_untracked() {
+        let set = ModemCommand::NasConfigSet(NasConfigSetRequest {
+            count: 1,
+            pairs: &[0x80, 1],
+        });
+        let get = ModemCommand::NasConfigGet(NasConfigGetRequest);
+        assert_eq!(set.response_key(), None);
+        assert_eq!(get.response_key(), None);
+
+        let mut set_frame = [0_u8; 7];
+        assert_eq!(encode_command(set, &mut set_frame), Ok(7));
+        assert_eq!(set_frame, [0x33, 0x70, 0, 3, 0x80, 1, 1]);
+        let mut get_frame = [0_u8; 4];
+        assert_eq!(encode_command(get, &mut get_frame), Ok(4));
+        assert_eq!(get_frame, [0x33, 0x72, 0, 0]);
     }
 
     #[test]

@@ -47,6 +47,7 @@ pub enum SdkCallbackKind {
     RrcCapabilityControl,
     RrcCapabilityControlGet,
     SetProtocolInfo,
+    GetNasConfig,
 }
 
 impl SdkCallbackKind {
@@ -79,6 +80,7 @@ impl SdkCallbackKind {
             Self::RrcCapabilityControl => 221,
             Self::RrcCapabilityControlGet => 223,
             Self::SetProtocolInfo => 178,
+            Self::GetNasConfig => 305,
         }
     }
 
@@ -111,6 +113,7 @@ impl SdkCallbackKind {
             Self::RrcCapabilityControl => 115,
             Self::RrcCapabilityControlGet => 116,
             Self::SetProtocolInfo => 90,
+            Self::GetNasConfig => 157,
         }
     }
 
@@ -189,6 +192,8 @@ pub enum SdkCommand {
     UiccRequest = 147,
     UeModeChange = 161,
     SetProtocolInfo = 177,
+    SetNasConfig = 303,
+    GetNasConfig = 304,
     EmmTimerControl = 207,
     PsmControl = 208,
     LcsControl = 209,
@@ -233,6 +238,8 @@ impl TryFrom<u16> for SdkCommand {
             147 => Ok(Self::UiccRequest),
             161 => Ok(Self::UeModeChange),
             177 => Ok(Self::SetProtocolInfo),
+            303 => Ok(Self::SetNasConfig),
+            304 => Ok(Self::GetNasConfig),
             207 => Ok(Self::EmmTimerControl),
             208 => Ok(Self::PsmControl),
             209 => Ok(Self::LcsControl),
@@ -667,6 +674,8 @@ mod tests {
         );
         assert_eq!(SdkCommand::try_from(18), Ok(SdkCommand::AddSpecialTid));
         assert_eq!(SdkCommand::try_from(177), Ok(SdkCommand::SetProtocolInfo));
+        assert_eq!(SdkCommand::try_from(303), Ok(SdkCommand::SetNasConfig));
+        assert_eq!(SdkCommand::try_from(304), Ok(SdkCommand::GetNasConfig));
         assert_eq!(SdkCommand::try_from(207), Ok(SdkCommand::EmmTimerControl));
         assert_eq!(SdkCommand::try_from(208), Ok(SdkCommand::PsmControl));
         assert_eq!(SdkCommand::try_from(209), Ok(SdkCommand::LcsControl));
@@ -878,6 +887,9 @@ mod tests {
             SdkCallbackKind::SetProtocolInfo.registration_offset(),
             0x2d4
         );
+        assert_eq!(SdkCallbackKind::GetNasConfig.callback_id(), 305);
+        assert_eq!(SdkCallbackKind::GetNasConfig.registration_index(), 157);
+        assert_eq!(SdkCallbackKind::GetNasConfig.registration_offset(), 0x4ec);
         assert_eq!(SdkCallbackKind::EmmNiReattachControl.callback_id(), 308);
         assert_eq!(
             SdkCallbackKind::EmmNiReattachControl.registration_offset(),

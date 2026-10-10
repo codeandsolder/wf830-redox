@@ -356,6 +356,10 @@ pub mod recovered_opcode {
     pub const EMM_CONTROL_REQUEST: u16 = 0x3155;
     /// Set-protocol-info request used by shipped P4 `lteatcm`/`gdmmon`.
     pub const SET_PROTOCOL_INFO_REQUEST: u16 = 0x3151;
+    /// Live-P4 NAS configuration setter used by shipped `lteautocm`.
+    pub const NAS_CONFIG_SET_REQUEST: u16 = 0x3370;
+    /// Live-P4 NAS configuration getter; no receive opcode is proven on P4.
+    pub const NAS_CONFIG_GET_REQUEST: u16 = 0x3372;
     /// RRC-capability set request used by the shipped connection manager.
     pub const RRC_CAPABILITY_CONTROL_REQUEST: u16 = 0x3906;
     /// RRC-capability get request used by the shipped connection manager.

@@ -1714,6 +1714,65 @@ seven-byte Add/Delete decoding, Add→default-EPS query→Delete→`0xff` lifecy
 malformed-record rejection before GLIF, zero pending modem state, and an empty
 modem transport for every local helper.
 
+## Live P4 NAS configuration — shipped request path, dormant completion path
+
+Shipped `lteautocm` uses the stock NAS-configuration API, and the live P4
+request-side contract is independently fixed at both compatibility layers.
+`liblted.so` exposes `LTED_SetNASConfigRequest@0x18550` and
+`LTED_GetNASConfigRequest@0x18700`: Set sends SDK command **303** and copies an
+exact **33-byte** local object, while Get sends SDK command **304** with **zero
+parameter bytes**. Both wrappers use the normal synchronous `lte_api_ret` /
+SysV semaphore handoff and return after the daemon has accepted the request.
+
+The 33-byte Set object is:
+
+```text
+count:u8 | pair[16] where pair = { tag:u8, value:u8 }
+```
+
+The shipped connection-manager builder uses the eleven one-byte NAS parameter
+tags **`0x80..=0x8a`**. Live `libltesdk.so`
+`LAPI_SetNASConfigRequest@0x64438` emits HCI **`0x3370`** and expands each of
+the first `count` pairs into exactly three modem bytes:
+
+```text
+tag | 0x01 | value
+```
+
+Thus `count = N` produces a `3*N`-byte modem payload. The OEM loop trusts the
+local count even though the historical object only contains sixteen pair slots;
+the clean codec therefore rejects `count > 16` before GLIF and also rejects
+unshipped tags rather than reproducing an out-of-bounds read. Live
+`LAPI_GetNASConfigRequest@0x646ec` emits the exact header-only HCI request
+**`33 72 00 00`** (`0x3372`).
+
+The completion side exists as stock ABI machinery but is not proven reachable
+from the live modem receive path. The P4 daemon registers SDK response slot
+**157** to `ind_get_nas_config_response@0x381d4`; that handler normalizes an
+exact **14-byte** callback object and emits stock callback selector **305**.
+The stock `liblted.so` callback jump table maps selector 305 to
+**`cb_rsp[157]`**, function/context offsets **`0x4ec/0x4f0`**. B014
+`libltesdk.so` also contains a standalone 14-byte slot-157 parser at
+`0x356e8`, but its main HCI dispatch table does not reference that parser.
+The live P4 HCI dispatch table likewise contains no proven NAS-Get response
+entry leading to slot 157. In particular, there is no evidence-tight response
+opcode that can be paired with `0x3372` merely by numerical adjacency.
+
+Rust therefore implements commands **303/304** as exact shipped **request-side**
+compatibility only. `gct-lapi` provides bounded typed Set/Get request codecs;
+`gct-runtime` marks both as deliberately untracked; `lted-bridge` validates the
+exact 33/0-byte local shapes and sends the modem frames; and `lted-proto`
+records callback 305 / `cb_rsp[157]` metadata for ABI provenance. The bridge
+does **not** synthesize callback 305 and does not invent a response opcode. If a
+future capture or independently recovered receive route proves the modem
+completion, that path can be added without changing the shipped request ABI.
+
+Tests lock the exact Set expansion (`0x3370`), exact four-byte Get request
+(`0x3372`), command IDs 303/304, callback-305 registration offset `0x4ec`,
+zero pending/deferred state, rejection of malformed 33-byte objects, rejection
+of count overflow and unshipped tags before GLIF, and the absence of any
+synthetic completion traffic.
+
 ## Live P4 DMLogExt — transport proven, semantic bridge intentionally deferred
 
 Live P4 proves the DMLogExt transport contract completely: stock SDK command
