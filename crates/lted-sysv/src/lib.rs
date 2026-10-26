@@ -23,7 +23,7 @@ union Semun {
 pub struct ClientContext {
     shmid: libc::c_int,
     semid: libc::c_int,
-    address: usize,
+    address: *mut u8,
 }
 
 impl ClientContext {
@@ -39,12 +39,16 @@ impl ClientContext {
     /// `semctl(SETALL)`. Partially-created resources are removed before return.
     pub fn create(seed_path: &Path, client_id: u8) -> io::Result<Self> {
         let key = key_for(seed_path, client_id)?;
+        // SAFETY: `shmget` takes only integer values here. Its return value is
+        // checked before it is used as a shared-memory identifier.
         let shared_memory_id =
             unsafe { libc::shmget(key, SHARED_CONTEXT_LEN, IPC_CREATE_EXCLUSIVE_MODE) };
         if shared_memory_id < 0 {
             return Err(io::Error::last_os_error());
         }
 
+        // SAFETY: `semget` takes only integer values here. Its return value is
+        // checked before it is used as a semaphore-set identifier.
         let semaphore_id = unsafe { libc::semget(key, SEMAPHORE_COUNT, IPC_CREATE_EXCLUSIVE_MODE) };
         if semaphore_id < 0 {
             let error = io::Error::last_os_error();
@@ -52,8 +56,12 @@ impl ClientContext {
             return Err(error);
         }
 
+        // SAFETY: a null address hint and zero flags are valid for `shmat`.
+        // The returned pointer is retained only after checking the documented
+        // `(void *) -1` failure sentinel.
         let address = unsafe { libc::shmat(shared_memory_id, ptr::null(), 0) };
-        if address == (-1_isize) as *mut libc::c_void {
+        let failed_address = ptr::without_provenance_mut::<libc::c_void>(usize::MAX);
+        if address == failed_address {
             let error = io::Error::last_os_error();
             remove_sem(semaphore_id);
             remove_shm(shared_memory_id);
@@ -63,7 +71,7 @@ impl ClientContext {
         let context = Self {
             shmid: shared_memory_id,
             semid: semaphore_id,
-            address: address as usize,
+            address: address.cast(),
         };
         if let Err(error) = context.set_all_zero() {
             drop(context);
@@ -112,12 +120,12 @@ impl ClientContext {
     /// Returns `InvalidInput` when `offset + data.len()` exceeds `0x9780`.
     pub fn write(&mut self, offset: usize, data: &[u8]) -> io::Result<()> {
         let range = checked_range(offset, data.len())?;
+        // SAFETY: `self.address` is the live `shmat` result owned by this
+        // context, and `checked_range` proves the destination stays within the
+        // `SHARED_CONTEXT_LEN` attachment. The safe API never exposes a slice
+        // into that mapping, so `data` cannot overlap the destination.
         unsafe {
-            ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                (self.address as *mut u8).add(range.start),
-                data.len(),
-            );
+            ptr::copy_nonoverlapping(data.as_ptr(), self.address.add(range.start), data.len());
         }
         Ok(())
     }
@@ -132,9 +140,13 @@ impl ClientContext {
     /// Returns `InvalidInput` when `offset + output.len()` exceeds `0x9780`.
     pub fn read(&self, offset: usize, output: &mut [u8]) -> io::Result<()> {
         let range = checked_range(offset, output.len())?;
+        // SAFETY: `self.address` is the live `shmat` result owned by this
+        // context, and `checked_range` proves the source stays within the
+        // `SHARED_CONTEXT_LEN` attachment. The safe API never exposes a slice
+        // into that mapping, so `output` cannot overlap the source.
         unsafe {
             ptr::copy_nonoverlapping(
-                (self.address as *const u8).add(range.start),
+                self.address.add(range.start).cast_const(),
                 output.as_mut_ptr(),
                 output.len(),
             );
@@ -174,11 +186,16 @@ impl ClientContext {
         let arg = Semun {
             array: values.as_mut_ptr(),
         };
+        // SAFETY: this semaphore set was created with exactly two entries and
+        // `values` is a live two-element `c_ushort` array for the duration of
+        // the variadic `SETALL` call.
         let result = unsafe { libc::semctl(self.semid, 0, libc::SETALL, arg) };
         cvt_zero(result)
     }
 
     fn semop(&self, ops: &mut [libc::sembuf]) -> io::Result<()> {
+        // SAFETY: `ops.as_mut_ptr()` is valid for exactly `ops.len()` entries
+        // and `self.semid` names the live semaphore set owned by this context.
         let result = unsafe { libc::semop(self.semid, ops.as_mut_ptr(), ops.len()) };
         cvt_zero(result)
     }
@@ -186,8 +203,10 @@ impl ClientContext {
 
 impl Drop for ClientContext {
     fn drop(&mut self) {
+        // SAFETY: `self.address` is the successful `shmat` result retained by
+        // this context and this is its single detach point.
         unsafe {
-            libc::shmdt(self.address as *const libc::c_void);
+            libc::shmdt(self.address.cast_const().cast());
         }
         remove_shm(self.shmid);
         remove_sem(self.semid);
@@ -206,6 +225,8 @@ pub fn key_for(seed_path: &Path, client_id: u8) -> io::Result<libc::key_t> {
             "System V ftok seed path contains NUL",
         )
     })?;
+    // SAFETY: `CString` guarantees a live NUL-terminated pathname for the
+    // duration of `ftok`; `client_id` is losslessly widened to `c_int`.
     let key = unsafe { libc::ftok(path.as_ptr(), libc::c_int::from(client_id)) };
     if key == -1 {
         Err(io::Error::last_os_error())
@@ -252,12 +273,16 @@ fn cvt_zero(result: libc::c_int) -> io::Result<()> {
 }
 
 fn remove_shm(shmid: libc::c_int) {
+    // SAFETY: callers pass identifiers returned by successful `shmget` calls.
+    // Removal is best-effort cleanup, so the integer return code is discarded.
     unsafe {
         libc::shmctl(shmid, libc::IPC_RMID, ptr::null_mut());
     }
 }
 
 fn remove_sem(semid: libc::c_int) {
+    // SAFETY: callers pass identifiers returned by successful `semget` calls.
+    // Removal is best-effort cleanup, so the integer return code is discarded.
     unsafe {
         libc::semctl(semid, 0, libc::IPC_RMID);
     }
@@ -300,6 +325,8 @@ mod tests {
     }
 
     fn sem_value(semid: libc::c_int, number: libc::c_int) -> libc::c_int {
+        // SAFETY: the tests call this only with a live semaphore-set identifier
+        // and an in-range semaphore number.
         let value = unsafe { libc::semctl(semid, number, libc::GETVAL) };
         if value < 0 {
             std::process::abort();
@@ -309,6 +336,8 @@ mod tests {
 
     fn client_wait(context: &ClientContext) {
         let mut ops = [sembuf(1, -1, 0), sembuf(0, 1, SEM_UNDO_FLAG)];
+        // SAFETY: `context` owns a live two-entry semaphore set and `ops` is a
+        // live two-element array for the duration of this call.
         let result = unsafe { libc::semop(context.semid(), ops.as_mut_ptr(), ops.len()) };
         if result != 0 {
             std::process::abort();
@@ -317,6 +346,8 @@ mod tests {
 
     fn client_done(context: &ClientContext) {
         let mut ops = [sembuf(0, -1, SEM_UNDO_FLAG)];
+        // SAFETY: `context` owns a live two-entry semaphore set and `ops` is a
+        // live one-element array for the duration of this call.
         let result = unsafe { libc::semop(context.semid(), ops.as_mut_ptr(), ops.len()) };
         if result != 0 {
             std::process::abort();
@@ -328,7 +359,11 @@ mod tests {
         let seed = Seed::new();
         let context = ClientContext::create(&seed.0, 7).unwrap_or_else(|_| std::process::abort());
         let key = key_for(&seed.0, 7).unwrap_or_else(|_| std::process::abort());
+        // SAFETY: this is a lookup-only call with the exact key and size used
+        // by the already-created live shared-memory segment.
         let shared_memory_lookup = unsafe { libc::shmget(key, SHARED_CONTEXT_LEN, 0) };
+        // SAFETY: this is a lookup-only call with the exact key and entry count
+        // used by the already-created live semaphore set.
         let semaphore_lookup = unsafe { libc::semget(key, 2, 0o666) };
         assert_eq!(shared_memory_lookup, context.shmid());
         assert_eq!(semaphore_lookup, context.semid());
