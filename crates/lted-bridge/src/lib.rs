@@ -105,7 +105,7 @@ pub const DHCP_LEASE_STATE_RESULT_OFFSET: usize = 0x977e;
 pub enum HostAction {
     SetMtu {
         interface_name: [u8; 15],
-        name_len: u8,
+        name_len: usize,
         mtu: u16,
     },
 }
@@ -118,7 +118,7 @@ impl HostAction {
                 interface_name,
                 name_len,
                 ..
-            } => &interface_name[..usize::from(*name_len)],
+            } => &interface_name[..*name_len],
         }
     }
 }
@@ -638,7 +638,7 @@ impl DeviceBridge {
         interface_name[..name_len].copy_from_slice(&name_source[..name_len]);
         host_action(HostAction::SetMtu {
             interface_name,
-            name_len: u8::try_from(name_len).unwrap_or(15),
+            name_len,
             mtu,
         })
         .map_err(HandleError::Host)?;

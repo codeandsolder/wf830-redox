@@ -8,6 +8,7 @@ use std::{
         unix::{ffi::OsStrExt, net::UnixDatagram},
     },
     process::{Command, ExitCode},
+    sync::mpsc,
     thread::{self, JoinHandle},
 };
 
@@ -110,7 +111,8 @@ fn run() -> io::Result<()> {
     let mut ipv6_prefix = Ipv6PrefixSource::bind()?;
     let reader_file = modem.transport().inner().try_clone()?;
     let (glif_rx, glif_tx) = UnixDatagram::pair()?;
-    let _reader = spawn_glif_reader(reader_file, glif_tx)?;
+    let (glif_error_tx, glif_error_rx) = mpsc::channel();
+    let _reader = spawn_glif_reader(reader_file, glif_tx, glif_error_tx)?;
     let mut bridge = DeviceBridge::new(device_id);
     if let Some(bytes) = bridge
         .drive_initialization(&mut modem)
@@ -123,6 +125,7 @@ fn run() -> io::Result<()> {
         &mut server,
         &mut bridge,
         &glif_rx,
+        &glif_error_rx,
         &mut ipv6_prefix,
     )
 }
@@ -156,7 +159,11 @@ fn resolve_device_id(
     }
 }
 
-fn spawn_glif_reader<R>(mut reader: R, notify: UnixDatagram) -> io::Result<JoinHandle<()>>
+fn spawn_glif_reader<R>(
+    mut reader: R,
+    notify: UnixDatagram,
+    error_tx: mpsc::Sender<io::Error>,
+) -> io::Result<JoinHandle<()>>
 where
     R: Read + Send + 'static,
 {
@@ -180,10 +187,10 @@ where
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                     Err(error) => {
-                        message[0] = GLIF_MESSAGE_ERROR;
-                        let errno = error.raw_os_error().unwrap_or(0).to_be_bytes();
-                        message[1..5].copy_from_slice(&errno);
-                        let _ = notify.send(&message[..5]);
+                        if error_tx.send(error).is_ok() {
+                            message[0] = GLIF_MESSAGE_ERROR;
+                            let _ = notify.send(&message[..1]);
+                        }
                         break;
                     }
                 }
@@ -247,6 +254,7 @@ fn daemon_loop(
     server: &mut Server,
     bridge: &mut DeviceBridge,
     glif_rx: &UnixDatagram,
+    glif_errors: &mpsc::Receiver<io::Error>,
     ipv6_prefix: &mut Ipv6PrefixSource,
 ) -> io::Result<()> {
     let mut client_frame = vec![0_u8; LOCAL_FRAME_MAX];
@@ -283,6 +291,7 @@ fn daemon_loop(
                 modem,
                 glif_rx,
                 &mut glif_message,
+                glif_errors,
                 &mut decoder,
                 server,
                 bridge,
@@ -400,6 +409,7 @@ fn handle_glif_message(
     modem: &mut Modem<File>,
     glif_rx: &UnixDatagram,
     message: &mut [u8],
+    glif_errors: &mpsc::Receiver<io::Error>,
     decoder: &mut HciStreamDecoder,
     server: &mut Server,
     bridge: &mut DeviceBridge,
@@ -447,19 +457,24 @@ fn handle_glif_message(
             io::ErrorKind::UnexpectedEof,
             "GLIF returned EOF",
         )),
-        GLIF_MESSAGE_ERROR if payload.len() == 4 => {
-            let errno = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-            if errno == 0 {
-                Err(io::Error::other("GLIF reader failed without an OS errno"))
-            } else {
-                Err(io::Error::from_raw_os_error(errno))
-            }
-        }
+        GLIF_MESSAGE_ERROR if payload.is_empty() => take_glif_reader_error(glif_errors),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid GLIF reader notification",
         )),
     }
+}
+
+fn take_glif_reader_error(errors: &mpsc::Receiver<io::Error>) -> io::Result<()> {
+    errors.try_recv().map_or_else(
+        |error| {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("GLIF error notification has no matching reader error: {error}"),
+            ))
+        },
+        Err,
+    )
 }
 
 fn invalid_usage() -> io::Error {
@@ -483,15 +498,30 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Cursor, os::unix::net::UnixDatagram};
+    use std::{
+        io::{self, Cursor, Read},
+        os::unix::net::UnixDatagram,
+        sync::mpsc,
+    };
 
     use gct_runtime::StartupInterface;
     use lted_compat::Server;
 
     use super::{
-        GLIF_MESSAGE_DATA, GLIF_MESSAGE_EOF, ReadySources, resolve_device_id, spawn_glif_reader,
-        wait_ready,
+        GLIF_MESSAGE_DATA, GLIF_MESSAGE_EOF, GLIF_MESSAGE_ERROR, ReadySources, resolve_device_id,
+        spawn_glif_reader, take_glif_reader_error, wait_ready,
     };
+
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "synthetic GLIF read failure",
+            ))
+        }
+    }
 
     #[test]
     fn oem_device_id_is_one_based_modem_index() {
@@ -515,7 +545,9 @@ mod tests {
     fn glif_reader_preserves_read_boundaries_and_reports_eof() {
         let (rx, tx) = UnixDatagram::pair().unwrap_or_else(|_| std::process::abort());
         let reader = Cursor::new(vec![0x31, 0x2f, 0x00, 0x04, 0, 0, 0, 1]);
-        let handle = spawn_glif_reader(reader, tx).unwrap_or_else(|_| std::process::abort());
+        let (error_tx, _error_rx) = mpsc::channel();
+        let handle =
+            spawn_glif_reader(reader, tx, error_tx).unwrap_or_else(|_| std::process::abort());
         let mut frame = [0_u8; 32];
 
         let len = rx
@@ -528,6 +560,29 @@ mod tests {
             .recv(&mut frame)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(&frame[..len], &[GLIF_MESSAGE_EOF]);
+        if handle.join().is_err() {
+            std::process::abort();
+        }
+    }
+
+    #[test]
+    fn glif_reader_preserves_non_errno_error_details() {
+        let (rx, tx) = UnixDatagram::pair().unwrap_or_else(|_| std::process::abort());
+        let (error_tx, error_rx) = mpsc::channel();
+        let handle = spawn_glif_reader(FailingReader, tx, error_tx)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut frame = [0_u8; 8];
+
+        let len = rx
+            .recv(&mut frame)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(&frame[..len], &[GLIF_MESSAGE_ERROR]);
+
+        let error = take_glif_reader_error(&error_rx)
+            .err()
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "synthetic GLIF read failure");
         if handle.join().is_err() {
             std::process::abort();
         }

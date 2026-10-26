@@ -294,16 +294,17 @@ impl NicState {
 
     pub(crate) fn snapshot(&self) -> [u8; CONNECTION_INFO_LEN] {
         let mut output = [0_u8; CONNECTION_INFO_LEN];
-        let mut count = 0_usize;
+        let mut count = 0_u32;
+        let mut offset = 4;
         for record in &self.records {
             if Self::default_eps_id(record) == 0 {
                 continue;
             }
-            let offset = 4 + count * NIC_RECORD_LEN;
             output[offset..offset + NIC_RECORD_LEN].copy_from_slice(record);
+            offset += NIC_RECORD_LEN;
             count += 1;
         }
-        output[..4].copy_from_slice(&u32::try_from(count).unwrap_or(0).to_be_bytes());
+        output[..4].copy_from_slice(&count.to_be_bytes());
         output
     }
 
@@ -312,7 +313,8 @@ impl NicState {
     }
 
     fn apply_common(record: &mut [u8; NIC_RECORD_LEN], update: &ConnectionUpdate<'_>) {
-        let status = u32::from_be_bytes(record[0x100..0x104].try_into().unwrap_or([0; 4]));
+        let status =
+            u32::from_be_bytes([record[0x100], record[0x101], record[0x102], record[0x103]]);
         Self::write_u32(record, 0x100, status | update.event_bit);
         Self::write_u32(record, 0x104, u32::from(update.apn_type));
         record[0x10d] = update.data_path;
@@ -445,14 +447,10 @@ impl NicState {
         record[0x16a..0x172].copy_from_slice(&prefix[..8]);
         record[0x1aa..0x1b2].copy_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0]);
 
-        let address: [u8; 16] = record[0x16a..0x17a].try_into().unwrap_or([0; 16]);
-        let dns1: [u8; 16] = record[0x18a..0x19a].try_into().unwrap_or([0; 16]);
-        let dns2: [u8; 16] = record[0x19a..0x1aa].try_into().unwrap_or([0; 16]);
-        let gateway: [u8; 16] = record[0x1aa..0x1ba].try_into().unwrap_or([0; 16]);
-        record[0x1be..0x1ce].copy_from_slice(&address);
-        record[0x1ce..0x1de].copy_from_slice(&dns1);
-        record[0x1de..0x1ee].copy_from_slice(&dns2);
-        record[0x1ee..0x1fe].copy_from_slice(&gateway);
+        record.copy_within(0x16a..0x17a, 0x1be);
+        record.copy_within(0x18a..0x19a, 0x1ce);
+        record.copy_within(0x19a..0x1aa, 0x1de);
+        record.copy_within(0x1aa..0x1ba, 0x1ee);
         record[0x1bd] = 1;
         true
     }
