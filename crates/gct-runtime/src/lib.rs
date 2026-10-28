@@ -51,25 +51,41 @@ pub struct StartupInterface {
 /// whose PDN index is zero. The clean parser deliberately requires the whole
 /// interface name to match instead of accepting trailing garbage after the
 /// second decimal number as `sscanf` would.
-#[must_use]
-pub fn parse_startup_interface_name(name: &str) -> Option<StartupInterface> {
-    let rest = name.strip_prefix("lte")?;
-    let (modem, pdn) = rest.split_once("pdn")?;
-    if modem.is_empty() || pdn.is_empty() || !modem.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParseStartupInterfaceError;
+
+impl std::fmt::Display for ParseStartupInterfaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("expected an lteNpdn0 startup interface name")
     }
-    if !pdn.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
+}
+
+impl std::error::Error for ParseStartupInterfaceError {}
+
+impl std::str::FromStr for StartupInterface {
+    type Err = ParseStartupInterfaceError;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        let rest = name.strip_prefix("lte").ok_or(ParseStartupInterfaceError)?;
+        let (modem, pdn) = rest.split_once("pdn").ok_or(ParseStartupInterfaceError)?;
+        if modem.is_empty() || pdn.is_empty() || !modem.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(ParseStartupInterfaceError);
+        }
+        if !pdn.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(ParseStartupInterfaceError);
+        }
+        let modem_index = modem
+            .parse::<u32>()
+            .map_err(|_| ParseStartupInterfaceError)?;
+        let pdn_index = pdn.parse::<u32>().map_err(|_| ParseStartupInterfaceError)?;
+        if pdn_index != 0 {
+            return Err(ParseStartupInterfaceError);
+        }
+        Ok(StartupInterface {
+            name: name.to_owned(),
+            modem_index,
+        })
     }
-    let modem_index = modem.parse::<u32>().ok()?;
-    let pdn_index = pdn.parse::<u32>().ok()?;
-    if pdn_index != 0 {
-        return None;
-    }
-    Some(StartupInterface {
-        name: name.to_owned(),
-        modem_index,
-    })
 }
 
 /// Find the first OEM primary LTE interface in already-read `/proc/net/dev`
@@ -78,7 +94,7 @@ pub fn parse_startup_interface_name(name: &str) -> Option<StartupInterface> {
 pub fn find_startup_interface(net_dev: &str) -> Option<StartupInterface> {
     net_dev.lines().find_map(|line| {
         let (name, _) = line.split_once(':')?;
-        parse_startup_interface_name(name.trim())
+        name.trim().parse().ok()
     })
 }
 
@@ -112,7 +128,7 @@ pub fn discover_startup_interface() -> io::Result<StartupInterface> {
 /// kernel interface table cannot be read, or `NotFound` if the named interface
 /// is not currently present.
 pub fn verify_startup_interface(name: &str) -> io::Result<StartupInterface> {
-    let parsed = parse_startup_interface_name(name).ok_or_else(|| {
+    let parsed = name.parse::<StartupInterface>().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "startup interface must match lteNpdn0",
@@ -937,24 +953,24 @@ mod tests {
     #[test]
     fn startup_interface_parser_accepts_only_primary_oem_names() {
         assert_eq!(
-            super::parse_startup_interface_name("lte0pdn0"),
-            Some(super::StartupInterface {
+            "lte0pdn0".parse::<super::StartupInterface>(),
+            Ok(super::StartupInterface {
                 name: "lte0pdn0".to_owned(),
                 modem_index: 0,
             })
         );
         assert_eq!(
-            super::parse_startup_interface_name("lte12pdn0"),
-            Some(super::StartupInterface {
+            "lte12pdn0".parse::<super::StartupInterface>(),
+            Ok(super::StartupInterface {
                 name: "lte12pdn0".to_owned(),
                 modem_index: 12,
             })
         );
-        assert_eq!(super::parse_startup_interface_name("lte0pdn1"), None);
-        assert_eq!(super::parse_startup_interface_name("ltepdn0"), None);
-        assert_eq!(super::parse_startup_interface_name("lte0pdn"), None);
-        assert_eq!(super::parse_startup_interface_name("xlte0pdn0"), None);
-        assert_eq!(super::parse_startup_interface_name("lte0pdn0junk"), None);
+        assert!("lte0pdn1".parse::<super::StartupInterface>().is_err());
+        assert!("ltepdn0".parse::<super::StartupInterface>().is_err());
+        assert!("lte0pdn".parse::<super::StartupInterface>().is_err());
+        assert!("xlte0pdn0".parse::<super::StartupInterface>().is_err());
+        assert!("lte0pdn0junk".parse::<super::StartupInterface>().is_err());
     }
 
     #[test]
