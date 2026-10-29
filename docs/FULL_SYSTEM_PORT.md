@@ -1,5 +1,7 @@
 # WF830 full-system oxidation / modern OpenWrt scope
 
+See [`OXIDATION_INVENTORY.md`](OXIDATION_INVENTORY.md) for the flash-by-flash, userspace, kernel/BSP and firmware inventory behind this scope.
+
 This scopes the layer below wf830-redox: replace the GDM7243QT application-side vendor Linux/BSP with modern Linux/OpenWrt while keeping the cellular modem RTOS/PHY firmware on ARM1.
 
 ## Boundary

@@ -29,3 +29,5 @@ code. Every recovered constant should be traceable to either upstream GCT/Linux
 source or a specific OEM function/disassembly. Host-derived compatibility state
 is wired from the proven kernel event source rather than synthesized from
 plausible defaults.
+
+Full-system work is tracked in [`docs/FULL_SYSTEM_PORT.md`](docs/FULL_SYSTEM_PORT.md). The concrete code/blob inventory and Rust-first host boundary are in [`docs/OXIDATION_INVENTORY.md`](docs/OXIDATION_INVENTORY.md).
