@@ -39,12 +39,14 @@ impl ClientContext {
     /// `semctl(SETALL)`. Partially-created resources are removed before return.
     pub fn create(seed_path: &Path, client_id: u8) -> io::Result<Self> {
         let key = key_for(seed_path, client_id)?;
+        // SAFETY: `shmget` has no pointer preconditions; `key`, size, and flags are plain values.
         let shared_memory_id =
             unsafe { libc::shmget(key, SHARED_CONTEXT_LEN, IPC_CREATE_EXCLUSIVE_MODE) };
         if shared_memory_id < 0 {
             return Err(io::Error::last_os_error());
         }
 
+        // SAFETY: `semget` has no pointer preconditions; `key`, count, and flags are plain values.
         let semaphore_id = unsafe { libc::semget(key, SEMAPHORE_COUNT, IPC_CREATE_EXCLUSIVE_MODE) };
         if semaphore_id < 0 {
             let error = io::Error::last_os_error();
@@ -52,6 +54,7 @@ impl ClientContext {
             return Err(error);
         }
 
+        // SAFETY: `shared_memory_id` names the segment created above; a null hint lets the kernel choose the address.
         let address = unsafe { libc::shmat(shared_memory_id, ptr::null(), 0) };
         if address == (-1_isize) as *mut libc::c_void {
             let error = io::Error::last_os_error();
@@ -112,6 +115,8 @@ impl ClientContext {
     /// Returns `InvalidInput` when `offset + data.len()` exceeds `0x9780`.
     pub fn write(&mut self, offset: usize, data: &[u8]) -> io::Result<()> {
         let range = checked_range(offset, data.len())?;
+        // SAFETY: `checked_range` proves the destination range lies inside the attached mapping;
+        // `data` is distinct and the mapping is not exposed as a Rust reference.
         unsafe {
             ptr::copy_nonoverlapping(
                 data.as_ptr(),
@@ -132,6 +137,8 @@ impl ClientContext {
     /// Returns `InvalidInput` when `offset + output.len()` exceeds `0x9780`.
     pub fn read(&self, offset: usize, output: &mut [u8]) -> io::Result<()> {
         let range = checked_range(offset, output.len())?;
+        // SAFETY: `checked_range` proves the source range lies inside the attached mapping;
+        // `output` is distinct and the mapping is not exposed as a Rust reference.
         unsafe {
             ptr::copy_nonoverlapping(
                 (self.address as *const u8).add(range.start),
@@ -174,11 +181,13 @@ impl ClientContext {
         let arg = Semun {
             array: values.as_mut_ptr(),
         };
+        // SAFETY: `arg.array` points to two live values, matching this semaphore set fixed size.
         let result = unsafe { libc::semctl(self.semid, 0, libc::SETALL, arg) };
         cvt_zero(result)
     }
 
     fn semop(&self, ops: &mut [libc::sembuf]) -> io::Result<()> {
+        // SAFETY: `ops` provides exactly `ops.len()` initialized `sembuf` entries.
         let result = unsafe { libc::semop(self.semid, ops.as_mut_ptr(), ops.len()) };
         cvt_zero(result)
     }
@@ -186,6 +195,7 @@ impl ClientContext {
 
 impl Drop for ClientContext {
     fn drop(&mut self) {
+        // SAFETY: `address` is the still-attached pointer returned by `shmat` during construction.
         unsafe {
             libc::shmdt(self.address as *const libc::c_void);
         }
@@ -206,6 +216,7 @@ pub fn key_for(seed_path: &Path, client_id: u8) -> io::Result<libc::key_t> {
             "System V ftok seed path contains NUL",
         )
     })?;
+    // SAFETY: `path` is a live NUL-terminated `CString` for the duration of the call.
     let key = unsafe { libc::ftok(path.as_ptr(), libc::c_int::from(client_id)) };
     if key == -1 {
         Err(io::Error::last_os_error())
@@ -252,12 +263,14 @@ fn cvt_zero(result: libc::c_int) -> io::Result<()> {
 }
 
 fn remove_shm(shmid: libc::c_int) {
+    // SAFETY: `IPC_RMID` does not dereference the null metadata pointer; invalid IDs just fail.
     unsafe {
         libc::shmctl(shmid, libc::IPC_RMID, ptr::null_mut());
     }
 }
 
 fn remove_sem(semid: libc::c_int) {
+    // SAFETY: `IPC_RMID` takes no variadic argument; invalid semaphore IDs just fail.
     unsafe {
         libc::semctl(semid, 0, libc::IPC_RMID);
     }
