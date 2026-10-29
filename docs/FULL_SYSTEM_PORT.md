@@ -2,6 +2,8 @@
 
 See [`OXIDATION_INVENTORY.md`](OXIDATION_INVENTORY.md) for the flash-by-flash, userspace, kernel/BSP and firmware inventory behind this scope.
 
+For the literal all-Rust ARM0 alternative, see [`RUST_ONLY_PLATFORM.md`](RUST_ONLY_PLATFORM.md). Native BE8 Rust output has been proven, so that route does not depend on the LE-kernel experiment below.
+
 This scopes the layer below wf830-redox: replace the GDM7243QT application-side vendor Linux/BSP with modern Linux/OpenWrt while keeping the cellular modem RTOS/PHY firmware on ARM1.
 
 ## Boundary

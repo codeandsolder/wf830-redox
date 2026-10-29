@@ -4,9 +4,10 @@ This inventories everything between the current WF830 and a useful "fully oxidiz
 
 The distinction matters:
 
-- **Useful total oxidation:** every host-side component we maintain is open and preferably Rust; mature upstream Linux subsystems remain Linux; ARM1 TK stays firmware.
-- **Zero proprietary executable payloads:** additionally replace TK (and any Wi-Fi firmware). That means reimplementing the LTE modem/PHY and is intentionally outside the practical project.
-- **Literally only Rust ever executes after reset:** impossible in a strict sense because the SoC starts in immutable mask ROM, and pointless if it also means replacing Linux itself. The useful pride target is "all custom ARM0 software is ours and Rust-first."
+- **Modern-Linux oxidation:** every host-side component we maintain is open and preferably Rust; mature upstream Linux subsystems remain Linux; ARM1 TK stays firmware.
+- **Rust-only ARM0 oxidation:** replace Linux and its BSP as well, booting one native BE8 Rust image on ARM0 while retaining TK on ARM1. This is now a first-class target; see [`RUST_ONLY_PLATFORM.md`](RUST_ONLY_PLATFORM.md).
+- **Zero proprietary executable payloads:** additionally replace TK (and any optional Wi-Fi firmware). That means reimplementing the LTE modem/PHY and is intentionally outside the practical project.
+- **Strictly only Rust from reset:** immutable mask ROM can never be replaced. Stock U-Boot can be retained during bring-up and replaced later if desired.
 
 ## Executive result
 
@@ -25,7 +26,9 @@ At a modern OpenWrt end state:
 |---|---|---|
 | Rust userland on stock 3.10 | stock U-Boot + stock kernel/BSP/modules + TK (+ RTL8192E firmware if Wi-Fi used) | Already close; useful compatibility milestone. |
 | Modern OpenWrt + Rust host stack | TK (+ optional RTL8192E firmware); stock U-Boot can initially remain | Practical and bounded. |
-| No proprietary firmware anywhere | none, but requires replacing ARM1 LTE/PHY and likely Wi-Fi microcode | Modem-reimplementation project; not justified. |
+| **Bare-metal BE8 Rust ARM0** | TK (+ stock U-Boot initially; optional RTL8192E firmware) | **Practical and arguably simpler than the Linux port for the pride target.** |
+| Rust bootloader + Rust ARM0 | mask ROM + TK (+ optional Wi-Fi firmware) | Bounded but requires DDR/NAND/boot-ROM handoff work. |
+| No proprietary firmware anywhere | none beyond immutable ROM, but requires replacing ARM1 LTE/PHY and likely Wi-Fi microcode | Modem-reimplementation project; not justified. |
 
 ## Flash inventory
 
@@ -287,19 +290,12 @@ Replacing TK means implementing and validating an LTE Release-10/11 modem stack 
 
 ## Endianness and Rust
 
-Stock ARM0 is BE8. Current nightly Rust on Acer exposes `armeb-unknown-linux-gnueabi` as 32-bit big-endian ARM/Linux, so Rust userspace on the stock kernel is possible in principle with an appropriate libc/link/runtime strategy.
+Stock ARM0 is BE8. Two different targets now have different answers:
 
-Mainline Rust-for-Linux currently supports 32-bit ARM as ARMv7 little-endian. Kernel-side Rust therefore strongly favors changing ARM0 to LE before booting a modern kernel.
+- **Bare-metal Rust:** native BE8 is proven. A custom `armebv7a-none-eabi` target builds `core`/`compiler_builtins`, and `ld.lld --be8` emits an ELF32 ARM EABI5 BE8 executable with big-endian data and little-endian instruction storage. No endian switch is required.
+- **Modern Linux/OpenWrt:** little-endian remains attractive because the kernel/toolchain/Rust-for-Linux ecosystem is built around ARMv7 LE. The old LE trampoline experiment is relevant only to this route.
 
-Highest-value spike:
-
-1. TFTP a tiny payload from stock U-Boot;
-2. switch Cortex-A7 data endianness to LE;
-3. prove UART/RAM/MMIO;
-4. boot a minimal LE zImage/DT/initramfs;
-5. only then commit to Rust platform drivers.
-
-If LE works, this becomes a mostly ordinary ARMv7 OpenWrt target with a small set of GCT-specific drivers.
+See [`RUST_ONLY_PLATFORM.md`](RUST_ONLY_PLATFORM.md) for the verified BE8 toolchain result and bare-metal bring-up plan.
 
 ## Existing public work
 
@@ -315,14 +311,18 @@ Projects such as `patryk4815/openwrt-gdm7243-lte`, plus public B5328, URoad/Home
 
 ## What actually stands between us and the end state
 
-1. **LE boot proof** — architectural fork.
-2. **Minimal SoC support** — DT + IRQ/timer/clock/reset/UART/pinctrl.
-3. **Ethernet** — enough GCT MAC support for a comfortable networked OpenWrt shell.
-4. **GIPC/IPCIF + ARM1 boot** — ~20 KiB IPC core plus useful `modem.ko` semantics, preserving `/dev/glif0`.
-5. **LTE data plane** — replace useful `gdmlte.ko` semantics.
-6. **NAND/ECC + UBI** — normal flash/sysupgrade; defer until TFTP kernel is healthy.
-7. **USB3/SDIO toys** — daughterboard, microSD, better Wi-Fi, extra buses.
-8. **Polish** — PM/watchdog/crash recovery/A-B/upstream-quality drivers/optional bootloader modernization.
+For **modern OpenWrt/Linux**:
+
+1. LE boot proof / modern-kernel architectural choice;
+2. minimal SoC support — DT + IRQ/timer/clock/reset/UART/pinctrl;
+3. Ethernet;
+4. GIPC/IPCIF + ARM1 boot;
+5. **USIM physical controller path**;
+6. LTE data plane;
+7. NAND/ECC + UBI;
+8. optional USB3/SDIO and PM/polish.
+
+For the **Rust-only ARM0** target, the list is smaller and avoids Linux compatibility work: BE8 startup, IRQ/timer/UART, Ethernet, GIPC/ARM1 loader, USIM, NV feed, direct LTE packet path, and a Rust network/router stack. NAND can be deferred behind U-Boot/TFTP. Host `libltesdk.so` confirms LTE uses `/dev/usim` and performs the embedded-host UICC power/ATR/APDU bridge to ARM1, so USIM is a real mandatory dependency rather than legacy WiMAX baggage.
 
 ## Blob scorecard at the useful end state
 
@@ -345,12 +345,15 @@ Thus:
 
 ## Recommended next work
 
-1. **Do the LE trampoline now.**
-2. Generate a SoC/register inventory from the symbolized kernel/Ghidra, grouped by leaked original source file.
-3. Create a minimal modern-kernel/OpenWrt patch stack with UART/IRQ/timer/clock/reset.
-4. TFTP it from stock U-Boot; do not touch NAND until healthy.
-5. Port Ethernet.
-6. Reconstruct GIPC/IPCIF and a minimal ARM1 loader, preserving `/dev/glif0`.
-7. Run current `gctd` against TK unchanged.
-8. Replace `gdmlte` data-path semantics; declare OEM ARM0 dead.
-9. Add USB3/SDIO daughterboard toys.
+For the pride target, start with [`RUST_ONLY_PLATFORM.md`](RUST_ONLY_PLATFORM.md):
+
+1. turn the proven custom BE8 Rust target/linker flags into a checked-in target spec;
+2. generate a compact MMIO/register oracle from the symbolized kernel for UART/IRQ/timer/Ethernet/GIPC/USIM;
+3. TFTP a minimal BE8 Rust image from stock U-Boot and print on UART;
+4. bring up timer/IRQs and Ethernet;
+5. reconstruct GIPC/IPCIF + ARM1 loader and receive the first HCI frame;
+6. implement the USIM transport path;
+7. feed LTE packets directly into a Rust router stack;
+8. add NAND/local boot, then USB3/SDIO toys.
+
+Keep [`FULL_SYSTEM_PORT.md`](FULL_SYSTEM_PORT.md) as the alternative if a conventional OpenWrt environment becomes more valuable than the Rust-only runtime.
