@@ -359,7 +359,7 @@ pub enum MessageDecodeError {
     SdkEnvelopeLengthMismatch { declared: usize, actual: usize },
 }
 
-fn expect_event(packet: Packet<'_>, expected: Event) -> Result<&[u8], MessageDecodeError> {
+const fn expect_event(packet: Packet<'_>, expected: Event) -> Result<&[u8], MessageDecodeError> {
     if packet.header.event != expected as u16 {
         return Err(MessageDecodeError::WrongEvent {
             expected: expected as u16,
