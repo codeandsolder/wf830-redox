@@ -2094,10 +2094,13 @@ Live `LAPI_SetMTUSize` performs no modem send. Its `net_nic_mtuset` helper zeros
 an `ifreq`, `strncpy`s at most 15 interface-name bytes, stores the MTU at the
 `ifreq` union offset, and calls Linux **`SIOCSIFMTU` (`0x8922`)** on the SDK's
 host socket. The Rust bridge therefore emits a typed host action rather than a
-fake HCI packet. Production `gctd` executes the equivalent `ip link set dev ...
-mtu ...` operation without a shell; failure propagates through the stock
-synchronous `lte_api_ret` result. Tests inject the host executor and never alter
-real interfaces.
+fake HCI packet. Production `gctd` applies that action directly with rtnetlink:
+it resolves the interface index, sends `RTM_NEWLINK` with an `IFLA_MTU` u32
+attribute, requires the matching kernel ACK, and preserves a returned kernel
+errno. No iproute2 executable or shell is required. Failure propagates through
+the stock synchronous `lte_api_ret` result. Tests inject the host executor and
+the rtnetlink tests validate request/ACK framing without altering real
+interfaces.
 
 This closes the useful finite compatibility pass without importing diagnostic
 escape hatches (`VendorSpecificHCI`, raw DM controls), eMBMS/CSG feature fossils,

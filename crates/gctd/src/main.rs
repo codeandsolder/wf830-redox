@@ -3,25 +3,22 @@ use std::{
     ffi::OsStr,
     fs::File,
     io::{self, Read},
-    os::{
-        fd::AsFd,
-        unix::{ffi::OsStrExt, net::UnixDatagram},
-    },
-    process::{Command, ExitCode},
+    os::{fd::AsFd, unix::net::UnixDatagram},
+    process::ExitCode,
     sync::mpsc,
     thread::{self, JoinHandle},
 };
 
-mod ipv6_prefix;
+mod rtnetlink;
 
 use gct_runtime::{
     Modem, StartupInterface, decode_event, discover_startup_interface, verify_startup_interface,
 };
 use gct_transport::{HciStreamDecoder, OEM_READ_BUFFER_LEN};
-use ipv6_prefix::{Ipv6PrefixSource, interface_name};
 use lted_bridge::{DeviceBridge, HostAction};
 use lted_compat::{Error as CompatError, Server};
 use lted_proto::{Event, Packet, SdkApiRequest, parse_api_close};
+use rtnetlink::{Ipv6PrefixSource, interface_name, set_link_mtu};
 use rustix::event::{PollFd, PollFlags, poll};
 
 const LOCAL_FRAME_MAX: usize = 4 + 65_535;
@@ -386,22 +383,7 @@ fn handle_client_datagram(
 
 fn execute_host_action(action: HostAction) -> io::Result<()> {
     match action {
-        HostAction::SetMtu { mtu, .. } => {
-            let interface_name = OsStr::from_bytes(action.interface_name_bytes());
-            let status = Command::new("/sbin/ip")
-                .args([OsStr::new("link"), OsStr::new("set"), OsStr::new("dev")])
-                .arg(interface_name)
-                .arg("mtu")
-                .arg(mtu.to_string())
-                .status()?;
-            if status.success() {
-                Ok(())
-            } else {
-                Err(io::Error::other(format!(
-                    "ip link set mtu {mtu} exited with {status}"
-                )))
-            }
-        }
+        HostAction::SetMtu { mtu, .. } => set_link_mtu(action.interface_name_bytes(), mtu),
     }
 }
 
