@@ -11,9 +11,10 @@ use gct_hci::{
     encode_packet, public_opcode, recovered_opcode,
 };
 
-/// The two outer container tags consumed by the OEM `ATTACH_PDN_RSP_INFO`
-/// parser. The SDK accepts either tag in either of its two container slots and
-/// dispatches their contents through the same inner field table.
+/// Outer container tags consumed by the OEM `ATTACH_PDN_RSP_INFO` parser.
+///
+/// The SDK accepts either tag in either of its two container slots and dispatches
+/// their contents through the same inner field table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PdnInfoContainerKind {
     F0,
@@ -41,7 +42,7 @@ pub struct PdnInfoContainer<'a> {
 impl<'a> PdnInfoContainer<'a> {
     /// Cursor over the inner `[type,len,payload]` fields.
     #[must_use]
-    pub fn fields(self) -> TlvCursor<'a> {
+    pub const fn fields(self) -> TlvCursor<'a> {
         self.fields
     }
 }
@@ -233,7 +234,7 @@ pub enum ResponseDecodeError {
     TruncatedPrefix { minimum: usize, actual: usize },
 }
 
-fn response_payload(
+const fn response_payload(
     packet: Packet<'_>,
     expected_opcode: u16,
 ) -> Result<&[u8], ResponseDecodeError> {
@@ -1054,7 +1055,7 @@ fn required_pdn_tlv<'a>(
         .ok_or(PdnResponseDecodeError::MissingField(field))
 }
 
-fn exact_pdn_field(
+const fn exact_pdn_field(
     field: PdnResponseField,
     payload: &[u8],
     expected: usize,
@@ -1069,7 +1070,7 @@ fn exact_pdn_field(
     Ok(())
 }
 
-fn bounded_pdn_field(
+const fn bounded_pdn_field(
     field: PdnResponseField,
     payload: &[u8],
     maximum: usize,
@@ -1181,7 +1182,7 @@ impl<'a> PdnConnectTailField<'a> {
     /// Return the inner TLV cursor for the descriptor-managed extra PDN-info
     /// field. Other tail variants have no nested PDN payload.
     #[must_use]
-    pub fn pdn_info_fields(self) -> Option<TlvCursor<'a>> {
+    pub const fn pdn_info_fields(self) -> Option<TlvCursor<'a>> {
         match self {
             Self::PdnInfo(bytes) => Some(TlvCursor::new(bytes)),
             Self::Ipv4LinkMtu(_)
@@ -1909,14 +1910,14 @@ impl PlmnSearchExtRequest<'_> {
                     return Err(PlmnSearchExtEncodeError::UnsupportedElementType { index, kind });
                 }
             };
-            let body_len = count.checked_mul(item_width).ok_or(
+            let body_len = count.checked_mul(item_width).ok_or_else(|| {
                 PlmnSearchExtEncodeError::TruncatedElement {
                     index,
                     kind,
                     expected: usize::MAX,
                     remaining: remaining.saturating_sub(2),
-                },
-            )?;
+                }
+            })?;
             let element_len = 2_usize.checked_add(body_len).ok_or(
                 PlmnSearchExtEncodeError::TruncatedElement {
                     index,
@@ -2038,6 +2039,10 @@ impl TemperatureReadRequest {
     ///
     /// # Errors
     /// Returns [`EncodeError::NoSpace`] when `output` is shorter than eight bytes.
+    #[expect(
+        clippy::unused_self,
+        reason = "zero-sized request keeps the uniform value-based ModemCommand encode interface"
+    )]
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
         encode_packet(
             recovered_opcode::MISC_READ_REQUEST,
@@ -2066,6 +2071,10 @@ impl IccidReadRequest {
     ///
     /// # Errors
     /// Returns [`EncodeError::NoSpace`] when `output` is shorter than eight bytes.
+    #[expect(
+        clippy::unused_self,
+        reason = "zero-sized request keeps the uniform value-based ModemCommand encode interface"
+    )]
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
         encode_packet(
             recovered_opcode::MISC_READ_REQUEST,
@@ -2095,6 +2104,10 @@ impl MsisdnReadRequest {
     /// # Errors
     /// Returns [`EncodeError::NoSpace`] when `output` is shorter than eight
     /// bytes.
+    #[expect(
+        clippy::unused_self,
+        reason = "zero-sized request keeps the uniform value-based ModemCommand encode interface"
+    )]
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
         encode_packet(
             recovered_opcode::MISC_READ_REQUEST,
@@ -2250,7 +2263,7 @@ fn parse_iccid_chunk(
     }))
 }
 
-fn parse_temperature_chunk(
+const fn parse_temperature_chunk(
     read_result: u16,
     body: &[u8],
 ) -> Result<MiscReadResponse<'_>, MiscReadDecodeError> {
@@ -2366,6 +2379,10 @@ impl<'a> MiscReadResponse<'a> {
 
 /// EMM timer-control request carried by shared command `0x3155` discriminator 7.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "timer_* names preserve the recovered EMM timer wire-field terminology"
+)]
 pub struct EmmTimerControlRequest {
     pub timer_id: u16,
     pub timer_value_unit: u8,
@@ -2566,10 +2583,11 @@ fn parse_emm_control_envelope(
     Ok((be_u16(payload, 0), be_u16(payload, 2), be_u32(payload, 6)))
 }
 
-/// Shared `0xb156` control response. Live P4 only wires discriminator 11 to the
-/// NI-reattach stock callback; discriminators 7 (timer), 8 (PSM), 9 (LCS), and
-/// 10 (LPP), and 13 (timer start) are deliberately dropped by the SDK switch and remain
-/// [`Self::Unsupported`].
+/// Shared `0xb156` control response.
+///
+/// Live P4 only wires discriminator 11 to the NI-reattach stock callback;
+/// discriminators 7 (timer), 8 (PSM), 9 (LCS), 10 (LPP), and 13 (timer start)
+/// are deliberately dropped by the SDK switch and remain [`Self::Unsupported`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmmControlResponse {
     NiReattach { result: u32 },
@@ -2908,7 +2926,7 @@ impl<'a> UiccFixedRequest<'a> {
     /// # Errors
     /// Returns [`UiccFixedRequestError::UnexpectedLength`] unless `data` is
     /// exactly the recovered 36-byte subtype width.
-    pub fn authenticate(data: &'a [u8]) -> Result<Self, UiccFixedRequestError> {
+    pub const fn authenticate(data: &'a [u8]) -> Result<Self, UiccFixedRequestError> {
         Self::new(uicc_control::AUTHENTICATE, 36, data)
     }
 
@@ -2917,11 +2935,15 @@ impl<'a> UiccFixedRequest<'a> {
     /// # Errors
     /// Returns [`UiccFixedRequestError::UnexpectedLength`] unless `data` is
     /// exactly the recovered 20-byte subtype width.
-    pub fn pin_command(data: &'a [u8]) -> Result<Self, UiccFixedRequestError> {
+    pub const fn pin_command(data: &'a [u8]) -> Result<Self, UiccFixedRequestError> {
         Self::new(uicc_control::PIN_COMMAND, 20, data)
     }
 
-    fn new(kind: u16, expected: usize, data: &'a [u8]) -> Result<Self, UiccFixedRequestError> {
+    const fn new(
+        kind: u16,
+        expected: usize,
+        data: &'a [u8],
+    ) -> Result<Self, UiccFixedRequestError> {
         if data.len() != expected {
             return Err(UiccFixedRequestError::UnexpectedLength {
                 kind,
@@ -3089,12 +3111,12 @@ impl<'a> UiccReadRecordResponse<'a> {
         let record_len = usize::from(response.data[9]);
         let record_count = usize::from(response.data[10]);
         let expected = if response.data[8] == 0 {
-            record_len.checked_mul(record_count).ok_or(
+            record_len.checked_mul(record_count).ok_or_else(|| {
                 UiccFileDecodeError::EmbeddedLengthMismatch {
                     declared: usize::MAX,
                     actual: response.data.len().saturating_sub(11),
-                },
-            )?
+                }
+            })?
         } else {
             record_len
         };
@@ -3334,6 +3356,10 @@ impl UiccPinStatusRequest {
     /// # Errors
     /// Returns [`EncodeError::NoSpace`] when `output` is shorter than eight
     /// bytes.
+    #[expect(
+        clippy::unused_self,
+        reason = "zero-sized request keeps the uniform value-based ModemCommand encode interface"
+    )]
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
         encode_uicc_request(uicc_control::PIN_STATUS, &[], output)
     }
@@ -3419,9 +3445,11 @@ fn encode_pin_data(pin: PinData<'_>, output: &mut [u8; 9]) -> Result<(), UiccPin
     Ok(())
 }
 
-/// UICC PIN command (`type 6`). `pin_type` and `pin_command` are intentionally
-/// kept as recovered wire values: the available DWARF names the fields but
-/// does not provide a trustworthy enum for their value domain.
+/// UICC PIN command (`type 6`).
+///
+/// `pin_type` and `pin_command` are intentionally kept as recovered wire values:
+/// the available DWARF names the fields but does not provide a trustworthy enum
+/// for their value domain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UiccPinCommandRequest<'a> {
     pub pin_type: u8,
@@ -3571,6 +3599,10 @@ impl NasConfigGetRequest {
     ///
     /// # Errors
     /// Returns [`EncodeError::NoSpace`] when `output` is shorter than four bytes.
+    #[expect(
+        clippy::unused_self,
+        reason = "zero-sized request keeps the uniform value-based ModemCommand encode interface"
+    )]
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
         encode_packet(recovered_opcode::NAS_CONFIG_GET_REQUEST, &[], output)
     }
@@ -3585,6 +3617,10 @@ impl DeviceInformationRequest {
     ///
     /// # Errors
     /// Returns `EncodeError::NoSpace` when output is shorter than the HCI header.
+    #[expect(
+        clippy::unused_self,
+        reason = "zero-sized request keeps the uniform value-based ModemCommand encode interface"
+    )]
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
         encode_packet(public_opcode::LTE_GET_INFORMATION, &[], output)
     }
@@ -3974,7 +4010,7 @@ pub struct AttachExtRequest<'a> {
 }
 
 impl AttachExtRequest<'_> {
-    fn validate_profile(
+    const fn validate_profile(
         profile: AttachExtProfile<'_>,
         apn: AttachExtField,
         username: AttachExtField,
@@ -4061,6 +4097,10 @@ impl AttachExtRequest<'_> {
 /// The old C structure is nine bytes. The three 16-bit protocol identifiers are
 /// converted to device byte order before the block is sent as TLV `0x21`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "*_pco names preserve the recovered packet-configuration field terminology"
+)]
 pub struct PcoInfo {
     pub first_pco: u8,
     pub second_pco: u8,

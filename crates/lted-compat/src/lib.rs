@@ -60,6 +60,17 @@ pub struct OpenedClient {
     pub socket_path: PathBuf,
 }
 
+/// Identity state for one compatibility client slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientIdentityState {
+    /// No client currently occupies this slot.
+    Vacant,
+    /// A client is open but used the accepted zero-length identity form.
+    Anonymous,
+    /// A client is open with the recovered 16-bit identity value.
+    Identified(u16),
+}
+
 struct Client {
     identity: Option<u16>,
     socket_path: PathBuf,
@@ -139,12 +150,16 @@ impl Server {
             .collect()
     }
 
+    /// Return the identity state of one client slot.
     #[must_use]
-    pub fn client_identity(&self, id: u8) -> Option<Option<u16>> {
-        self.clients
-            .get(usize::from(id))
-            .and_then(Option::as_ref)
-            .map(|client| client.identity)
+    pub fn client_identity(&self, id: u8) -> ClientIdentityState {
+        let Some(client) = self.clients.get(usize::from(id)).and_then(Option::as_ref) else {
+            return ClientIdentityState::Vacant;
+        };
+        client.identity.map_or(
+            ClientIdentityState::Anonymous,
+            ClientIdentityState::Identified,
+        )
     }
 
     #[must_use]
@@ -354,7 +369,7 @@ mod tests {
 
     use lted_proto::{ApiOpenRequest, ApiOpenResponse, Packet};
 
-    use super::{MAX_CLIENTS, REJECTED_CLIENT_ID, Server, private_path};
+    use super::{ClientIdentityState, MAX_CLIENTS, REJECTED_CLIENT_ID, Server, private_path};
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -479,7 +494,10 @@ mod tests {
         let (client, _client_path, id, source_path) = open_client(&mut server, &dir, 0, 0x1234);
         assert_eq!(id, 0);
         assert_eq!(source_path, private_path(&prefix, id));
-        assert_eq!(server.client_identity(id), Some(Some(0x1234)));
+        assert_eq!(
+            server.client_identity(id),
+            ClientIdentityState::Identified(0x1234)
+        );
         assert_eq!(server.client_count(), 1);
         let context = server
             .client_context(id)

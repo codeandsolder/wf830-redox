@@ -81,7 +81,7 @@ impl std::str::FromStr for StartupInterface {
         if pdn_index != 0 {
             return Err(ParseStartupInterfaceError);
         }
-        Ok(StartupInterface {
+        Ok(Self {
             name: name.to_owned(),
             modem_index,
         })

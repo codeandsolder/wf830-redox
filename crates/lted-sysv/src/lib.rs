@@ -37,6 +37,7 @@ impl ClientContext {
     /// # Errors
     /// Returns an OS error from `ftok`, `shmget`, `semget`, `shmat`, or
     /// `semctl(SETALL)`. Partially-created resources are removed before return.
+    #[expect(unsafe_code, reason = "calls the audited SysV shm/sem attachment FFI")]
     pub fn create(seed_path: &Path, client_id: u8) -> io::Result<Self> {
         let key = key_for(seed_path, client_id)?;
         // SAFETY: `shmget` has no pointer preconditions; `key`, size, and flags are plain values.
@@ -113,6 +114,10 @@ impl ClientContext {
     ///
     /// # Errors
     /// Returns `InvalidInput` when `offset + data.len()` exceeds `0x9780`.
+    #[expect(
+        unsafe_code,
+        reason = "copies into the attached SysV shared-memory mapping"
+    )]
     pub fn write(&mut self, offset: usize, data: &[u8]) -> io::Result<()> {
         let range = checked_range(offset, data.len())?;
         // SAFETY: `checked_range` proves the destination range lies inside the attached mapping;
@@ -135,6 +140,10 @@ impl ClientContext {
     ///
     /// # Errors
     /// Returns `InvalidInput` when `offset + output.len()` exceeds `0x9780`.
+    #[expect(
+        unsafe_code,
+        reason = "copies out of the attached SysV shared-memory mapping"
+    )]
     pub fn read(&self, offset: usize, output: &mut [u8]) -> io::Result<()> {
         let range = checked_range(offset, output.len())?;
         // SAFETY: `checked_range` proves the source range lies inside the attached mapping;
@@ -176,6 +185,10 @@ impl ClientContext {
         self.write(offset, &value.to_be_bytes())
     }
 
+    #[expect(
+        unsafe_code,
+        reason = "initializes the SysV semaphore set through semctl"
+    )]
     fn set_all_zero(&self) -> io::Result<()> {
         let mut values = [0_u16; 2];
         let arg = Semun {
@@ -186,6 +199,7 @@ impl ClientContext {
         cvt_zero(result)
     }
 
+    #[expect(unsafe_code, reason = "executes the recovered SysV semaphore protocol")]
     fn semop(&self, ops: &mut [libc::sembuf]) -> io::Result<()> {
         // SAFETY: `ops` provides exactly `ops.len()` initialized `sembuf` entries.
         let result = unsafe { libc::semop(self.semid, ops.as_mut_ptr(), ops.len()) };
@@ -194,6 +208,7 @@ impl ClientContext {
 }
 
 impl Drop for ClientContext {
+    #[expect(unsafe_code, reason = "detaches the owned SysV shared-memory mapping")]
     fn drop(&mut self) {
         // SAFETY: `address` is the still-attached pointer returned by `shmat` during construction.
         unsafe {
@@ -209,6 +224,7 @@ impl Drop for ClientContext {
 /// # Errors
 /// Returns `InvalidInput` for a pathname containing NUL, or the OS error from
 /// `ftok`.
+#[expect(unsafe_code, reason = "derives the OEM SysV IPC key through ftok")]
 pub fn key_for(seed_path: &Path, client_id: u8) -> io::Result<libc::key_t> {
     let path = CString::new(seed_path.as_os_str().as_bytes()).map_err(|_| {
         io::Error::new(
@@ -262,6 +278,7 @@ fn cvt_zero(result: libc::c_int) -> io::Result<()> {
     }
 }
 
+#[expect(unsafe_code, reason = "removes an owned SysV shared-memory segment")]
 fn remove_shm(shmid: libc::c_int) {
     // SAFETY: `IPC_RMID` does not dereference the null metadata pointer; invalid IDs just fail.
     unsafe {
@@ -269,6 +286,7 @@ fn remove_shm(shmid: libc::c_int) {
     }
 }
 
+#[expect(unsafe_code, reason = "removes an owned SysV semaphore set")]
 fn remove_sem(semid: libc::c_int) {
     // SAFETY: `IPC_RMID` takes no variadic argument; invalid semaphore IDs just fail.
     unsafe {
@@ -312,7 +330,12 @@ mod tests {
         }
     }
 
+    #[expect(
+        unsafe_code,
+        reason = "test probes the SysV semaphore value through semctl"
+    )]
     fn sem_value(semid: libc::c_int, number: libc::c_int) -> libc::c_int {
+        // SAFETY: `semid` names the live test semaphore set and GETVAL reads one existing slot.
         let value = unsafe { libc::semctl(semid, number, libc::GETVAL) };
         if value < 0 {
             std::process::abort();
@@ -320,16 +343,26 @@ mod tests {
         value
     }
 
+    #[expect(
+        unsafe_code,
+        reason = "test emulates the stock client SysV semop sequence"
+    )]
     fn client_wait(context: &ClientContext) {
         let mut ops = [sembuf(1, -1, 0), sembuf(0, 1, SEM_UNDO_FLAG)];
+        // SAFETY: `ops` is a live mutable array for this call and `semid` belongs to `context`.
         let result = unsafe { libc::semop(context.semid(), ops.as_mut_ptr(), ops.len()) };
         if result != 0 {
             std::process::abort();
         }
     }
 
+    #[expect(
+        unsafe_code,
+        reason = "test emulates the stock client SysV semop completion"
+    )]
     fn client_done(context: &ClientContext) {
         let mut ops = [sembuf(0, -1, SEM_UNDO_FLAG)];
+        // SAFETY: `ops` is a live mutable array for this call and `semid` belongs to `context`.
         let result = unsafe { libc::semop(context.semid(), ops.as_mut_ptr(), ops.len()) };
         if result != 0 {
             std::process::abort();
@@ -337,11 +370,17 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "test verifies stock SysV lookup calls discover the created resources"
+    )]
     fn resources_are_discoverable_by_the_stock_lookup_flags() {
         let seed = Seed::new();
         let context = ClientContext::create(&seed.0, 7).unwrap_or_else(|_| std::process::abort());
         let key = key_for(&seed.0, 7).unwrap_or_else(|_| std::process::abort());
+        // SAFETY: lookup-only call for the key just created by `ClientContext`; no pointer is passed.
         let shared_memory_lookup = unsafe { libc::shmget(key, SHARED_CONTEXT_LEN, 0) };
+        // SAFETY: lookup-only call for the key just created by `ClientContext`; no pointer is passed.
         let semaphore_lookup = unsafe { libc::semget(key, 2, 0o666) };
         assert_eq!(shared_memory_lookup, context.shmid());
         assert_eq!(semaphore_lookup, context.semid());
