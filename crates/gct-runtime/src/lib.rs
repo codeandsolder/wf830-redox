@@ -81,7 +81,7 @@ impl std::str::FromStr for StartupInterface {
         if pdn_index != 0 {
             return Err(ParseStartupInterfaceError);
         }
-        Ok(StartupInterface {
+        Ok(Self {
             name: name.to_owned(),
             modem_index,
         })
@@ -585,9 +585,9 @@ pub fn encode_command(
         ModemCommand::PlmnSearchExt(request) => Ok(request.encode(output)?),
         ModemCommand::PlmnSearchStop(request) => Ok(request.encode(output)?),
         ModemCommand::MobileIdRead(request) => Ok(request.encode(output)?),
-        ModemCommand::IccidRead(request) => Ok(request.encode(output)?),
-        ModemCommand::MsisdnRead(request) => Ok(request.encode(output)?),
-        ModemCommand::TemperatureRead(request) => Ok(request.encode(output)?),
+        ModemCommand::IccidRead(_) => Ok(IccidReadRequest::encode(output)?),
+        ModemCommand::MsisdnRead(_) => Ok(MsisdnReadRequest::encode(output)?),
+        ModemCommand::TemperatureRead(_) => Ok(TemperatureReadRequest::encode(output)?),
         ModemCommand::UeModeChange(request) => Ok(request.encode(output)?),
         ModemCommand::EmmTimerControl(request) => Ok(request.encode(output)?),
         ModemCommand::EmmTimerStart(request) => Ok(request.encode(output)?),
@@ -603,14 +603,14 @@ pub fn encode_command(
         ModemCommand::UiccReadBinary(request) => Ok(request.encode(output)?),
         ModemCommand::UiccReadRecord(request) => Ok(request.encode(output)?),
         ModemCommand::UiccAuthenticate(request) => Ok(request.encode(output)?),
-        ModemCommand::UiccPinStatus(request) => Ok(request.encode(output)?),
+        ModemCommand::UiccPinStatus(_) => Ok(UiccPinStatusRequest::encode(output)?),
         ModemCommand::UiccPinCommand(request) => Ok(request.encode(output)?),
         ModemCommand::RrcCapabilitySet(request) => Ok(request.encode(output)?),
         ModemCommand::RrcCapabilityGet(request) => Ok(request.encode(output)?),
         ModemCommand::SetProtocolInfo(request) => Ok(request.encode(output)?),
-        ModemCommand::DeviceInformation(request) => Ok(request.encode(output)?),
+        ModemCommand::DeviceInformation(_) => Ok(DeviceInformationRequest::encode(output)?),
         ModemCommand::NasConfigSet(request) => Ok(request.encode(output)?),
-        ModemCommand::NasConfigGet(request) => Ok(request.encode(output)?),
+        ModemCommand::NasConfigGet(_) => Ok(NasConfigGetRequest::encode(output)?),
     }
 }
 
@@ -1084,12 +1084,12 @@ mod tests {
             password: b"",
             auth_flag: 0,
             pco: PcoInfo {
-                first_pco: 0,
-                second_pco: 0,
-                n_pco: 0,
-                first_os_pco: 0,
-                second_os_pco: 0,
-                third_os_pco: 0,
+                first: 0,
+                second: 0,
+                count: 0,
+                first_os: 0,
+                second_os: 0,
+                third_os: 0,
             },
         };
         let request = AttachExtRequest {
@@ -1325,9 +1325,9 @@ mod tests {
         assert_eq!(
             encode_command(
                 ModemCommand::EmmTimerControl(EmmTimerControlRequest {
-                    timer_id: 0x1234,
-                    timer_value_unit: 5,
-                    timer_value: 6,
+                    id: 0x1234,
+                    value_unit: 5,
+                    value: 6,
                 }),
                 &mut timer_bytes,
             ),
@@ -1341,9 +1341,9 @@ mod tests {
         );
         assert_eq!(
             ModemCommand::EmmTimerControl(EmmTimerControlRequest {
-                timer_id: 1,
-                timer_value_unit: 2,
-                timer_value: 3,
+                id: 1,
+                value_unit: 2,
+                value: 3,
             })
             .response_key(),
             None

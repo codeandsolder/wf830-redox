@@ -313,6 +313,8 @@ mod tests {
     }
 
     fn sem_value(semid: libc::c_int, number: libc::c_int) -> libc::c_int {
+        // SAFETY: GETVAL is a scalar-only semctl operation; the test passes an existing
+        // semaphore-set ID and a valid semaphore index, with no pointer argument.
         let value = unsafe { libc::semctl(semid, number, libc::GETVAL) };
         if value < 0 {
             std::process::abort();
@@ -322,6 +324,8 @@ mod tests {
 
     fn client_wait(context: &ClientContext) {
         let mut ops = [sembuf(1, -1, 0), sembuf(0, 1, SEM_UNDO_FLAG)];
+        // SAFETY: `context` owns a live semaphore set and `ops` remains allocated and
+        // mutable for exactly `ops.len()` entries for the duration of the syscall.
         let result = unsafe { libc::semop(context.semid(), ops.as_mut_ptr(), ops.len()) };
         if result != 0 {
             std::process::abort();
@@ -330,6 +334,8 @@ mod tests {
 
     fn client_done(context: &ClientContext) {
         let mut ops = [sembuf(0, -1, SEM_UNDO_FLAG)];
+        // SAFETY: `context` owns a live semaphore set and `ops` remains allocated and
+        // mutable for exactly `ops.len()` entries for the duration of the syscall.
         let result = unsafe { libc::semop(context.semid(), ops.as_mut_ptr(), ops.len()) };
         if result != 0 {
             std::process::abort();
@@ -341,7 +347,9 @@ mod tests {
         let seed = Seed::new();
         let context = ClientContext::create(&seed.0, 7).unwrap_or_else(|_| std::process::abort());
         let key = key_for(&seed.0, 7).unwrap_or_else(|_| std::process::abort());
+        // SAFETY: shmget takes only scalar values here; no borrowed memory crosses FFI.
         let shared_memory_lookup = unsafe { libc::shmget(key, SHARED_CONTEXT_LEN, 0) };
+        // SAFETY: semget likewise takes only scalar values and performs a lookup only.
         let semaphore_lookup = unsafe { libc::semget(key, 2, 0o666) };
         assert_eq!(shared_memory_lookup, context.shmid());
         assert_eq!(semaphore_lookup, context.semid());
