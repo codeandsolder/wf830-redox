@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -20,5 +21,7 @@ jobs:
       rust-components: "rustfmt clippy"
       command: |
         cargo +1.99.1 fmt --all -- --check
-        cargo +1.99.1 test --locked --workspace --all-features
+        git diff --check
         cargo +1.99.1 clippy --locked --workspace --all-targets --all-features -- -D warnings
+        cargo +1.99.1 test --locked --workspace --all-features
+        RUSTDOCFLAGS="-D warnings" cargo +1.99.1 doc --locked --workspace --all-features --no-deps
