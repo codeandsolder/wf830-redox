@@ -9,9 +9,6 @@ license.workspace = true
 libc = "0.2"
 lted-proto = { path = "../lted-proto" }
 
-[lints.rust]
-unsafe_code = "allow"
-
 [lints.clippy]
 all = "deny"
 pedantic = { level = "warn", priority = -1 }

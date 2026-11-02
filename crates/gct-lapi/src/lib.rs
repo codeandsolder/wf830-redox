@@ -12,7 +12,9 @@ use gct_hci::{
 };
 
 /// The two outer container tags consumed by the OEM `ATTACH_PDN_RSP_INFO`
-/// parser. The SDK accepts either tag in either of its two container slots and
+/// parser.
+///
+/// The SDK accepts either tag in either of its two container slots and
 /// dispatches their contents through the same inner field table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PdnInfoContainerKind {
@@ -41,7 +43,7 @@ pub struct PdnInfoContainer<'a> {
 impl<'a> PdnInfoContainer<'a> {
     /// Cursor over the inner `[type,len,payload]` fields.
     #[must_use]
-    pub fn fields(self) -> TlvCursor<'a> {
+    pub const fn fields(self) -> TlvCursor<'a> {
         self.fields
     }
 }
@@ -233,7 +235,7 @@ pub enum ResponseDecodeError {
     TruncatedPrefix { minimum: usize, actual: usize },
 }
 
-fn response_payload(
+const fn response_payload(
     packet: Packet<'_>,
     expected_opcode: u16,
 ) -> Result<&[u8], ResponseDecodeError> {
@@ -1054,7 +1056,7 @@ fn required_pdn_tlv<'a>(
         .ok_or(PdnResponseDecodeError::MissingField(field))
 }
 
-fn exact_pdn_field(
+const fn exact_pdn_field(
     field: PdnResponseField,
     payload: &[u8],
     expected: usize,
@@ -1069,7 +1071,7 @@ fn exact_pdn_field(
     Ok(())
 }
 
-fn bounded_pdn_field(
+const fn bounded_pdn_field(
     field: PdnResponseField,
     payload: &[u8],
     maximum: usize,
@@ -1181,7 +1183,7 @@ impl<'a> PdnConnectTailField<'a> {
     /// Return the inner TLV cursor for the descriptor-managed extra PDN-info
     /// field. Other tail variants have no nested PDN payload.
     #[must_use]
-    pub fn pdn_info_fields(self) -> Option<TlvCursor<'a>> {
+    pub const fn pdn_info_fields(self) -> Option<TlvCursor<'a>> {
         match self {
             Self::PdnInfo(bytes) => Some(TlvCursor::new(bytes)),
             Self::Ipv4LinkMtu(_)
@@ -1909,14 +1911,14 @@ impl PlmnSearchExtRequest<'_> {
                     return Err(PlmnSearchExtEncodeError::UnsupportedElementType { index, kind });
                 }
             };
-            let body_len = count.checked_mul(item_width).ok_or(
+            let body_len = count.checked_mul(item_width).ok_or_else(|| {
                 PlmnSearchExtEncodeError::TruncatedElement {
                     index,
                     kind,
                     expected: usize::MAX,
                     remaining: remaining.saturating_sub(2),
-                },
-            )?;
+                }
+            })?;
             let element_len = 2_usize.checked_add(body_len).ok_or(
                 PlmnSearchExtEncodeError::TruncatedElement {
                     index,
@@ -2038,7 +2040,7 @@ impl TemperatureReadRequest {
     ///
     /// # Errors
     /// Returns [`EncodeError::NoSpace`] when `output` is shorter than eight bytes.
-    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+    pub fn encode(output: &mut [u8]) -> Result<usize, EncodeError> {
         encode_packet(
             recovered_opcode::MISC_READ_REQUEST,
             &[0x00, 0x04, 0x00, 0x00],
@@ -2066,7 +2068,7 @@ impl IccidReadRequest {
     ///
     /// # Errors
     /// Returns [`EncodeError::NoSpace`] when `output` is shorter than eight bytes.
-    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+    pub fn encode(output: &mut [u8]) -> Result<usize, EncodeError> {
         encode_packet(
             recovered_opcode::MISC_READ_REQUEST,
             &[0x00, 0x02, 0x00, 0x00],
@@ -2095,7 +2097,7 @@ impl MsisdnReadRequest {
     /// # Errors
     /// Returns [`EncodeError::NoSpace`] when `output` is shorter than eight
     /// bytes.
-    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+    pub fn encode(output: &mut [u8]) -> Result<usize, EncodeError> {
         encode_packet(
             recovered_opcode::MISC_READ_REQUEST,
             &[0x00, 0x03, 0x00, 0x00],
@@ -2250,7 +2252,7 @@ fn parse_iccid_chunk(
     }))
 }
 
-fn parse_temperature_chunk(
+const fn parse_temperature_chunk(
     read_result: u16,
     body: &[u8],
 ) -> Result<MiscReadResponse<'_>, MiscReadDecodeError> {
@@ -2367,19 +2369,19 @@ impl<'a> MiscReadResponse<'a> {
 /// EMM timer-control request carried by shared command `0x3155` discriminator 7.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EmmTimerControlRequest {
-    pub timer_id: u16,
-    pub timer_value_unit: u8,
-    pub timer_value: u8,
+    pub id: u16,
+    pub value_unit: u8,
+    pub value: u8,
 }
 
 impl EmmTimerControlRequest {
     /// Encode the exact eight-byte live-P4 payload
-    /// `00 07 00 04 <timer_id:u16> <unit:u8> <value:u8>`.
+    /// `00 07 00 04 <id:u16> <unit:u8> <value:u8>`.
     ///
     /// # Errors
     /// Returns [`EncodeError::NoSpace`] when `output` is shorter than 12 bytes.
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
-        let timer_id = self.timer_id.to_be_bytes();
+        let id = self.id.to_be_bytes();
         encode_packet(
             recovered_opcode::EMM_CONTROL_REQUEST,
             &[
@@ -2387,10 +2389,10 @@ impl EmmTimerControlRequest {
                 0x07,
                 0x00,
                 0x04,
-                timer_id[0],
-                timer_id[1],
-                self.timer_value_unit,
-                self.timer_value,
+                id[0],
+                id[1],
+                self.value_unit,
+                self.value,
             ],
             output,
         )
@@ -2566,10 +2568,11 @@ fn parse_emm_control_envelope(
     Ok((be_u16(payload, 0), be_u16(payload, 2), be_u32(payload, 6)))
 }
 
-/// Shared `0xb156` control response. Live P4 only wires discriminator 11 to the
-/// NI-reattach stock callback; discriminators 7 (timer), 8 (PSM), 9 (LCS), and
-/// 10 (LPP), and 13 (timer start) are deliberately dropped by the SDK switch and remain
-/// [`Self::Unsupported`].
+/// Shared `0xb156` control response.
+///
+/// Live P4 only wires discriminator 11 to the NI-reattach stock callback;
+/// discriminators 7 (timer), 8 (PSM), 9 (LCS), 10 (LPP), and 13 (timer start)
+/// are deliberately dropped by the SDK switch and remain [`Self::Unsupported`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmmControlResponse {
     NiReattach { result: u32 },
@@ -2908,7 +2911,7 @@ impl<'a> UiccFixedRequest<'a> {
     /// # Errors
     /// Returns [`UiccFixedRequestError::UnexpectedLength`] unless `data` is
     /// exactly the recovered 36-byte subtype width.
-    pub fn authenticate(data: &'a [u8]) -> Result<Self, UiccFixedRequestError> {
+    pub const fn authenticate(data: &'a [u8]) -> Result<Self, UiccFixedRequestError> {
         Self::new(uicc_control::AUTHENTICATE, 36, data)
     }
 
@@ -2917,11 +2920,15 @@ impl<'a> UiccFixedRequest<'a> {
     /// # Errors
     /// Returns [`UiccFixedRequestError::UnexpectedLength`] unless `data` is
     /// exactly the recovered 20-byte subtype width.
-    pub fn pin_command(data: &'a [u8]) -> Result<Self, UiccFixedRequestError> {
+    pub const fn pin_command(data: &'a [u8]) -> Result<Self, UiccFixedRequestError> {
         Self::new(uicc_control::PIN_COMMAND, 20, data)
     }
 
-    fn new(kind: u16, expected: usize, data: &'a [u8]) -> Result<Self, UiccFixedRequestError> {
+    const fn new(
+        kind: u16,
+        expected: usize,
+        data: &'a [u8],
+    ) -> Result<Self, UiccFixedRequestError> {
         if data.len() != expected {
             return Err(UiccFixedRequestError::UnexpectedLength {
                 kind,
@@ -3089,12 +3096,12 @@ impl<'a> UiccReadRecordResponse<'a> {
         let record_len = usize::from(response.data[9]);
         let record_count = usize::from(response.data[10]);
         let expected = if response.data[8] == 0 {
-            record_len.checked_mul(record_count).ok_or(
+            record_len.checked_mul(record_count).ok_or_else(|| {
                 UiccFileDecodeError::EmbeddedLengthMismatch {
                     declared: usize::MAX,
                     actual: response.data.len().saturating_sub(11),
-                },
-            )?
+                }
+            })?
         } else {
             record_len
         };
@@ -3334,7 +3341,7 @@ impl UiccPinStatusRequest {
     /// # Errors
     /// Returns [`EncodeError::NoSpace`] when `output` is shorter than eight
     /// bytes.
-    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+    pub fn encode(output: &mut [u8]) -> Result<usize, EncodeError> {
         encode_uicc_request(uicc_control::PIN_STATUS, &[], output)
     }
 }
@@ -3419,9 +3426,11 @@ fn encode_pin_data(pin: PinData<'_>, output: &mut [u8; 9]) -> Result<(), UiccPin
     Ok(())
 }
 
-/// UICC PIN command (`type 6`). `pin_type` and `pin_command` are intentionally
-/// kept as recovered wire values: the available DWARF names the fields but
-/// does not provide a trustworthy enum for their value domain.
+/// UICC PIN command (`type 6`).
+///
+/// `pin_type` and `pin_command` are intentionally kept as recovered wire
+/// values: the available DWARF names the fields but does not provide a
+/// trustworthy enum for their value domain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UiccPinCommandRequest<'a> {
     pub pin_type: u8,
@@ -3571,7 +3580,7 @@ impl NasConfigGetRequest {
     ///
     /// # Errors
     /// Returns [`EncodeError::NoSpace`] when `output` is shorter than four bytes.
-    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+    pub fn encode(output: &mut [u8]) -> Result<usize, EncodeError> {
         encode_packet(recovered_opcode::NAS_CONFIG_GET_REQUEST, &[], output)
     }
 }
@@ -3585,7 +3594,7 @@ impl DeviceInformationRequest {
     ///
     /// # Errors
     /// Returns `EncodeError::NoSpace` when output is shorter than the HCI header.
-    pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
+    pub fn encode(output: &mut [u8]) -> Result<usize, EncodeError> {
         encode_packet(public_opcode::LTE_GET_INFORMATION, &[], output)
     }
 }
@@ -3974,7 +3983,7 @@ pub struct AttachExtRequest<'a> {
 }
 
 impl AttachExtRequest<'_> {
-    fn validate_profile(
+    const fn validate_profile(
         profile: AttachExtProfile<'_>,
         apn: AttachExtField,
         username: AttachExtField,
@@ -4062,24 +4071,24 @@ impl AttachExtRequest<'_> {
 /// converted to device byte order before the block is sent as TLV `0x21`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PcoInfo {
-    pub first_pco: u8,
-    pub second_pco: u8,
-    pub n_pco: u8,
-    pub first_os_pco: u16,
-    pub second_os_pco: u16,
-    pub third_os_pco: u16,
+    pub first: u8,
+    pub second: u8,
+    pub count: u8,
+    pub first_os: u16,
+    pub second_os: u16,
+    pub third_os: u16,
 }
 
 impl PcoInfo {
     #[must_use]
     const fn wire_bytes(self) -> [u8; 9] {
-        let first = self.first_os_pco.to_be_bytes();
-        let second = self.second_os_pco.to_be_bytes();
-        let third = self.third_os_pco.to_be_bytes();
+        let first = self.first_os.to_be_bytes();
+        let second = self.second_os.to_be_bytes();
+        let third = self.third_os.to_be_bytes();
         [
-            self.first_pco,
-            self.second_pco,
-            self.n_pco,
+            self.first,
+            self.second,
+            self.count,
             first[0],
             first[1],
             second[0],
@@ -4837,7 +4846,7 @@ mod tests {
         assert_eq!(set, [0x33, 0x70, 0, 6, 0x80, 1, 1, 0x8a, 1, 2]);
 
         let mut get = [0_u8; 4];
-        assert_eq!(NasConfigGetRequest.encode(&mut get), Ok(4));
+        assert_eq!(NasConfigGetRequest::encode(&mut get), Ok(4));
         assert_eq!(get, [0x33, 0x72, 0, 0]);
 
         assert_eq!(
@@ -4864,7 +4873,7 @@ mod tests {
     #[test]
     fn device_information_request_and_tlv_response_match_live_wire() {
         let mut request = [0_u8; 4];
-        assert_eq!(DeviceInformationRequest.encode(&mut request), Ok(4));
+        assert_eq!(DeviceInformationRequest::encode(&mut request), Ok(4));
         assert_eq!(request, [0x30, 0x02, 0, 0]);
 
         let payload = [
@@ -5661,12 +5670,12 @@ mod tests {
             password: b"p",
             auth_flag: 2,
             pco: PcoInfo {
-                first_pco: 0x11,
-                second_pco: 0x22,
-                n_pco: 3,
-                first_os_pco: 0x1234,
-                second_os_pco: 0x5678,
-                third_os_pco: 0x9abc,
+                first: 0x11,
+                second: 0x22,
+                count: 3,
+                first_os: 0x1234,
+                second_os: 0x5678,
+                third_os: 0x9abc,
             },
         };
         let retry = super::AttachExtProfile {
@@ -5678,12 +5687,12 @@ mod tests {
             password: b"",
             auth_flag: 1,
             pco: PcoInfo {
-                first_pco: 0,
-                second_pco: 0,
-                n_pco: 0,
-                first_os_pco: 0,
-                second_os_pco: 0,
-                third_os_pco: 0,
+                first: 0,
+                second: 0,
+                count: 0,
+                first_os: 0,
+                second_os: 0,
+                third_os: 0,
             },
         };
         let request = super::AttachExtRequest {
@@ -5718,12 +5727,12 @@ mod tests {
             password: &oversized_credential,
             auth_flag: 0xff,
             pco: PcoInfo {
-                first_pco: 0xff,
-                second_pco: 0xff,
-                n_pco: 0xff,
-                first_os_pco: 0xffff,
-                second_os_pco: 0xffff,
-                third_os_pco: 0xffff,
+                first: 0xff,
+                second: 0xff,
+                count: 0xff,
+                first_os: 0xffff,
+                second_os: 0xffff,
+                third_os: 0xffff,
             },
         };
         let mut output = [0_u8; 5];
@@ -5743,12 +5752,12 @@ mod tests {
     fn extended_attach_rejects_serialized_profile_overflow() {
         let oversized_apn = [b'a'; 100];
         let pco = PcoInfo {
-            first_pco: 0,
-            second_pco: 0,
-            n_pco: 0,
-            first_os_pco: 0,
-            second_os_pco: 0,
-            third_os_pco: 0,
+            first: 0,
+            second: 0,
+            count: 0,
+            first_os: 0,
+            second_os: 0,
+            third_os: 0,
         };
         let primary = super::AttachExtProfile {
             ip_alloc: 0,
@@ -5791,12 +5800,12 @@ mod tests {
             password: &[b'p'; 64],
             auth_flag: 0xff,
             pco: PcoInfo {
-                first_pco: 0xff,
-                second_pco: 0xff,
-                n_pco: 0xff,
-                first_os_pco: 0xffff,
-                second_os_pco: 0xffff,
-                third_os_pco: 0xffff,
+                first: 0xff,
+                second: 0xff,
+                count: 0xff,
+                first_os: 0xffff,
+                second_os: 0xffff,
+                third_os: 0xffff,
             },
         };
         let mut output = [0_u8; 11];
@@ -5822,12 +5831,12 @@ mod tests {
             password: b"p",
             auth_flag: 2,
             pco: PcoInfo {
-                first_pco: 0x11,
-                second_pco: 0x22,
-                n_pco: 3,
-                first_os_pco: 0x1234,
-                second_os_pco: 0x5678,
-                third_os_pco: 0x9abc,
+                first: 0x11,
+                second: 0x22,
+                count: 3,
+                first_os: 0x1234,
+                second_os: 0x5678,
+                third_os: 0x9abc,
             },
         };
         let mut output = [0_u8; 48];
@@ -6294,7 +6303,7 @@ mod tests {
     #[test]
     fn temperature_read_matches_shared_live_p4_request_and_signed_response() {
         let mut request = [0_u8; 8];
-        assert_eq!(super::TemperatureReadRequest.encode(&mut request), Ok(8));
+        assert_eq!(super::TemperatureReadRequest::encode(&mut request), Ok(8));
         assert_eq!(request, [0x31, 0x45, 0, 4, 0, 4, 0, 0]);
 
         let payload = [0, 0, 0, 4, 0, 2, 0, 0xef];
@@ -6328,7 +6337,7 @@ mod tests {
     #[test]
     fn iccid_read_matches_shared_live_p4_request_and_exact_response() {
         let mut request = [0_u8; 8];
-        assert_eq!(super::IccidReadRequest.encode(&mut request), Ok(8));
+        assert_eq!(super::IccidReadRequest::encode(&mut request), Ok(8));
         assert_eq!(request, [0x31, 0x45, 0, 4, 0, 2, 0, 0]);
 
         let payload = [
@@ -6362,7 +6371,7 @@ mod tests {
     #[test]
     fn msisdn_read_matches_shared_live_p4_request_and_bounded_records() {
         let mut request = [0_u8; 8];
-        assert_eq!(super::MsisdnReadRequest.encode(&mut request), Ok(8));
+        assert_eq!(super::MsisdnReadRequest::encode(&mut request), Ok(8));
         assert_eq!(request, [0x31, 0x45, 0, 4, 0, 3, 0, 0]);
 
         let mut record = [0_u8; super::MSISDN_RECORD_LEN];
@@ -6593,7 +6602,7 @@ mod tests {
         );
 
         let mut pin_status = [0_u8; 8];
-        assert_eq!(super::UiccPinStatusRequest.encode(&mut pin_status), Ok(8));
+        assert_eq!(super::UiccPinStatusRequest::encode(&mut pin_status), Ok(8));
         assert_eq!(pin_status, [0x35, 0x04, 0x00, 0x04, 0x00, 0x07, 0x00, 0x00]);
     }
 
@@ -7030,9 +7039,9 @@ mod tests {
         let mut timer = [0_u8; 12];
         assert_eq!(
             super::EmmTimerControlRequest {
-                timer_id: 0x1234,
-                timer_value_unit: 5,
-                timer_value: 6,
+                id: 0x1234,
+                value_unit: 5,
+                value: 6,
             }
             .encode(&mut timer),
             Ok(12)

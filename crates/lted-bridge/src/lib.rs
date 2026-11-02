@@ -360,7 +360,7 @@ pub fn decode_legacy_rrc_capability_set(
 /// # Errors
 /// Rejects any non-five-byte object or a type not exercised by shipped
 /// `lteautocm`.
-pub fn decode_legacy_rrc_capability_get(
+pub const fn decode_legacy_rrc_capability_get(
     params: &[u8],
 ) -> Result<RrcCapabilityGetRequest, LegacyRrcCapabilityDecodeError> {
     if params.len() != 5 {
@@ -428,12 +428,12 @@ fn legacy_attach_ext_c_string(
 
 const fn legacy_pco_info(bytes: &[u8], offset: usize) -> PcoInfo {
     PcoInfo {
-        first_pco: bytes[offset],
-        second_pco: bytes[offset + 1],
-        n_pco: bytes[offset + 2],
-        first_os_pco: u16::from_be_bytes([bytes[offset + 3], bytes[offset + 4]]),
-        second_os_pco: u16::from_be_bytes([bytes[offset + 5], bytes[offset + 6]]),
-        third_os_pco: u16::from_be_bytes([bytes[offset + 7], bytes[offset + 8]]),
+        first: bytes[offset],
+        second: bytes[offset + 1],
+        count: bytes[offset + 2],
+        first_os: u16::from_be_bytes([bytes[offset + 3], bytes[offset + 4]]),
+        second_os: u16::from_be_bytes([bytes[offset + 5], bytes[offset + 6]]),
+        third_os: u16::from_be_bytes([bytes[offset + 7], bytes[offset + 8]]),
     }
 }
 
@@ -447,12 +447,12 @@ const fn empty_attach_ext_profile() -> AttachExtProfile<'static> {
         password: &[],
         auth_flag: 0,
         pco: PcoInfo {
-            first_pco: 0,
-            second_pco: 0,
-            n_pco: 0,
-            first_os_pco: 0,
-            second_os_pco: 0,
-            third_os_pco: 0,
+            first: 0,
+            second: 0,
+            count: 0,
+            first_os: 0,
+            second_os: 0,
+            third_os: 0,
         },
     }
 }
@@ -628,7 +628,7 @@ pub enum LegacyUiccDecodeError {
     UnsupportedKind(u16),
 }
 
-fn exact_uicc_subtype_len(
+const fn exact_uicc_subtype_len(
     kind: u16,
     data: &[u8],
     expected: usize,
@@ -1238,9 +1238,9 @@ const ATTACH_EXT_PDN_OFFSET: usize = 0x08d;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttachExtCallbackError {
-    PdnContainerTlv,
-    PdnInnerTlv,
-    PdnField(PdnInfoFieldLengthError),
+    ContainerTlv,
+    InnerTlv,
+    Field(PdnInfoFieldLengthError),
 }
 
 fn materialize_attach_ext_callback(
@@ -1263,9 +1263,9 @@ fn materialize_attach_ext_callback(
     data[0x08c] = response.apn_class;
     materialize_pdn_containers(response.pdn_info_containers(), data, ATTACH_EXT_PDN_OFFSET)
         .map_err(|error| match error {
-            PdnInfoMaterializeError::ContainerTlv => AttachExtCallbackError::PdnContainerTlv,
-            PdnInfoMaterializeError::InnerTlv => AttachExtCallbackError::PdnInnerTlv,
-            PdnInfoMaterializeError::Field(error) => AttachExtCallbackError::PdnField(error),
+            PdnInfoMaterializeError::ContainerTlv => AttachExtCallbackError::ContainerTlv,
+            PdnInfoMaterializeError::InnerTlv => AttachExtCallbackError::InnerTlv,
+            PdnInfoMaterializeError::Field(error) => AttachExtCallbackError::Field(error),
         })?;
     data[0x2b7] = response.network_features.ims_voice_over_ps;
     data[0x2b8] = response.network_features.emc_bc;
@@ -1436,7 +1436,9 @@ pub enum PdnConnectCallbackError {
     Tail(PdnConnectTailDecodeError),
 }
 
-fn map_pdn_connect_materialize_error(error: PdnInfoMaterializeError) -> PdnConnectCallbackError {
+const fn map_pdn_connect_materialize_error(
+    error: PdnInfoMaterializeError,
+) -> PdnConnectCallbackError {
     match error {
         PdnInfoMaterializeError::ContainerTlv => PdnConnectCallbackError::PdnContainerTlv,
         PdnInfoMaterializeError::InnerTlv => PdnConnectCallbackError::PdnInnerTlv,
@@ -1556,9 +1558,9 @@ const PDN_CONNECT_EXT_PDN_OFFSET: usize = 0x08f;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PdnConnectExtCallbackError {
-    PdnContainerTlv,
-    PdnInnerTlv,
-    PdnField(PdnInfoFieldLengthError),
+    ContainerTlv,
+    InnerTlv,
+    Field(PdnInfoFieldLengthError),
 }
 
 fn materialize_pdn_connect_ext_callback(
@@ -1587,9 +1589,9 @@ fn materialize_pdn_connect_ext_callback(
         PDN_CONNECT_EXT_PDN_OFFSET,
     )
     .map_err(|error| match error {
-        PdnInfoMaterializeError::ContainerTlv => PdnConnectExtCallbackError::PdnContainerTlv,
-        PdnInfoMaterializeError::InnerTlv => PdnConnectExtCallbackError::PdnInnerTlv,
-        PdnInfoMaterializeError::Field(error) => PdnConnectExtCallbackError::PdnField(error),
+        PdnInfoMaterializeError::ContainerTlv => PdnConnectExtCallbackError::ContainerTlv,
+        PdnInfoMaterializeError::InnerTlv => PdnConnectExtCallbackError::InnerTlv,
+        PdnInfoMaterializeError::Field(error) => PdnConnectExtCallbackError::Field(error),
     })?;
     Ok(())
 }
@@ -2137,7 +2139,7 @@ pub enum UiccCallbackError {
     },
 }
 
-fn require_uicc_callback_len(
+const fn require_uicc_callback_len(
     kind: u16,
     data: &[u8],
     expected: usize,
@@ -3515,9 +3517,9 @@ impl DeviceBridge {
                     actual: request.params.len(),
                 })?;
         let modem_request = EmmTimerControlRequest {
-            timer_id: u16::from_be_bytes([bytes[0], bytes[1]]),
-            timer_value_unit: bytes[2],
-            timer_value: bytes[3],
+            id: u16::from_be_bytes([bytes[0], bytes[1]]),
+            value_unit: bytes[2],
+            value: bytes[3],
         };
         let bytes_written = modem.send_command(ModemCommand::EmmTimerControl(modem_request))?;
         Ok(HandledCall {

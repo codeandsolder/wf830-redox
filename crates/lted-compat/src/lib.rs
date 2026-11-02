@@ -139,12 +139,12 @@ impl Server {
             .collect()
     }
 
-    #[must_use]
-    pub fn client_identity(&self, id: u8) -> Option<Option<u16>> {
-        self.clients
-            .get(usize::from(id))
-            .and_then(Option::as_ref)
-            .map(|client| client.identity)
+    /// Return the optional identity supplied by an allocated client.
+    ///
+    /// # Errors
+    /// Returns `NotFound` for an unused client ID.
+    pub fn client_identity(&self, id: u8) -> io::Result<Option<u16>> {
+        self.client(id).map(|client| client.identity)
     }
 
     #[must_use]
@@ -479,7 +479,7 @@ mod tests {
         let (client, _client_path, id, source_path) = open_client(&mut server, &dir, 0, 0x1234);
         assert_eq!(id, 0);
         assert_eq!(source_path, private_path(&prefix, id));
-        assert_eq!(server.client_identity(id), Some(Some(0x1234)));
+        assert!(matches!(server.client_identity(id), Ok(Some(0x1234))));
         assert_eq!(server.client_count(), 1);
         let context = server
             .client_context(id)
