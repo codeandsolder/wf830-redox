@@ -23,19 +23,20 @@ pub(crate) struct SpecialTidRecord {
 }
 
 impl SpecialTidRecord {
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, usize> {
-        let bytes: [u8; 7] = bytes.try_into().map_err(|_| bytes.len())?;
-        Ok(Self {
-            message_id: u16::from_be_bytes([bytes[0], bytes[1]]),
-            default_eps_id: u16::from_be_bytes([bytes[2], bytes[3]]),
-            tid_type: bytes[4],
-            requested_apn_type: bytes[5],
-            ip_allocation: bytes[6],
-        })
-    }
-
-    pub(crate) const fn requested_apn_type(self) -> u8 {
-        self.requested_apn_type
+    pub(crate) const fn new(
+        message_id: u16,
+        default_eps_id: u16,
+        tid_type: u8,
+        requested_apn_type: u8,
+        ip_allocation: u8,
+    ) -> Self {
+        Self {
+            message_id,
+            default_eps_id,
+            tid_type,
+            requested_apn_type,
+            ip_allocation,
+        }
     }
 }
 

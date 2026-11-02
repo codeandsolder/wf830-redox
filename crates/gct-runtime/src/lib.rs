@@ -318,6 +318,18 @@ pub enum ResponseKey {
     DeviceInformation,
 }
 
+impl ResponseKey {
+    #[must_use]
+    const fn transaction_id(self) -> Option<u8> {
+        match self {
+            Self::Attach(transaction_id)
+            | Self::PdnConnect(transaction_id)
+            | Self::PdnDisconnect(transaction_id) => Some(transaction_id),
+            _ => None,
+        }
+    }
+}
+
 impl ModemCommand<'_> {
     /// Response identity recoverable for this command.
     ///
@@ -471,6 +483,17 @@ impl PendingRequests {
     #[must_use]
     pub fn contains(&self, key: ResponseKey) -> bool {
         self.keys.contains(&key)
+    }
+
+    #[must_use]
+    pub fn contains_transaction_id(&self, transaction_id: u8) -> bool {
+        self.keys
+            .iter()
+            .any(|key| key.transaction_id() == Some(transaction_id))
+    }
+
+    pub fn clear_transaction_ids(&mut self) {
+        self.keys.retain(|key| key.transaction_id().is_none());
     }
 
     /// # Errors
@@ -1184,6 +1207,36 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(failure, ModemEvent::MiscReadFailure { read_result: 7 });
         assert_eq!(failure.response_key(), Some(ResponseKey::MiscRead));
+    }
+
+    #[test]
+    fn pending_transaction_id_helpers_cover_only_tid_lifecycle_families() {
+        let mut pending = PendingRequests::new();
+        assert!(matches!(pending.try_insert(ResponseKey::Attach(7)), Ok(())));
+        assert!(matches!(
+            pending.try_insert(ResponseKey::PdnConnect(8)),
+            Ok(())
+        ));
+        assert!(matches!(
+            pending.try_insert(ResponseKey::PdnDisconnect(9)),
+            Ok(())
+        ));
+        assert!(matches!(
+            pending.try_insert(ResponseKey::PlmnSearchStop(7)),
+            Ok(())
+        ));
+
+        assert!(pending.contains_transaction_id(7));
+        assert!(pending.contains_transaction_id(8));
+        assert!(pending.contains_transaction_id(9));
+        assert!(!pending.contains_transaction_id(10));
+
+        pending.clear_transaction_ids();
+        assert!(!pending.contains_transaction_id(7));
+        assert!(!pending.contains(ResponseKey::Attach(7)));
+        assert!(!pending.contains(ResponseKey::PdnConnect(8)));
+        assert!(!pending.contains(ResponseKey::PdnDisconnect(9)));
+        assert!(pending.contains(ResponseKey::PlmnSearchStop(7)));
     }
 
     #[test]
