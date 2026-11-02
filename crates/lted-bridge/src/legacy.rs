@@ -9,6 +9,7 @@ use gct_lapi::{
     attach::{AttachExtProfile, AttachExtRequest, AttachRequest, Positioning},
     common::{ApnType, PcoInfo, PdnConnectionControl},
     pdn::{PdnConnectExtRequest, PdnConnectRequest, PdnDisconnectRequest},
+    plmn::{PlmnSearchExtRequest, PlmnSearchRequest},
     rrc::{
         RrcCapabilityGetRequest, RrcCapabilitySetRequest, RrcFunctionGetRequest,
         SetProtocolInfoRequest,
@@ -37,6 +38,80 @@ pub const LEGACY_PDN_CONNECT_PARAMS_LEN: usize = 0x1a4;
 pub const LEGACY_PDN_CONNECT_EXT_PARAMS_LEN: usize = 0x0f4;
 pub const LEGACY_PDN_DISCONNECT_FIXED_LEN: usize = 4;
 pub const LEGACY_PDN_DISCONNECT_MAX_LEN: usize = 0x44;
+pub const LEGACY_PLMN_SEARCH_PARAMS_LEN: usize = 9;
+pub const LEGACY_PLMN_SEARCH_EXT_PARAMS_LEN: usize = 1_292;
+
+pub(crate) const fn decode_legacy_plmn_search(
+    params: &[u8; LEGACY_PLMN_SEARCH_PARAMS_LEN],
+) -> PlmnSearchRequest {
+    PlmnSearchRequest {
+        search_mode: params[0],
+        mcc: [params[1], params[2], params[3]],
+        mnc: [params[4], params[5], params[6]],
+        emergency_mode: params[7],
+        roaming_option: params[8],
+    }
+}
+
+pub(crate) fn decode_legacy_plmn_search_ext(
+    params: &[u8; LEGACY_PLMN_SEARCH_EXT_PARAMS_LEN],
+) -> PlmnSearchExtRequest<'_> {
+    let list_count = params[9];
+    let list_len = usize::from(params[10]);
+    let list_data = if list_count == 0 {
+        &[][..]
+    } else {
+        &params[11..11 + list_len]
+    };
+    PlmnSearchExtRequest {
+        selection_mode: params[0],
+        operation_mode: params[1],
+        mcc: [params[2], params[3], params[4]],
+        mnc: [params[5], params[6], params[7]],
+        roaming_option: params[8],
+        list_count,
+        list_data,
+        power_scan: params[LEGACY_PLMN_SEARCH_EXT_PARAMS_LEN - 1] == 1,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LegacySpecialTidRecord {
+    pub message_id: u16,
+    pub default_eps_id: u16,
+    pub tid_type: u8,
+    pub requested_apn_type: u8,
+    pub ip_allocation: u8,
+}
+
+pub(crate) fn decode_legacy_special_tid(params: &[u8]) -> Result<LegacySpecialTidRecord, usize> {
+    let bytes: [u8; 7] = params.try_into().map_err(|_| params.len())?;
+    Ok(LegacySpecialTidRecord {
+        message_id: u16::from_be_bytes([bytes[0], bytes[1]]),
+        default_eps_id: u16::from_be_bytes([bytes[2], bytes[3]]),
+        tid_type: bytes[4],
+        requested_apn_type: bytes[5],
+        ip_allocation: bytes[6],
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LegacyTidStateSeed {
+    pub requested_apn_type: u8,
+    pub ip_allocation: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LegacyAttachRequest<'a> {
+    pub modem: AttachRequest<'a>,
+    pub tid_state: LegacyTidStateSeed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LegacyPdnConnectRequest<'a> {
+    pub modem: PdnConnectRequest<'a>,
+    pub tid_state: LegacyTidStateSeed,
+}
 
 /// RRC-capability type IDs exercised by the shipped P4 `lteautocm` binary.
 ///
@@ -745,7 +820,9 @@ const fn legacy_apn_type(value: u8) -> ApnType {
 /// # Errors
 /// Returns [`LegacyAttachDecodeError`] for a wrong legacy structure size,
 /// unterminated fixed string, or operator PCO length beyond its 100-byte slot.
-pub fn decode_legacy_attach(params: &[u8]) -> Result<AttachRequest<'_>, LegacyAttachDecodeError> {
+pub fn decode_legacy_attach(
+    params: &[u8],
+) -> Result<LegacyAttachRequest<'_>, LegacyAttachDecodeError> {
     if params.len() != LEGACY_ATTACH_PARAMS_LEN {
         return Err(LegacyAttachDecodeError::UnexpectedLength {
             expected: LEGACY_ATTACH_PARAMS_LEN,
@@ -755,32 +832,38 @@ pub fn decode_legacy_attach(params: &[u8]) -> Result<AttachRequest<'_>, LegacyAt
 
     let optional_info = params[0];
     if optional_info == 0 {
-        return Ok(AttachRequest {
-            optional_info,
-            transaction_id: 0,
-            apn: &[],
-            pdn_type: 0,
-            ip_alloc: 0,
-            username: &[],
-            password: &[],
-            auth_flag: 0,
-            general_pco: None,
-            operator_pco: None,
-            req_apn_type: ApnType::NotSet,
-            attach_type: 0,
-            request_type: 0,
-            emergency_mode: 0,
-            positioning: Positioning {
-                lpp: false,
-                lcs: false,
+        return Ok(LegacyAttachRequest {
+            modem: AttachRequest {
+                optional_info,
+                transaction_id: 0,
+                apn: &[],
+                pdn_type: 0,
+                ip_alloc: 0,
+                username: &[],
+                password: &[],
+                auth_flag: 0,
+                general_pco: None,
+                operator_pco: None,
+                req_apn_type: ApnType::NotSet,
+                attach_type: 0,
+                request_type: 0,
+                emergency_mode: 0,
+                positioning: Positioning {
+                    lpp: false,
+                    lcs: false,
+                },
+                nas_sig_low_priority_ind: 0,
+                pdn_control: PdnConnectionControl {
+                    max_conn: 0,
+                    max_conn_t: 0,
+                    wait_time: 0,
+                },
+                secure_pco: 0,
             },
-            nas_sig_low_priority_ind: 0,
-            pdn_control: PdnConnectionControl {
-                max_conn: 0,
-                max_conn_t: 0,
-                wait_time: 0,
+            tid_state: LegacyTidStateSeed {
+                requested_apn_type: params[0x152],
+                ip_allocation: params[0x067],
             },
-            secure_pco: 0,
         });
     }
 
@@ -802,32 +885,38 @@ pub fn decode_legacy_attach(params: &[u8]) -> Result<AttachRequest<'_>, LegacyAt
         Some(&params[0x0ee..0x0ee + len])
     };
 
-    Ok(AttachRequest {
-        optional_info,
-        transaction_id: params[0x001],
-        apn,
-        pdn_type: params[0x066],
-        ip_alloc: params[0x067],
-        username,
-        password,
-        auth_flag: params[0x0e8],
-        general_pco,
-        operator_pco,
-        req_apn_type: legacy_apn_type(params[0x152]),
-        attach_type: params[0x153],
-        request_type: params[0x154],
-        emergency_mode: params[0x155],
-        positioning: Positioning {
-            lpp: params[0x156] == 1,
-            lcs: params[0x157] == 1,
+    Ok(LegacyAttachRequest {
+        modem: AttachRequest {
+            optional_info,
+            transaction_id: params[0x001],
+            apn,
+            pdn_type: params[0x066],
+            ip_alloc: params[0x067],
+            username,
+            password,
+            auth_flag: params[0x0e8],
+            general_pco,
+            operator_pco,
+            req_apn_type: legacy_apn_type(params[0x152]),
+            attach_type: params[0x153],
+            request_type: params[0x154],
+            emergency_mode: params[0x155],
+            positioning: Positioning {
+                lpp: params[0x156] == 1,
+                lcs: params[0x157] == 1,
+            },
+            nas_sig_low_priority_ind: params[0x158],
+            pdn_control: PdnConnectionControl {
+                max_conn: u16::from_be_bytes([params[0x159], params[0x15a]]),
+                max_conn_t: u16::from_be_bytes([params[0x15b], params[0x15c]]),
+                wait_time: u16::from_be_bytes([params[0x15d], params[0x15e]]),
+            },
+            secure_pco: params[0x15f],
         },
-        nas_sig_low_priority_ind: params[0x158],
-        pdn_control: PdnConnectionControl {
-            max_conn: u16::from_be_bytes([params[0x159], params[0x15a]]),
-            max_conn_t: u16::from_be_bytes([params[0x15b], params[0x15c]]),
-            wait_time: u16::from_be_bytes([params[0x15d], params[0x15e]]),
+        tid_state: LegacyTidStateSeed {
+            requested_apn_type: params[0x152],
+            ip_allocation: params[0x067],
         },
-        secure_pco: params[0x15f],
     })
 }
 
@@ -850,7 +939,7 @@ pub fn decode_legacy_attach(params: &[u8]) -> Result<AttachRequest<'_>, LegacyAt
 pub fn decode_legacy_pdn_connect(
     params: &[u8],
     transaction_id: u8,
-) -> Result<PdnConnectRequest<'_>, LegacyPdnConnectDecodeError> {
+) -> Result<LegacyPdnConnectRequest<'_>, LegacyPdnConnectDecodeError> {
     if params.len() != LEGACY_PDN_CONNECT_PARAMS_LEN {
         return Err(LegacyPdnConnectDecodeError::UnexpectedLength {
             expected: LEGACY_PDN_CONNECT_PARAMS_LEN,
@@ -884,7 +973,13 @@ pub fn decode_legacy_pdn_connect(
     };
 
     if optional_info == 0 {
-        return Ok(request);
+        return Ok(LegacyPdnConnectRequest {
+            modem: request,
+            tid_state: LegacyTidStateSeed {
+                requested_apn_type: params[0x19a],
+                ip_allocation: params[0x067],
+            },
+        });
     }
 
     request.pdn_type = params[0x066];
@@ -915,7 +1010,13 @@ pub fn decode_legacy_pdn_connect(
         wait_time: u16::from_be_bytes([params[0x1a0], params[0x1a1]]),
     };
     request.secure_pco = params[0x1a2];
-    Ok(request)
+    Ok(LegacyPdnConnectRequest {
+        modem: request,
+        tid_state: LegacyTidStateSeed {
+            requested_apn_type: params[0x19a],
+            ip_allocation: params[0x067],
+        },
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
