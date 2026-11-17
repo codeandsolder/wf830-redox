@@ -58,84 +58,55 @@ pub enum SdkCallbackKind {
 }
 
 impl SdkCallbackKind {
-    #[must_use]
-    pub const fn callback_id(self) -> u16 {
+    // Keep each proven live-P4 callback ID paired with its cb_rsp[] slot.
+    // These are independent OEM values, not an arithmetic offset or sequence.
+    const fn mapping(self) -> (u16, usize) {
         match self {
-            Self::Attach => 26,
-            Self::AttachExt => 28,
-            Self::Detach => 30,
-            Self::DetachRequired => 31,
-            Self::PdnConnect => 33,
-            Self::PdnConnectExt => 35,
-            Self::PdnDisconnect => 37,
-            Self::PlmnSearch => 41,
-            Self::PlmnSearchStop => 64,
-            Self::ContentsResetAndDelete => 66,
-            Self::PlmnList => 45,
-            Self::QuerySelectedPlmn => 54,
-            Self::Online => 59,
-            Self::Offline => 62,
-            Self::PsInit => 68,
-            Self::MobileIdRead => 77,
-            Self::IccidRead => 79,
-            Self::MsisdnRead => 81,
-            Self::TemperatureRead => 83,
-            Self::AtCommandFromDevice => 126,
-            Self::AtCommandFromDeviceExt => 128,
-            Self::UiccFromDevice => 148,
-            Self::UeModeChange => 162,
-            Self::RfStatusReportControl => 188,
-            Self::RfMeasureReport => 203,
-            Self::RfMeasureReportIndication => 204,
-            Self::EmmNiReattachControl => 308,
-            Self::EmmReattachControlReport => 309,
-            Self::RrcCapabilityControl => 221,
-            Self::RrcCapabilityControlGet => 223,
-            Self::RrcFunctionControl => 225,
-            Self::RrcFunctionControlGet => 227,
-            Self::SetProtocolInfo => 178,
-            Self::GetNasConfig => 305,
+            Self::Attach => (26, 2),
+            Self::AttachExt => (28, 3),
+            Self::Detach => (30, 4),
+            Self::DetachRequired => (31, 5),
+            Self::PdnConnect => (33, 6),
+            Self::PdnConnectExt => (35, 7),
+            Self::PdnDisconnect => (37, 8),
+            Self::PlmnSearch => (41, 9),
+            Self::PlmnSearchStop => (64, 20),
+            Self::ContentsResetAndDelete => (66, 21),
+            Self::PlmnList => (45, 11),
+            Self::QuerySelectedPlmn => (54, 16),
+            Self::Online => (59, 18),
+            Self::Offline => (62, 19),
+            Self::PsInit => (68, 22),
+            Self::MobileIdRead => (77, 26),
+            Self::IccidRead => (79, 27),
+            Self::MsisdnRead => (81, 28),
+            Self::TemperatureRead => (83, 29),
+            Self::AtCommandFromDevice => (126, 60),
+            Self::AtCommandFromDeviceExt => (128, 61),
+            Self::UiccFromDevice => (148, 71),
+            Self::UeModeChange => (162, 82),
+            Self::RfStatusReportControl => (188, 95),
+            Self::RfMeasureReport => (203, 106),
+            Self::RfMeasureReportIndication => (204, 107),
+            Self::EmmNiReattachControl => (308, 159),
+            Self::EmmReattachControlReport => (309, 160),
+            Self::RrcCapabilityControl => (221, 115),
+            Self::RrcCapabilityControlGet => (223, 116),
+            Self::RrcFunctionControl => (225, 117),
+            Self::RrcFunctionControlGet => (227, 118),
+            Self::SetProtocolInfo => (178, 90),
+            Self::GetNasConfig => (305, 157),
         }
     }
 
     #[must_use]
+    pub const fn callback_id(self) -> u16 {
+        self.mapping().0
+    }
+
+    #[must_use]
     pub const fn registration_index(self) -> usize {
-        match self {
-            Self::Attach => 2,
-            Self::AttachExt => 3,
-            Self::Detach => 4,
-            Self::DetachRequired => 5,
-            Self::PdnConnect => 6,
-            Self::PdnConnectExt => 7,
-            Self::PdnDisconnect => 8,
-            Self::PlmnSearch => 9,
-            Self::PlmnSearchStop => 20,
-            Self::ContentsResetAndDelete => 21,
-            Self::PlmnList => 11,
-            Self::QuerySelectedPlmn => 16,
-            Self::Online => 18,
-            Self::Offline => 19,
-            Self::PsInit => 22,
-            Self::MobileIdRead => 26,
-            Self::IccidRead => 27,
-            Self::MsisdnRead => 28,
-            Self::TemperatureRead => 29,
-            Self::AtCommandFromDevice => 60,
-            Self::AtCommandFromDeviceExt => 61,
-            Self::UiccFromDevice => 71,
-            Self::UeModeChange => 82,
-            Self::RfStatusReportControl => 95,
-            Self::RfMeasureReport => 106,
-            Self::RfMeasureReportIndication => 107,
-            Self::EmmNiReattachControl => 159,
-            Self::EmmReattachControlReport => 160,
-            Self::RrcCapabilityControl => 115,
-            Self::RrcCapabilityControlGet => 116,
-            Self::RrcFunctionControl => 117,
-            Self::RrcFunctionControlGet => 118,
-            Self::SetProtocolInfo => 90,
-            Self::GetNasConfig => 157,
-        }
+        self.mapping().1
     }
 
     #[must_use]
