@@ -85,33 +85,58 @@ pub struct RrcFunctionResponse<'a> {
     pub data: &'a [u8],
 }
 
+// These responses share framing, but the live wire puts len/type in opposite
+// orders for set and get. Keep that distinction explicit at the codec boundary.
+#[derive(Clone, Copy)]
+enum RrcResponseOrder {
+    LengthThenType,
+    TypeThenLength,
+}
+
+fn parse_common_rrc_response<'a>(
+    packet: Packet<'a>,
+    opcode: u16,
+    order: RrcResponseOrder,
+) -> Result<(u16, u16, &'a [u8]), ResponseDecodeError> {
+    let payload = response_payload(packet, opcode)?;
+    if payload.len() < 6 {
+        return Err(ResponseDecodeError::TruncatedPrefix {
+            minimum: 6,
+            actual: payload.len(),
+        });
+    }
+    let (length_offset, type_offset) = match order {
+        RrcResponseOrder::LengthThenType => (2, 4),
+        RrcResponseOrder::TypeThenLength => (4, 2),
+    };
+    let declared = usize::from(be_u16(payload, length_offset));
+    let expected = 6_usize
+        .checked_add(declared)
+        .ok_or(ResponseDecodeError::UnexpectedLength {
+            expected: usize::MAX,
+            actual: payload.len(),
+        })?;
+    if payload.len() != expected {
+        return Err(ResponseDecodeError::UnexpectedLength {
+            expected,
+            actual: payload.len(),
+        });
+    }
+    Ok((
+        be_u16(payload, 0),
+        be_u16(payload, type_offset),
+        &payload[6..],
+    ))
+}
+
 impl<'a> RrcFunctionResponse<'a> {
     fn parse_for(packet: Packet<'a>, opcode: u16) -> Result<Self, ResponseDecodeError> {
-        let payload = response_payload(packet, opcode)?;
-        if payload.len() < 6 {
-            return Err(ResponseDecodeError::TruncatedPrefix {
-                minimum: 6,
-                actual: payload.len(),
-            });
-        }
-        let declared = usize::from(be_u16(payload, 2));
-        let expected =
-            6_usize
-                .checked_add(declared)
-                .ok_or(ResponseDecodeError::UnexpectedLength {
-                    expected: usize::MAX,
-                    actual: payload.len(),
-                })?;
-        if payload.len() != expected {
-            return Err(ResponseDecodeError::UnexpectedLength {
-                expected,
-                actual: payload.len(),
-            });
-        }
+        let (result, type_id, data) =
+            parse_common_rrc_response(packet, opcode, RrcResponseOrder::LengthThenType)?;
         Ok(Self {
-            result: be_u16(payload, 0),
-            type_id: be_u16(payload, 4),
-            data: &payload[6..],
+            result,
+            type_id,
+            data,
         })
     }
 
@@ -151,29 +176,12 @@ impl RrcCapabilitySetRequest<'_> {
     /// common prefix cannot fit the HCI u16 payload length, or
     /// [`EncodeError::NoSpace`] when `output` is too small.
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
-        let data_len = u16::try_from(self.data.len()).map_err(|_| EncodeError::PayloadTooLong)?;
-        let payload_len = 4_usize
-            .checked_add(self.data.len())
-            .ok_or(EncodeError::PayloadTooLong)?;
-        let payload_len_u16 =
-            u16::try_from(payload_len).map_err(|_| EncodeError::PayloadTooLong)?;
-        let total = HEADER_LEN
-            .checked_add(payload_len)
-            .ok_or(EncodeError::PayloadTooLong)?;
-        let Some(dst) = output.get_mut(..total) else {
-            return Err(EncodeError::NoSpace);
-        };
-        dst[..HEADER_LEN].copy_from_slice(
-            &Header {
-                command: recovered_opcode::RRC_CAPABILITY_CONTROL_REQUEST,
-                payload_len: payload_len_u16,
-            }
-            .encode(),
-        );
-        dst[4..6].copy_from_slice(&self.type_id.to_be_bytes());
-        dst[6..8].copy_from_slice(&data_len.to_be_bytes());
-        dst[8..].copy_from_slice(self.data);
-        Ok(total)
+        encode_common_rrc_function_request(
+            recovered_opcode::RRC_CAPABILITY_CONTROL_REQUEST,
+            self.type_id,
+            self.data,
+            output,
+        )
     }
 }
 
@@ -216,31 +224,15 @@ impl<'a> RrcCapabilitySetResponse<'a> {
     /// Returns [`ResponseDecodeError`] for another opcode, a prefix shorter
     /// than six bytes, or a declared data length inconsistent with the frame.
     pub fn parse(packet: Packet<'a>) -> Result<Self, ResponseDecodeError> {
-        let payload = response_payload(packet, recovered_opcode::RRC_CAPABILITY_CONTROL_RESPONSE)?;
-        if payload.len() < 6 {
-            return Err(ResponseDecodeError::TruncatedPrefix {
-                minimum: 6,
-                actual: payload.len(),
-            });
-        }
-        let declared = usize::from(be_u16(payload, 2));
-        let expected =
-            6_usize
-                .checked_add(declared)
-                .ok_or(ResponseDecodeError::UnexpectedLength {
-                    expected: usize::MAX,
-                    actual: payload.len(),
-                })?;
-        if payload.len() != expected {
-            return Err(ResponseDecodeError::UnexpectedLength {
-                expected,
-                actual: payload.len(),
-            });
-        }
+        let (result, type_id, data) = parse_common_rrc_response(
+            packet,
+            recovered_opcode::RRC_CAPABILITY_CONTROL_RESPONSE,
+            RrcResponseOrder::LengthThenType,
+        )?;
         Ok(Self {
-            result: be_u16(payload, 0),
-            type_id: be_u16(payload, 4),
-            data: &payload[6..],
+            result,
+            type_id,
+            data,
         })
     }
 }
@@ -260,34 +252,15 @@ impl<'a> RrcCapabilityGetResponse<'a> {
     /// Returns [`ResponseDecodeError`] for another opcode, a short prefix, or
     /// a declared data length inconsistent with the complete HCI frame.
     pub fn parse(packet: Packet<'a>) -> Result<Self, ResponseDecodeError> {
-        let payload = response_payload(
+        let (result, type_id, data) = parse_common_rrc_response(
             packet,
             recovered_opcode::RRC_CAPABILITY_CONTROL_GET_RESPONSE,
+            RrcResponseOrder::TypeThenLength,
         )?;
-        if payload.len() < 6 {
-            return Err(ResponseDecodeError::TruncatedPrefix {
-                minimum: 6,
-                actual: payload.len(),
-            });
-        }
-        let declared = usize::from(be_u16(payload, 4));
-        let expected =
-            6_usize
-                .checked_add(declared)
-                .ok_or(ResponseDecodeError::UnexpectedLength {
-                    expected: usize::MAX,
-                    actual: payload.len(),
-                })?;
-        if payload.len() != expected {
-            return Err(ResponseDecodeError::UnexpectedLength {
-                expected,
-                actual: payload.len(),
-            });
-        }
         Ok(Self {
-            result: be_u16(payload, 0),
-            type_id: be_u16(payload, 2),
-            data: &payload[6..],
+            result,
+            type_id,
+            data,
         })
     }
 }
@@ -311,29 +284,12 @@ impl SetProtocolInfoRequest<'_> {
     /// cannot fit the HCI u16 payload length, or [`EncodeError::NoSpace`] when
     /// `output` is too small.
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
-        let data_len = u16::try_from(self.data.len()).map_err(|_| EncodeError::PayloadTooLong)?;
-        let payload_len = 4_usize
-            .checked_add(self.data.len())
-            .ok_or(EncodeError::PayloadTooLong)?;
-        let payload_len_u16 =
-            u16::try_from(payload_len).map_err(|_| EncodeError::PayloadTooLong)?;
-        let total = HEADER_LEN
-            .checked_add(payload_len)
-            .ok_or(EncodeError::PayloadTooLong)?;
-        let Some(dst) = output.get_mut(..total) else {
-            return Err(EncodeError::NoSpace);
-        };
-        dst[..HEADER_LEN].copy_from_slice(
-            &Header {
-                command: recovered_opcode::SET_PROTOCOL_INFO_REQUEST,
-                payload_len: payload_len_u16,
-            }
-            .encode(),
-        );
-        dst[4..6].copy_from_slice(&self.type_id.to_be_bytes());
-        dst[6..8].copy_from_slice(&data_len.to_be_bytes());
-        dst[8..].copy_from_slice(self.data);
-        Ok(total)
+        encode_common_rrc_function_request(
+            recovered_opcode::SET_PROTOCOL_INFO_REQUEST,
+            self.type_id,
+            self.data,
+            output,
+        )
     }
 }
 
@@ -352,31 +308,15 @@ impl<'a> SetProtocolInfoResponse<'a> {
     /// Returns [`ResponseDecodeError`] for another opcode, a short prefix, or
     /// a declared data length inconsistent with the complete HCI frame.
     pub fn parse(packet: Packet<'a>) -> Result<Self, ResponseDecodeError> {
-        let payload = response_payload(packet, recovered_opcode::SET_PROTOCOL_INFO_RESPONSE)?;
-        if payload.len() < 6 {
-            return Err(ResponseDecodeError::TruncatedPrefix {
-                minimum: 6,
-                actual: payload.len(),
-            });
-        }
-        let declared = usize::from(be_u16(payload, 4));
-        let expected =
-            6_usize
-                .checked_add(declared)
-                .ok_or(ResponseDecodeError::UnexpectedLength {
-                    expected: usize::MAX,
-                    actual: payload.len(),
-                })?;
-        if payload.len() != expected {
-            return Err(ResponseDecodeError::UnexpectedLength {
-                expected,
-                actual: payload.len(),
-            });
-        }
+        let (result, type_id, data) = parse_common_rrc_response(
+            packet,
+            recovered_opcode::SET_PROTOCOL_INFO_RESPONSE,
+            RrcResponseOrder::TypeThenLength,
+        )?;
         Ok(Self {
-            result: be_u16(payload, 0),
-            type_id: be_u16(payload, 2),
-            data: &payload[6..],
+            result,
+            type_id,
+            data,
         })
     }
 }
