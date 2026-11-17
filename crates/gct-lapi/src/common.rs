@@ -463,6 +463,63 @@ pub(crate) fn split_initial_pdn_info(bytes: &[u8]) -> Result<(&[u8], &[u8]), Tlv
     Ok((&bytes[..consumed], remaining))
 }
 
+/// Ordered fields shared by the extended Attach and extended PDN-connect
+/// responses. Their fixed prefixes differ, but the OEM consumes exactly the
+/// same three positional TLVs and first two nested PDN-info containers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExtendedPdnFields<'a> {
+    pub apn_class_kind: u8,
+    pub apn_class: u8,
+    pub requested_apn_ni: OrderedPdnTlv<'a>,
+    pub received_apn_ni: OrderedPdnTlv<'a>,
+    pub initial_pdn_info: &'a [u8],
+    pub unparsed_suffix: &'a [u8],
+}
+
+/// Decode the common extended-response suffix, without imposing tag checks
+/// that the recovered OEM implementation does not perform.
+///
+/// # Errors
+/// Returns `PdnResponseDecodeError` for missing, oversized, or malformed
+/// positional fields or truncated recognized PDN-info containers.
+pub(crate) fn parse_extended_pdn_fields(
+    optional_fields: &[u8],
+) -> Result<ExtendedPdnFields<'_>, PdnResponseDecodeError> {
+    let mut cursor = TlvCursor::new(optional_fields);
+    let apn_class = required_pdn_tlv(&mut cursor, PdnResponseField::ApnClass)?;
+    exact_pdn_field(PdnResponseField::ApnClass, apn_class.payload, 1)?;
+
+    let requested = required_pdn_tlv(&mut cursor, PdnResponseField::RequestedApnNetworkIdentifier)?;
+    bounded_pdn_field(
+        PdnResponseField::RequestedApnNetworkIdentifier,
+        requested.payload,
+        64,
+    )?;
+
+    let received = required_pdn_tlv(&mut cursor, PdnResponseField::ReceivedApnNetworkIdentifier)?;
+    bounded_pdn_field(
+        PdnResponseField::ReceivedApnNetworkIdentifier,
+        received.payload,
+        64,
+    )?;
+
+    let (initial_pdn_info, unparsed_suffix) = split_initial_pdn_info(cursor.remaining())?;
+    Ok(ExtendedPdnFields {
+        apn_class_kind: apn_class.kind,
+        apn_class: apn_class.payload[0],
+        requested_apn_ni: OrderedPdnTlv {
+            kind: requested.kind,
+            payload: requested.payload,
+        },
+        received_apn_ni: OrderedPdnTlv {
+            kind: received.kind,
+            payload: received.payload,
+        },
+        initial_pdn_info,
+        unparsed_suffix,
+    })
+}
+
 /// APN class values recovered from the B014 `ltetype.h` DWARF.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]

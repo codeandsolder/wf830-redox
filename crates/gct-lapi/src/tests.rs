@@ -1,3 +1,7 @@
+extern crate std;
+
+use std::vec;
+
 use super::{
     at::AtCommand,
     attach::{
@@ -1290,6 +1294,87 @@ fn extended_pdn_response_preserves_unchecked_tags_and_ignored_suffix() {
         return;
     };
     assert_eq!(PdnInfoField::parse(tlv), Ok(PdnInfoField::PdnType(3)));
+}
+
+#[test]
+fn extended_attach_and_pdn_share_ordered_suffix_contract() {
+    use super::common::PdnResponseDecodeError;
+    use super::pdn::PdnConnectExtResponse;
+
+    let mut oversized_requested = vec![0x20, 1, 1, 0x57, 65];
+    oversized_requested.extend_from_slice(&[0x42; 65]);
+    oversized_requested.extend_from_slice(&[0x58, 0]);
+
+    let mut oversized_received = vec![0x20, 1, 1, 0x57, 0, 0x58, 65];
+    oversized_received.extend_from_slice(&[0x42; 65]);
+
+    // Position, length, and nested-container framing are shared; prefix
+    // layouts and their semantic result fields remain family-specific.
+    let cases: &[(&str, &[u8], bool)] = &[
+        ("empty", &[], false),
+        ("short-class-header", &[0x20], false),
+        ("class-length-zero", &[0x20, 0], false),
+        ("missing-requested", &[0x20, 1, 1], false),
+        ("missing-received", &[0x20, 1, 1, 0x57, 0], false),
+        (
+            "truncated-nested",
+            &[0x20, 1, 1, 0x57, 0, 0x58, 0, 0xf0, 4, 0x05],
+            false,
+        ),
+        (
+            "unchecked-tags",
+            &[0x99, 1, 7, 0x88, 1, b'a', 0x77, 1, b'b'],
+            true,
+        ),
+        (
+            "ignored-non-tlv-suffix",
+            &[0x20, 1, 1, 0x57, 0, 0x58, 0, 0xff],
+            true,
+        ),
+        (
+            "two-pdn-containers",
+            &[0x20, 1, 1, 0x57, 0, 0x58, 0, 0xf0, 0, 0xf2, 0, 0xa5],
+            true,
+        ),
+    ];
+
+    let check = |name: &str, suffix: &[u8], expected_success: bool| {
+        let mut attach = vec![0_u8; 15];
+        attach.extend_from_slice(suffix);
+        let mut pdn = vec![0_u8; 12];
+        pdn.extend_from_slice(suffix);
+
+        let attach_result: Result<_, PdnResponseDecodeError> =
+            AttachExtResponse::parse(packet(0xb166, &attach)).map(|response| {
+                (
+                    response.apn_class_kind,
+                    response.apn_class,
+                    response.requested_apn_ni,
+                    response.received_apn_ni,
+                    response.pdn_info_containers().remaining(),
+                    response.unparsed_suffix,
+                )
+            });
+        let pdn_result: Result<_, PdnResponseDecodeError> =
+            PdnConnectExtResponse::parse(packet(0xb168, &pdn)).map(|response| {
+                (
+                    response.apn_class_kind,
+                    response.apn_class,
+                    response.requested_apn_ni,
+                    response.received_apn_ni,
+                    response.pdn_info_containers().remaining(),
+                    response.unparsed_suffix,
+                )
+            });
+
+        assert_eq!(attach_result, pdn_result, "{name}");
+        assert_eq!(attach_result.is_ok(), expected_success, "{name}");
+    };
+    for (name, suffix, expected_success) in cases {
+        check(name, suffix, *expected_success);
+    }
+    check("oversized-requested", &oversized_requested, false);
+    check("oversized-received", &oversized_received, false);
 }
 
 #[test]
