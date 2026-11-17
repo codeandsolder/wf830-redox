@@ -93,11 +93,11 @@ enum RrcResponseOrder {
     TypeThenLength,
 }
 
-fn parse_common_rrc_response<'a>(
-    packet: Packet<'a>,
+fn parse_common_rrc_response(
+    packet: Packet<'_>,
     opcode: u16,
     order: RrcResponseOrder,
-) -> Result<(u16, u16, &'a [u8]), ResponseDecodeError> {
+) -> Result<(u16, u16, &[u8]), ResponseDecodeError> {
     let payload = response_payload(packet, opcode)?;
     if payload.len() < 6 {
         return Err(ResponseDecodeError::TruncatedPrefix {

@@ -1535,6 +1535,66 @@ fn uicc_callback_matches_stock_prefix_padding_and_subscription_gate() {
 }
 
 #[test]
+fn tracked_callback_retirement_requires_matching_key_and_successful_delivery() {
+    let dir = TestDir::new();
+    let mut server = bind_server(&dir);
+    let mut bridge = DeviceBridge::new(1);
+    let key = ResponseKey::RrcFunctionGet(7);
+    bridge
+        .pending
+        .try_insert(key)
+        .unwrap_or_else(|_| std::process::abort());
+
+    // A response for another type or operation must not invoke its encoder.
+    let mut deliveries = 0;
+    let missing =
+        bridge.complete_tracked_callback(&mut server, ResponseKey::RrcFunctionSet(7), |_, _| {
+            deliveries += 1;
+            Ok(BroadcastReport::default())
+        });
+    assert!(matches!(missing, Ok(None)));
+    assert_eq!(deliveries, 0);
+    assert!(bridge.pending.contains(key));
+
+    // A malformed callback must not consume the pending transaction.
+    let failure = bridge.complete_tracked_callback(&mut server, key, |_, _| {
+        deliveries += 1;
+        Err(HandleError::Ipc(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "malformed callback",
+        )))
+    });
+    assert!(matches!(failure, Err(HandleError::Ipc(_))));
+    assert_eq!(deliveries, 1);
+    assert!(bridge.pending.contains(key));
+
+    let success = bridge.complete_tracked_callback(&mut server, key, |_, device_id| {
+        deliveries += 1;
+        assert_eq!(device_id, 1);
+        Ok(BroadcastReport {
+            registered_clients: 1,
+            sent_clients: 1,
+        })
+    });
+    assert!(matches!(
+        success,
+        Ok(Some(BroadcastReport {
+            registered_clients: 1,
+            sent_clients: 1,
+        }))
+    ));
+    assert_eq!(deliveries, 2);
+    assert!(!bridge.pending.contains(key));
+
+    let duplicate = bridge.complete_tracked_callback(&mut server, key, |_, _| {
+        deliveries += 1;
+        Ok(BroadcastReport::default())
+    });
+    assert!(matches!(duplicate, Ok(None)));
+    assert_eq!(deliveries, 2);
+}
+
+#[test]
 fn malformed_uicc_callback_keeps_pending_request_reserved() {
     let dir = TestDir::new();
     let mut server = bind_server(&dir);

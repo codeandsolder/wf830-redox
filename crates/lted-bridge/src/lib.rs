@@ -699,6 +699,23 @@ impl DeviceBridge {
         ))
     }
 
+    // Retire only after the exact stock callback was delivered successfully.
+    // Unrelated response families deliberately retire before broadcasting or
+    // remain pending across multipart delivery; do not route those here.
+    fn complete_tracked_callback(
+        &mut self,
+        server: &mut Server,
+        key: ResponseKey,
+        send: impl FnOnce(&mut Server, u32) -> Result<BroadcastReport, HandleError>,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        if !self.pending.contains(key) {
+            return Ok(None);
+        }
+        let report = send(server, self.device_id)?;
+        self.pending.remove(key);
+        Ok(Some(report))
+    }
+
     fn handle_attach_ext_event(
         &mut self,
         server: &mut Server,
@@ -739,9 +756,9 @@ impl DeviceBridge {
             self.pending.remove(key);
             return Ok(None);
         }
-        let report = broadcast_rrc_capability_set_callback(server, self.device_id, response)?;
-        self.pending.remove(key);
-        Ok(Some(report))
+        self.complete_tracked_callback(server, key, |server, device_id| {
+            broadcast_rrc_capability_set_callback(server, device_id, response)
+        })
     }
 
     fn handle_rrc_capability_get_event(
@@ -749,13 +766,11 @@ impl DeviceBridge {
         server: &mut Server,
         response: RrcCapabilityGetResponse<'_>,
     ) -> Result<Option<BroadcastReport>, HandleError> {
-        let key = ResponseKey::RrcCapabilityGet(response.type_id);
-        if !self.pending.contains(key) {
-            return Ok(None);
-        }
-        let report = broadcast_rrc_capability_get_callback(server, self.device_id, response)?;
-        self.pending.remove(key);
-        Ok(Some(report))
+        self.complete_tracked_callback(
+            server,
+            ResponseKey::RrcCapabilityGet(response.type_id),
+            |server, device_id| broadcast_rrc_capability_get_callback(server, device_id, response),
+        )
     }
 
     fn handle_query_selected_plmn_event(
@@ -763,13 +778,11 @@ impl DeviceBridge {
         server: &mut Server,
         response: QuerySelectedPlmnResponse,
     ) -> Result<Option<BroadcastReport>, HandleError> {
-        let key = ResponseKey::QuerySelectedPlmn;
-        if !self.pending.contains(key) {
-            return Ok(None);
-        }
-        let report = broadcast_query_selected_plmn_callback(server, self.device_id, response)?;
-        self.pending.remove(key);
-        Ok(Some(report))
+        self.complete_tracked_callback(
+            server,
+            ResponseKey::QuerySelectedPlmn,
+            |server, device_id| broadcast_query_selected_plmn_callback(server, device_id, response),
+        )
     }
 
     fn handle_rrc_function_set_event(
@@ -777,13 +790,11 @@ impl DeviceBridge {
         server: &mut Server,
         response: RrcFunctionResponse<'_>,
     ) -> Result<Option<BroadcastReport>, HandleError> {
-        let key = ResponseKey::RrcFunctionSet(response.type_id);
-        if !self.pending.contains(key) {
-            return Ok(None);
-        }
-        let report = broadcast_rrc_function_set_callback(server, self.device_id, response)?;
-        self.pending.remove(key);
-        Ok(Some(report))
+        self.complete_tracked_callback(
+            server,
+            ResponseKey::RrcFunctionSet(response.type_id),
+            |server, device_id| broadcast_rrc_function_set_callback(server, device_id, response),
+        )
     }
 
     fn handle_rrc_function_get_event(
@@ -791,13 +802,11 @@ impl DeviceBridge {
         server: &mut Server,
         response: RrcFunctionResponse<'_>,
     ) -> Result<Option<BroadcastReport>, HandleError> {
-        let key = ResponseKey::RrcFunctionGet(response.type_id);
-        if !self.pending.contains(key) {
-            return Ok(None);
-        }
-        let report = broadcast_rrc_function_get_callback(server, self.device_id, response)?;
-        self.pending.remove(key);
-        Ok(Some(report))
+        self.complete_tracked_callback(
+            server,
+            ResponseKey::RrcFunctionGet(response.type_id),
+            |server, device_id| broadcast_rrc_function_get_callback(server, device_id, response),
+        )
     }
 
     fn handle_device_information_event(
@@ -834,13 +843,11 @@ impl DeviceBridge {
         server: &mut Server,
         response: SetProtocolInfoResponse<'_>,
     ) -> Result<Option<BroadcastReport>, HandleError> {
-        let key = ResponseKey::SetProtocolInfo(response.type_id);
-        if !self.pending.contains(key) {
-            return Ok(None);
-        }
-        let report = broadcast_set_protocol_info_callback(server, self.device_id, response)?;
-        self.pending.remove(key);
-        Ok(Some(report))
+        self.complete_tracked_callback(
+            server,
+            ResponseKey::SetProtocolInfo(response.type_id),
+            |server, device_id| broadcast_set_protocol_info_callback(server, device_id, response),
+        )
     }
 
     fn handle_uicc_event(
@@ -848,13 +855,11 @@ impl DeviceBridge {
         server: &mut Server,
         response: UiccResponse<'_>,
     ) -> Result<Option<BroadcastReport>, HandleError> {
-        let key = ResponseKey::Uicc(response.kind);
-        if !self.pending.contains(key) {
-            return Ok(None);
-        }
-        let report = broadcast_uicc_callback(server, self.device_id, response)?;
-        self.pending.remove(key);
-        Ok(Some(report))
+        self.complete_tracked_callback(
+            server,
+            ResponseKey::Uicc(response.kind),
+            |server, device_id| broadcast_uicc_callback(server, device_id, response),
+        )
     }
 
     fn handle_misc_read_event(
@@ -863,36 +868,27 @@ impl DeviceBridge {
         event: &ModemEvent<'_>,
     ) -> Result<Option<BroadcastReport>, HandleError> {
         match event {
-            ModemEvent::IccidRead(response) => {
-                if !self.pending.contains(ResponseKey::MiscRead) {
-                    return Ok(None);
-                }
-                let report = broadcast_iccid_callback(server, self.device_id, *response)?;
-                self.pending.remove(ResponseKey::MiscRead);
-                Ok(Some(report))
-            }
+            ModemEvent::IccidRead(response) => self.complete_tracked_callback(
+                server,
+                ResponseKey::MiscRead,
+                |server, device_id| broadcast_iccid_callback(server, device_id, *response),
+            ),
             ModemEvent::MobileIdRead(response) => {
                 if !self.pending.remove(ResponseKey::MiscRead) {
                     return Ok(None);
                 }
                 broadcast_mobile_id_callback(server, self.device_id, *response).map(Some)
             }
-            ModemEvent::TemperatureRead(response) => {
-                if !self.pending.contains(ResponseKey::MiscRead) {
-                    return Ok(None);
-                }
-                let report = broadcast_temperature_callback(server, self.device_id, *response)?;
-                self.pending.remove(ResponseKey::MiscRead);
-                Ok(Some(report))
-            }
-            ModemEvent::MsisdnRead(response) => {
-                if !self.pending.contains(ResponseKey::MiscRead) {
-                    return Ok(None);
-                }
-                let report = broadcast_msisdn_callback(server, self.device_id, *response)?;
-                self.pending.remove(ResponseKey::MiscRead);
-                Ok(Some(report))
-            }
+            ModemEvent::TemperatureRead(response) => self.complete_tracked_callback(
+                server,
+                ResponseKey::MiscRead,
+                |server, device_id| broadcast_temperature_callback(server, device_id, *response),
+            ),
+            ModemEvent::MsisdnRead(response) => self.complete_tracked_callback(
+                server,
+                ResponseKey::MiscRead,
+                |server, device_id| broadcast_msisdn_callback(server, device_id, *response),
+            ),
             ModemEvent::MiscReadFailure { .. } => {
                 self.pending.remove(ResponseKey::MiscRead);
                 Ok(None)
