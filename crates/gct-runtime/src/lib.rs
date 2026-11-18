@@ -1309,7 +1309,7 @@ mod tests {
             payload: &payload,
         };
         let Ok(event) = decode_event(packet) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(event.response_key(), Some(ResponseKey::AttachExt));
     }
@@ -1393,7 +1393,7 @@ mod tests {
         };
         let event = decode_event(packet);
         let Ok(event) = event else {
-            return;
+            std::process::abort();
         };
         assert_eq!(event.response_key(), Some(ResponseKey::PlmnSearchStop(2)));
     }
@@ -1426,20 +1426,36 @@ mod tests {
     fn normal_attach_event_exposes_wire_transaction_identity() {
         let payload = [
             0x00, 0x01, 0x00, 0x02, 0x12, 0x34, 0x56, 0x78, 0x09, 0x0a, 1, 2, 3, 4, 5, 0x20, 0x01,
-            0x2a,
+            0x2a, 0x57, 0x00, // required positional APN TLV, empty value
         ];
         let packet = Packet {
             header: Header {
                 command: recovered_opcode::ATTACH_RESPONSE,
-                payload_len: 18,
+                payload_len: 20,
             },
             payload: &payload,
         };
         let event = decode_event(packet);
         let Ok(event) = event else {
-            return;
+            std::process::abort();
         };
         assert_eq!(event.response_key(), Some(ResponseKey::Attach(0x2a)));
+
+        // The original test omitted the mandatory APN TLV and silently
+        // succeeded by returning early on this error.
+        let missing_apn = Packet {
+            header: Header {
+                command: recovered_opcode::ATTACH_RESPONSE,
+                payload_len: 18,
+            },
+            payload: &payload[..18],
+        };
+        assert_eq!(
+            decode_event(missing_apn),
+            Err(EventDecodeError::Attach(
+                gct_lapi::attach::AttachResponseDecodeError::MissingApnNetworkIdentifier,
+            ))
+        );
     }
 
     #[test]

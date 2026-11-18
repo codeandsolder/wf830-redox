@@ -38,7 +38,7 @@ fn query_selected_plmn_matches_live_p4_wire() {
 
     let response = [0xb1, 0x10, 0, 4, 0, 0x21, 0xf3, 0x54];
     let Ok(packet) = Packet::parse(&response) else {
-        return;
+        std::process::abort();
     };
     assert_eq!(
         QuerySelectedPlmnResponse::parse(packet),
@@ -71,7 +71,7 @@ fn rrc_function_frames_match_live_p4_common_grammar() {
 
     let set_response = [0xb9, 0x09, 0, 7, 0, 0, 0, 1, 0, 7, 0xaa];
     let Ok(packet) = Packet::parse(&set_response) else {
-        return;
+        std::process::abort();
     };
     assert_eq!(
         RrcFunctionResponse::parse_set(packet),
@@ -84,7 +84,7 @@ fn rrc_function_frames_match_live_p4_common_grammar() {
 
     let get_response = [0xb9, 0x10, 0, 7, 0, 0, 0, 1, 0, 7, 0xbb];
     let Ok(packet) = Packet::parse(&get_response) else {
-        return;
+        std::process::abort();
     };
     assert_eq!(
         RrcFunctionResponse::parse_get(packet),
@@ -428,7 +428,7 @@ fn normal_attach_response_splits_ordered_apn_and_typed_tail() {
     ];
     let response = AttachResponse::parse(packet(0xb102, &payload));
     let Ok(response) = response else {
-        return;
+        std::process::abort();
     };
     assert_eq!(response.transaction_id, 0x7f);
     assert_eq!(response.register_result1, 1);
@@ -456,20 +456,20 @@ fn normal_attach_emergency_list_preserves_packed_record_grammar() {
         0x02, 0x02, b'9', // len=2: category + one number byte
     ];
     let Ok(response) = AttachResponse::parse(packet(0xb102, &payload)) else {
-        return;
+        std::process::abort();
     };
     let mut tail = response.trailing_fields();
     let Ok(Some(AttachTailField::EmergencyNumbers(list))) = tail.next_field() else {
-        return;
+        std::process::abort();
     };
     let mut records = list.records();
     let Ok(Some(first)) = records.next_record() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(first.category, 1);
     assert_eq!(first.number, b"11");
     let Ok(Some(second)) = records.next_record() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(second.category, 2);
     assert_eq!(second.number, b"9");
@@ -533,19 +533,19 @@ fn nested_pdn_containers_stop_before_enclosing_suffix() {
     ];
     let mut containers = PdnInfoContainers::new(&bytes);
     let Ok(Some(first)) = containers.next_container() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(first.kind, PdnInfoContainerKind::F0);
     let mut fields = first.fields();
     let Ok(Some(first_tlv)) = fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(
         PdnInfoField::parse(first_tlv),
         Ok(PdnInfoField::Ipv4Address([10, 20, 30, 40]))
     );
     let Ok(Some(second_tlv)) = fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(
         PdnInfoField::parse(second_tlv),
@@ -554,12 +554,12 @@ fn nested_pdn_containers_stop_before_enclosing_suffix() {
     assert!(matches!(fields.next_tlv(), Ok(None)));
 
     let Ok(Some(second)) = containers.next_container() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(second.kind, PdnInfoContainerKind::F2);
     let mut qos_fields = second.fields();
     let Ok(Some(qos_tlv)) = qos_fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(
         PdnInfoField::parse(qos_tlv),
@@ -720,7 +720,7 @@ fn extended_attach_response_splits_ordered_apns_nested_pdn_and_ignored_suffix() 
         0xaa, 0x00,
     ];
     let Ok(response) = AttachExtResponse::parse(packet(0xb166, &payload)) else {
-        return;
+        std::process::abort();
     };
     assert_eq!(response.register_result1, 1);
     assert_eq!(response.register_result2, 2);
@@ -738,21 +738,21 @@ fn extended_attach_response_splits_ordered_apns_nested_pdn_and_ignored_suffix() 
 
     let mut containers = response.pdn_info_containers();
     let Ok(Some(container)) = containers.next_container() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(container.kind, PdnInfoContainerKind::F0);
     let mut fields = container.fields();
     let Ok(Some(apn)) = fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     let Ok(Some(pdn_type)) = fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     let Ok(Some(ipv4)) = fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     let Ok(Some(qos)) = fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(
         PdnInfoField::parse(apn),
@@ -1194,7 +1194,7 @@ fn full_normal_pdn_response_follows_recovered_parser_pipeline() {
         0x06, 0x08, 0x04, 1, 1, 1, 1, 0xf3, 0x08, 0, 0, 0, 100, 0, 0, 0, 200, 0xee, 0x01, 0xff,
     ];
     let Ok(response) = super::pdn::PdnConnectResponse::parse(packet(0xb106, &payload)) else {
-        return;
+        std::process::abort();
     };
     assert_eq!(response.result, 1);
     assert_eq!(response.default_eps_id, 0x1234);
@@ -1204,24 +1204,24 @@ fn full_normal_pdn_response_follows_recovered_parser_pipeline() {
 
     let mut containers = response.pdn_info_containers();
     let Ok(Some(first)) = containers.next_container() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(first.kind, PdnInfoContainerKind::F0);
     let mut first_fields = first.fields();
     let Ok(Some(first_tlv)) = first_fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(
         PdnInfoField::parse(first_tlv),
         Ok(PdnInfoField::Ipv4Address([10, 20, 30, 40]))
     );
     let Ok(Some(second)) = containers.next_container() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(second.kind, PdnInfoContainerKind::F2);
     let mut second_fields = second.fields();
     let Ok(Some(qos_tlv)) = second_fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(
         PdnInfoField::parse(qos_tlv),
@@ -1274,7 +1274,7 @@ fn extended_pdn_response_preserves_unchecked_tags_and_ignored_suffix() {
         0xaa, 0x00,
     ];
     let Ok(response) = super::pdn::PdnConnectExtResponse::parse(packet(0xb168, &payload)) else {
-        return;
+        std::process::abort();
     };
     assert_eq!(response.throttle_time, 0x0708);
     assert_eq!(response.apn_class_kind, 0x20);
@@ -1287,11 +1287,11 @@ fn extended_pdn_response_preserves_unchecked_tags_and_ignored_suffix() {
 
     let mut containers = response.pdn_info_containers();
     let Ok(Some(container)) = containers.next_container() else {
-        return;
+        std::process::abort();
     };
     let mut fields = container.fields();
     let Ok(Some(tlv)) = fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(PdnInfoField::parse(tlv), Ok(PdnInfoField::PdnType(3)));
 }
@@ -1384,7 +1384,7 @@ fn disconnect_response_decodes_descriptor_suffix_and_unknowns() {
         b't', b'e', b'r', b'n', b'e', b't', 0x5d, 0x02, 0xaa, 0xbb, 0xee, 0x00,
     ];
     let Ok(response) = super::pdn::PdnDisconnectResponse::parse(packet(0xb108, &payload)) else {
-        return;
+        std::process::abort();
     };
     assert_eq!(response.transaction_id, 9);
     let mut fields = response.trailing_fields();
@@ -1840,7 +1840,7 @@ fn plmn_list_response_assembles_three_tlvs_per_record() {
         0x04, 0, 0, 0, 3, 0x12, 0x03, 0x21, 0x43, 0x65, 0x13, 0x04, 0, 0, 0, 2,
     ];
     let Ok(response) = super::plmn::PlmnListResponse::parse(packet(0xb10c, &payload)) else {
-        return;
+        std::process::abort();
     };
     assert_eq!(response.search_complete, 1);
     let mut records = response.records();
@@ -1872,7 +1872,7 @@ fn plmn_search_response_splits_fixed_metadata_and_records() {
         0x04, 0x00, 0x00, 0x00, 0x01, 0x14, 0x04, 0x00, 0x00, 0x00, 0x02,
     ];
     let Ok(response) = super::plmn::PlmnSearchResponse::parse(packet(0xb10a, &payload)) else {
-        return;
+        std::process::abort();
     };
     assert_eq!(response.result, 0);
     assert_eq!(response.selection_mode, 2);
@@ -1912,7 +1912,7 @@ fn plmn_parsers_reject_ambiguous_or_unsafe_vendor_shapes() {
         1, 0x12, 0x03, 1, 2, 3, 0x12, 0x03, 4, 5, 6, 0x14, 0x04, 0, 0, 0, 1,
     ];
     let Ok(response) = super::plmn::PlmnListResponse::parse(packet(0xb10c, &duplicate)) else {
-        return;
+        std::process::abort();
     };
     let mut records = response.records();
     assert_eq!(

@@ -618,6 +618,8 @@ impl<'a> SdkCallback<'a> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::{
         ApiOpenRequest, ApiOpenResponse, Event, Header, MessageDecodeError, Packet,
         PacketDecodeError, SdkApiRequest, SdkCallback, SdkCallbackKind, SdkCommand,
@@ -734,13 +736,13 @@ mod tests {
         assert_eq!(request.encode(&mut frame), Ok(8));
         assert_eq!(frame, [0x01, 0x00, 0x00, 0x04, 0, 0, 0x12, 0x34]);
         let Ok(packet) = Packet::parse(&frame) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(ApiOpenRequest::parse(packet), Ok(request));
 
         let noncanonical = [0x01, 0x00, 0x00, 0x04, 0xde, 0xad, 0xbe, 0xef];
         let Ok(packet) = Packet::parse(&noncanonical) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(
             ApiOpenRequest::parse(packet),
@@ -750,7 +752,7 @@ mod tests {
         );
         let empty = [0x01, 0x00, 0x00, 0x00];
         let Ok(packet) = Packet::parse(&empty) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(
             ApiOpenRequest::parse(packet),
@@ -767,18 +769,18 @@ mod tests {
         assert_eq!(response.encode(&mut frame), Ok(5));
         assert_eq!(frame, [0x81, 0x01, 0x00, 0x01, 7]);
         let Ok(packet) = Packet::parse(&frame) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(ApiOpenResponse::parse(packet), Ok(response));
 
         let close_frame = [0x01, 0x02, 0x00, 0x00];
         let Ok(close) = Packet::parse(&close_frame) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(parse_api_close(close), Ok(()));
         let bad_frame = [0x01, 0x02, 0x00, 0x01, 9];
         let Ok(bad) = Packet::parse(&bad_frame) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(
             parse_api_close(bad),
@@ -807,10 +809,10 @@ mod tests {
             ]
         );
         let Ok(packet) = Packet::parse(&frame) else {
-            return;
+            std::process::abort();
         };
         let Ok(parsed) = SdkApiRequest::parse(packet) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(parsed, request);
         assert_eq!(parsed.known_command(), Ok(SdkCommand::PsInit));
@@ -832,10 +834,10 @@ mod tests {
             ]
         );
         let Ok(packet) = Packet::parse(&frame) else {
-            return;
+            std::process::abort();
         };
         let Ok(parsed) = SdkApiRequest::parse(packet) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(parsed.known_command(), Ok(SdkCommand::GetPsInitComplete));
     }
@@ -855,7 +857,7 @@ mod tests {
             &[0x01, 0x06, 0x01, 0x68, 0x00, 0x19, 0x01, 0x64, 0, 0, 0, 1]
         );
         let Ok(packet) = Packet::parse(&frame) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(SdkApiRequest::parse(packet), Ok(request));
     }
@@ -1002,7 +1004,7 @@ mod tests {
             ]
         );
         let Ok(packet) = Packet::parse(&frame) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(SdkCallback::parse(packet), Ok(callback));
     }
@@ -1011,7 +1013,7 @@ mod tests {
     fn sdk_api_rejects_inner_length_mismatch_and_preserves_unknown_commands() {
         let bad = [0x01, 0x06, 0x00, 0x08, 0x12, 0x34, 0x00, 0x05, 0, 0, 0, 1];
         let Ok(packet) = Packet::parse(&bad) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(
             SdkApiRequest::parse(packet),
@@ -1023,10 +1025,10 @@ mod tests {
 
         let unknown = [0x01, 0x06, 0x00, 0x08, 0x12, 0x34, 0x00, 0x04, 0, 0, 0, 1];
         let Ok(packet) = Packet::parse(&unknown) else {
-            return;
+            std::process::abort();
         };
         let Ok(parsed) = SdkApiRequest::parse(packet) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(parsed.command, 0x1234);
         assert!(parsed.known_command().is_err());
