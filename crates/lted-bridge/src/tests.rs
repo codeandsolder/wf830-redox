@@ -161,6 +161,11 @@ fn daemon_startup_drives_ps_init_then_online_before_reporting_complete() {
     let transport = HciIo::new(Cursor::new(Vec::new()));
     let mut modem = Modem::new(transport);
     let mut bridge = DeviceBridge::new(1);
+    let init_query = SdkApiRequest {
+        command: SdkCommand::GetPsInitComplete as u16,
+        device_id: 1,
+        params: &[],
+    };
 
     assert_eq!(bridge.startup_phase(), StartupPhase::Idle);
     assert!(matches!(
@@ -169,6 +174,17 @@ fn daemon_startup_drives_ps_init_then_online_before_reporting_complete() {
     ));
     assert_eq!(bridge.startup_phase(), StartupPhase::AwaitingPsInit);
     assert_eq!(bridge.pending_count(), 1);
+
+    // The unchanged Polish P4 ltesms queries command 0 before the first
+    // PSInit response; this must complete locally and report not ready.
+    bridge
+        .handle_sdk_api(&mut server, &mut modem, id, init_query)
+        .unwrap_or_else(|_| std::process::abort());
+    assert_eq!(read_api_ret(&mut server, id), 0);
+    assert_eq!(
+        read_shared_byte(&mut server, id, PS_INIT_COMPLETE_OFFSET),
+        0
+    );
 
     let ps_init = ModemEvent::Result {
         kind: ResultResponseKind::PsInit,
@@ -179,6 +195,13 @@ fn daemon_startup_drives_ps_init_then_online_before_reporting_complete() {
         .unwrap_or_else(|_| std::process::abort());
     assert_eq!(bridge.startup_phase(), StartupPhase::NeedOnline);
     assert_eq!(bridge.pending_count(), 0);
+    bridge
+        .handle_sdk_api(&mut server, &mut modem, id, init_query)
+        .unwrap_or_else(|_| std::process::abort());
+    assert_eq!(
+        read_shared_byte(&mut server, id, PS_INIT_COMPLETE_OFFSET),
+        0
+    );
 
     assert!(matches!(
         bridge.drive_initialization(&mut modem),
@@ -186,6 +209,13 @@ fn daemon_startup_drives_ps_init_then_online_before_reporting_complete() {
     ));
     assert_eq!(bridge.startup_phase(), StartupPhase::AwaitingOnline);
     assert_eq!(bridge.pending_count(), 1);
+    bridge
+        .handle_sdk_api(&mut server, &mut modem, id, init_query)
+        .unwrap_or_else(|_| std::process::abort());
+    assert_eq!(
+        read_shared_byte(&mut server, id, PS_INIT_COMPLETE_OFFSET),
+        0
+    );
 
     let online = ModemEvent::Result {
         kind: ResultResponseKind::Online,
@@ -197,6 +227,10 @@ fn daemon_startup_drives_ps_init_then_online_before_reporting_complete() {
     assert_eq!(bridge.startup_phase(), StartupPhase::Complete);
     assert!(bridge.init_complete());
     assert_eq!(bridge.pending_count(), 0);
+    assert!(matches!(
+        bridge.handle_modem_event(&mut server, &online),
+        Ok(None),
+    ));
     assert!(matches!(bridge.drive_initialization(&mut modem), Ok(None)));
     assert_eq!(
         modem.into_transport().into_inner().into_inner(),
@@ -205,21 +239,14 @@ fn daemon_startup_drives_ps_init_then_online_before_reporting_complete() {
 
     let transport = HciIo::new(Cursor::new(Vec::new()));
     let mut modem = Modem::new(transport);
-    let request = SdkApiRequest {
-        command: SdkCommand::GetPsInitComplete as u16,
-        device_id: 1,
-        params: &[],
-    };
     bridge
-        .handle_sdk_api(&mut server, &mut modem, id, request)
+        .handle_sdk_api(&mut server, &mut modem, id, init_query)
         .unwrap_or_else(|_| std::process::abort());
-    let mut value = [0_u8; 1];
-    server
-        .client_context(id)
-        .unwrap_or_else(|_| std::process::abort())
-        .read(PS_INIT_COMPLETE_OFFSET, &mut value)
-        .unwrap_or_else(|_| std::process::abort());
-    assert_eq!(value, [1]);
+    assert_eq!(read_api_ret(&mut server, id), 0);
+    assert_eq!(
+        read_shared_byte(&mut server, id, PS_INIT_COMPLETE_OFFSET),
+        1
+    );
 }
 
 #[test]
