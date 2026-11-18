@@ -93,6 +93,15 @@ def main() -> int:
     if CLIENT not in CLIENTS:
         raise ValueError(f"Unsupported client: {CLIENT}")
     LOG.mkdir(exist_ok=True)
+    # Reject callback images left by prior runs.
+    image_names = (
+        ["rrc-set-image.bin", "rrc-get-image.bin"]
+        if CLIENT == "rrc_probe"
+        else [f"{CLIENT.removesuffix('_probe')}-image.bin"]
+        if CLIENT.endswith("_probe") else []
+    )
+    for filename in image_names:
+        (LOG / filename).unlink(missing_ok=True)
     master, slave = pty.openpty()
     tty.setraw(slave)
     daemon_log_path = LOG / f"gctd-{SCENARIO}.log"
