@@ -699,6 +699,23 @@ impl DeviceBridge {
         ))
     }
 
+    // Retire only after the exact stock callback was delivered successfully.
+    // Unrelated response families deliberately retire before broadcasting or
+    // remain pending across multipart delivery; do not route those here.
+    fn complete_tracked_callback(
+        &mut self,
+        server: &mut Server,
+        key: ResponseKey,
+        send: impl FnOnce(&mut Server, u32) -> Result<BroadcastReport, HandleError>,
+    ) -> Result<Option<BroadcastReport>, HandleError> {
+        if !self.pending.contains(key) {
+            return Ok(None);
+        }
+        let report = send(server, self.device_id)?;
+        self.pending.remove(key);
+        Ok(Some(report))
+    }
+
     fn handle_attach_ext_event(
         &mut self,
         server: &mut Server,
@@ -739,9 +756,9 @@ impl DeviceBridge {
             self.pending.remove(key);
             return Ok(None);
         }
-        let report = broadcast_rrc_capability_set_callback(server, self.device_id, response)?;
-        self.pending.remove(key);
-        Ok(Some(report))
+        self.complete_tracked_callback(server, key, |server, device_id| {
+            broadcast_rrc_capability_set_callback(server, device_id, response)
+        })
     }
 
     fn handle_rrc_capability_get_event(
@@ -749,13 +766,11 @@ impl DeviceBridge {
         server: &mut Server,
         response: RrcCapabilityGetResponse<'_>,
     ) -> Result<Option<BroadcastReport>, HandleError> {
-        let key = ResponseKey::RrcCapabilityGet(response.type_id);
-        if !self.pending.contains(key) {
-            return Ok(None);
-        }
-        let report = broadcast_rrc_capability_get_callback(server, self.device_id, response)?;
-        self.pending.remove(key);
-        Ok(Some(report))
+        self.complete_tracked_callback(
+            server,
+            ResponseKey::RrcCapabilityGet(response.type_id),
+            |server, device_id| broadcast_rrc_capability_get_callback(server, device_id, response),
+        )
     }
 
     fn handle_query_selected_plmn_event(
@@ -763,13 +778,11 @@ impl DeviceBridge {
         server: &mut Server,
         response: QuerySelectedPlmnResponse,
     ) -> Result<Option<BroadcastReport>, HandleError> {
-        let key = ResponseKey::QuerySelectedPlmn;
-        if !self.pending.contains(key) {
-            return Ok(None);
-        }
-        let report = broadcast_query_selected_plmn_callback(server, self.device_id, response)?;
-        self.pending.remove(key);
-        Ok(Some(report))
+        self.complete_tracked_callback(
+            server,
+            ResponseKey::QuerySelectedPlmn,
+            |server, device_id| broadcast_query_selected_plmn_callback(server, device_id, response),
+        )
     }
 
     fn handle_rrc_function_set_event(
@@ -777,13 +790,11 @@ impl DeviceBridge {
         server: &mut Server,
         response: RrcFunctionResponse<'_>,
     ) -> Result<Option<BroadcastReport>, HandleError> {
-        let key = ResponseKey::RrcFunctionSet(response.type_id);
-        if !self.pending.contains(key) {
-            return Ok(None);
-        }
-        let report = broadcast_rrc_function_set_callback(server, self.device_id, response)?;
-        self.pending.remove(key);
-        Ok(Some(report))
+        self.complete_tracked_callback(
+            server,
+            ResponseKey::RrcFunctionSet(response.type_id),
+            |server, device_id| broadcast_rrc_function_set_callback(server, device_id, response),
+        )
     }
 
     fn handle_rrc_function_get_event(
@@ -791,13 +802,11 @@ impl DeviceBridge {
         server: &mut Server,
         response: RrcFunctionResponse<'_>,
     ) -> Result<Option<BroadcastReport>, HandleError> {
-        let key = ResponseKey::RrcFunctionGet(response.type_id);
-        if !self.pending.contains(key) {
-            return Ok(None);
-        }
-        let report = broadcast_rrc_function_get_callback(server, self.device_id, response)?;
-        self.pending.remove(key);
-        Ok(Some(report))
+        self.complete_tracked_callback(
+            server,
+            ResponseKey::RrcFunctionGet(response.type_id),
+            |server, device_id| broadcast_rrc_function_get_callback(server, device_id, response),
+        )
     }
 
     fn handle_device_information_event(
@@ -834,13 +843,11 @@ impl DeviceBridge {
         server: &mut Server,
         response: SetProtocolInfoResponse<'_>,
     ) -> Result<Option<BroadcastReport>, HandleError> {
-        let key = ResponseKey::SetProtocolInfo(response.type_id);
-        if !self.pending.contains(key) {
-            return Ok(None);
-        }
-        let report = broadcast_set_protocol_info_callback(server, self.device_id, response)?;
-        self.pending.remove(key);
-        Ok(Some(report))
+        self.complete_tracked_callback(
+            server,
+            ResponseKey::SetProtocolInfo(response.type_id),
+            |server, device_id| broadcast_set_protocol_info_callback(server, device_id, response),
+        )
     }
 
     fn handle_uicc_event(
@@ -848,13 +855,11 @@ impl DeviceBridge {
         server: &mut Server,
         response: UiccResponse<'_>,
     ) -> Result<Option<BroadcastReport>, HandleError> {
-        let key = ResponseKey::Uicc(response.kind);
-        if !self.pending.contains(key) {
-            return Ok(None);
-        }
-        let report = broadcast_uicc_callback(server, self.device_id, response)?;
-        self.pending.remove(key);
-        Ok(Some(report))
+        self.complete_tracked_callback(
+            server,
+            ResponseKey::Uicc(response.kind),
+            |server, device_id| broadcast_uicc_callback(server, device_id, response),
+        )
     }
 
     fn handle_misc_read_event(
@@ -863,36 +868,27 @@ impl DeviceBridge {
         event: &ModemEvent<'_>,
     ) -> Result<Option<BroadcastReport>, HandleError> {
         match event {
-            ModemEvent::IccidRead(response) => {
-                if !self.pending.contains(ResponseKey::MiscRead) {
-                    return Ok(None);
-                }
-                let report = broadcast_iccid_callback(server, self.device_id, *response)?;
-                self.pending.remove(ResponseKey::MiscRead);
-                Ok(Some(report))
-            }
+            ModemEvent::IccidRead(response) => self.complete_tracked_callback(
+                server,
+                ResponseKey::MiscRead,
+                |server, device_id| broadcast_iccid_callback(server, device_id, *response),
+            ),
             ModemEvent::MobileIdRead(response) => {
                 if !self.pending.remove(ResponseKey::MiscRead) {
                     return Ok(None);
                 }
                 broadcast_mobile_id_callback(server, self.device_id, *response).map(Some)
             }
-            ModemEvent::TemperatureRead(response) => {
-                if !self.pending.contains(ResponseKey::MiscRead) {
-                    return Ok(None);
-                }
-                let report = broadcast_temperature_callback(server, self.device_id, *response)?;
-                self.pending.remove(ResponseKey::MiscRead);
-                Ok(Some(report))
-            }
-            ModemEvent::MsisdnRead(response) => {
-                if !self.pending.contains(ResponseKey::MiscRead) {
-                    return Ok(None);
-                }
-                let report = broadcast_msisdn_callback(server, self.device_id, *response)?;
-                self.pending.remove(ResponseKey::MiscRead);
-                Ok(Some(report))
-            }
+            ModemEvent::TemperatureRead(response) => self.complete_tracked_callback(
+                server,
+                ResponseKey::MiscRead,
+                |server, device_id| broadcast_temperature_callback(server, device_id, *response),
+            ),
+            ModemEvent::MsisdnRead(response) => self.complete_tracked_callback(
+                server,
+                ResponseKey::MiscRead,
+                |server, device_id| broadcast_msisdn_callback(server, device_id, *response),
+            ),
             ModemEvent::MiscReadFailure { .. } => {
                 self.pending.remove(ResponseKey::MiscRead);
                 Ok(None)
@@ -1266,21 +1262,36 @@ impl DeviceBridge {
         Ok(HandledCall::for_request(request, command, 0))
     }
 
+    // A tracked SDK call has one source of truth for its stock command ID.
+    // Requests requiring post-send state changes use the lower-level send API.
+    fn send_tracked_sdk<T: Write>(
+        &mut self,
+        modem: &mut Modem<T>,
+        request: SdkApiRequest<'_>,
+        command: ModemCommand<'_>,
+    ) -> Result<HandledCall, HandleError> {
+        let sdk_command = request
+            .known_command()
+            .map_err(|_| HandleError::UnsupportedCommand(request.command))?;
+        let bytes_written = modem.send_tracked_command(&mut self.pending, command)?;
+        Ok(HandledCall::for_request(
+            request,
+            sdk_command,
+            bytes_written,
+        ))
+    }
+
     fn dispatch_device_information<T: Write>(
         &mut self,
         modem: &mut Modem<T>,
         request: SdkApiRequest<'_>,
     ) -> Result<HandledCall, HandleError> {
         require_no_params(&request)?;
-        let bytes_written = modem.send_tracked_command(
-            &mut self.pending,
-            ModemCommand::DeviceInformation(DeviceInformationRequest),
-        )?;
-        Ok(HandledCall::for_request(
+        self.send_tracked_sdk(
+            modem,
             request,
-            SdkCommand::GetDeviceInformation,
-            bytes_written,
-        ))
+            ModemCommand::DeviceInformation(DeviceInformationRequest),
+        )
     }
 
     fn dispatch_nas_config_set<T: Write>(
@@ -1320,15 +1331,7 @@ impl DeviceBridge {
     ) -> Result<HandledCall, HandleError> {
         let modem_request = decode_legacy_set_protocol_info(request.params)
             .map_err(HandleError::LegacySetProtocolInfo)?;
-        let bytes_written = modem.send_tracked_command(
-            &mut self.pending,
-            ModemCommand::SetProtocolInfo(modem_request),
-        )?;
-        Ok(HandledCall::for_request(
-            request,
-            SdkCommand::SetProtocolInfo,
-            bytes_written,
-        ))
+        self.send_tracked_sdk(modem, request, ModemCommand::SetProtocolInfo(modem_request))
     }
 
     fn dispatch_rrc_request<T: Write>(
@@ -1353,15 +1356,11 @@ impl DeviceBridge {
     ) -> Result<HandledCall, HandleError> {
         let modem_request = decode_legacy_rrc_capability_set(request.params)
             .map_err(HandleError::LegacyRrcCapability)?;
-        let bytes_written = modem.send_tracked_command(
-            &mut self.pending,
-            ModemCommand::RrcCapabilitySet(modem_request),
-        )?;
-        Ok(HandledCall::for_request(
+        self.send_tracked_sdk(
+            modem,
             request,
-            SdkCommand::RrcCapabilityControl,
-            bytes_written,
-        ))
+            ModemCommand::RrcCapabilitySet(modem_request),
+        )
     }
 
     fn dispatch_rrc_capability_get<T: Write>(
@@ -1371,15 +1370,11 @@ impl DeviceBridge {
     ) -> Result<HandledCall, HandleError> {
         let modem_request = decode_legacy_rrc_capability_get(request.params)
             .map_err(HandleError::LegacyRrcCapability)?;
-        let bytes_written = modem.send_tracked_command(
-            &mut self.pending,
-            ModemCommand::RrcCapabilityGet(modem_request),
-        )?;
-        Ok(HandledCall::for_request(
+        self.send_tracked_sdk(
+            modem,
             request,
-            SdkCommand::RrcCapabilityControlGet,
-            bytes_written,
-        ))
+            ModemCommand::RrcCapabilityGet(modem_request),
+        )
     }
 
     fn dispatch_query_selected_plmn<T: Write>(
@@ -1388,15 +1383,11 @@ impl DeviceBridge {
         request: SdkApiRequest<'_>,
     ) -> Result<HandledCall, HandleError> {
         require_no_params(&request)?;
-        let bytes_written = modem.send_tracked_command(
-            &mut self.pending,
-            ModemCommand::QuerySelectedPlmn(QuerySelectedPlmnRequest),
-        )?;
-        Ok(HandledCall::for_request(
+        self.send_tracked_sdk(
+            modem,
             request,
-            SdkCommand::QuerySelectedPlmn,
-            bytes_written,
-        ))
+            ModemCommand::QuerySelectedPlmn(QuerySelectedPlmnRequest),
+        )
     }
 
     fn dispatch_rrc_function_set<T: Write>(
@@ -1414,18 +1405,14 @@ impl DeviceBridge {
         } else {
             legacy.data
         };
-        let bytes_written = modem.send_tracked_command(
-            &mut self.pending,
+        self.send_tracked_sdk(
+            modem,
+            request,
             ModemCommand::RrcFunctionSet(RrcFunctionSetRequest {
                 type_id: legacy.type_id,
                 data,
             }),
-        )?;
-        Ok(HandledCall::for_request(
-            request,
-            SdkCommand::RrcFunctionControl,
-            bytes_written,
-        ))
+        )
     }
 
     fn dispatch_rrc_function_get<T: Write>(
@@ -1435,15 +1422,7 @@ impl DeviceBridge {
     ) -> Result<HandledCall, HandleError> {
         let modem_request = decode_legacy_rrc_function_get(request.params)
             .map_err(HandleError::LegacyRrcFunction)?;
-        let bytes_written = modem.send_tracked_command(
-            &mut self.pending,
-            ModemCommand::RrcFunctionGet(modem_request),
-        )?;
-        Ok(HandledCall::for_request(
-            request,
-            SdkCommand::RrcFunctionControlGet,
-            bytes_written,
-        ))
+        self.send_tracked_sdk(modem, request, ModemCommand::RrcFunctionGet(modem_request))
     }
 
     fn dispatch_emm_timer_control<T: Write>(
@@ -1537,15 +1516,11 @@ impl DeviceBridge {
         let modem_request = EmmNiReattachControlRequest {
             control: u32::from_be_bytes(bytes),
         };
-        let bytes_written = modem.send_tracked_command(
-            &mut self.pending,
-            ModemCommand::EmmNiReattachControl(modem_request),
-        )?;
-        Ok(HandledCall::for_request(
+        self.send_tracked_sdk(
+            modem,
             request,
-            SdkCommand::EmmNiReattachControl,
-            bytes_written,
-        ))
+            ModemCommand::EmmNiReattachControl(modem_request),
+        )
     }
 
     fn dispatch_rf_status_report_control<T: Write>(
@@ -1561,15 +1536,11 @@ impl DeviceBridge {
             thresh_idle: u16::from_be_bytes([bytes[6], bytes[7]]),
             thresh_connect: u16::from_be_bytes([bytes[8], bytes[9]]),
         };
-        let bytes_written = modem.send_tracked_command(
-            &mut self.pending,
-            ModemCommand::RfStatusReportControl(modem_request),
-        )?;
-        Ok(HandledCall::for_request(
+        self.send_tracked_sdk(
+            modem,
             request,
-            SdkCommand::RfStatusReportControl,
-            bytes_written,
-        ))
+            ModemCommand::RfStatusReportControl(modem_request),
+        )
     }
 
     fn dispatch_rf_measure_report<T: Write>(
@@ -1578,15 +1549,11 @@ impl DeviceBridge {
         request: SdkApiRequest<'_>,
     ) -> Result<HandledCall, HandleError> {
         let &[control] = exact_params::<1>(&request)?;
-        let bytes_written = modem.send_tracked_command(
-            &mut self.pending,
-            ModemCommand::RfMeasureReport(RfMeasureReportRequest { control }),
-        )?;
-        Ok(HandledCall::for_request(
+        self.send_tracked_sdk(
+            modem,
             request,
-            SdkCommand::RfMeasureReport,
-            bytes_written,
-        ))
+            ModemCommand::RfMeasureReport(RfMeasureReportRequest { control }),
+        )
     }
 
     fn dispatch_ue_mode_change<T: Write>(
@@ -1595,15 +1562,11 @@ impl DeviceBridge {
         request: SdkApiRequest<'_>,
     ) -> Result<HandledCall, HandleError> {
         let &[mode] = exact_params::<1>(&request)?;
-        let bytes_written = modem.send_tracked_command(
-            &mut self.pending,
-            ModemCommand::UeModeChange(UeModeChangeRequest { mode }),
-        )?;
-        Ok(HandledCall::for_request(
+        self.send_tracked_sdk(
+            modem,
             request,
-            SdkCommand::UeModeChange,
-            bytes_written,
-        ))
+            ModemCommand::UeModeChange(UeModeChangeRequest { mode }),
+        )
     }
 
     fn dispatch_contents_reset_and_delete<T: Write>(
@@ -1612,17 +1575,13 @@ impl DeviceBridge {
         request: SdkApiRequest<'_>,
     ) -> Result<HandledCall, HandleError> {
         let bytes = *exact_params::<4>(&request)?;
-        let bytes_written = modem.send_tracked_command(
-            &mut self.pending,
+        self.send_tracked_sdk(
+            modem,
+            request,
             ModemCommand::ContentsResetAndDelete(ContentsResetAndDeleteRequest {
                 mask_id: u32::from_be_bytes(bytes),
             }),
-        )?;
-        Ok(HandledCall::for_request(
-            request,
-            SdkCommand::ContentsResetAndDelete,
-            bytes_written,
-        ))
+        )
     }
 
     fn dispatch_plmn_search_stop<T: Write>(
@@ -1631,15 +1590,11 @@ impl DeviceBridge {
         request: SdkApiRequest<'_>,
     ) -> Result<HandledCall, HandleError> {
         let &[search_type] = exact_params::<1>(&request)?;
-        let bytes_written = modem.send_tracked_command(
-            &mut self.pending,
-            ModemCommand::PlmnSearchStop(PlmnSearchStopRequest { search_type }),
-        )?;
-        Ok(HandledCall::for_request(
+        self.send_tracked_sdk(
+            modem,
             request,
-            SdkCommand::PlmnSearchStop,
-            bytes_written,
-        ))
+            ModemCommand::PlmnSearchStop(PlmnSearchStopRequest { search_type }),
+        )
     }
 
     fn dispatch_plmn_search_ext<T: Write>(
@@ -1649,13 +1604,7 @@ impl DeviceBridge {
     ) -> Result<HandledCall, HandleError> {
         let params = exact_params::<LEGACY_PLMN_SEARCH_EXT_PARAMS_LEN>(&request)?;
         let search = decode_legacy_plmn_search_ext(params);
-        let bytes_written =
-            modem.send_tracked_command(&mut self.pending, ModemCommand::PlmnSearchExt(search))?;
-        Ok(HandledCall::for_request(
-            request,
-            SdkCommand::PlmnSearchExt,
-            bytes_written,
-        ))
+        self.send_tracked_sdk(modem, request, ModemCommand::PlmnSearchExt(search))
     }
 
     fn dispatch_plmn_search<T: Write>(
@@ -1665,13 +1614,7 @@ impl DeviceBridge {
     ) -> Result<HandledCall, HandleError> {
         let params = exact_params::<LEGACY_PLMN_SEARCH_PARAMS_LEN>(&request)?;
         let search = decode_legacy_plmn_search(params);
-        let bytes_written =
-            modem.send_tracked_command(&mut self.pending, ModemCommand::PlmnSearch(search))?;
-        Ok(HandledCall::for_request(
-            request,
-            SdkCommand::PlmnSearch,
-            bytes_written,
-        ))
+        self.send_tracked_sdk(modem, request, ModemCommand::PlmnSearch(search))
     }
 
     fn dispatch_detach<T: Write>(
@@ -1728,13 +1671,7 @@ impl DeviceBridge {
     ) -> Result<HandledCall, HandleError> {
         let pdn = decode_legacy_pdn_connect_ext(request.params)
             .map_err(HandleError::LegacyPdnConnectExt)?;
-        let bytes_written =
-            modem.send_tracked_command(&mut self.pending, ModemCommand::PdnConnectExt(pdn))?;
-        Ok(HandledCall::for_request(
-            request,
-            SdkCommand::PdnConnectExt,
-            bytes_written,
-        ))
+        self.send_tracked_sdk(modem, request, ModemCommand::PdnConnectExt(pdn))
     }
 
     fn dispatch_pdn_disconnect<T: Write>(
@@ -1763,13 +1700,7 @@ impl DeviceBridge {
     ) -> Result<HandledCall, HandleError> {
         let attach =
             decode_legacy_attach_ext(request.params).map_err(HandleError::LegacyAttachExt)?;
-        let bytes_written =
-            modem.send_tracked_command(&mut self.pending, ModemCommand::AttachExt(attach))?;
-        Ok(HandledCall::for_request(
-            request,
-            SdkCommand::AttachExt,
-            bytes_written,
-        ))
+        self.send_tracked_sdk(modem, request, ModemCommand::AttachExt(attach))
     }
 
     fn dispatch_attach<T: Write>(
@@ -1863,15 +1794,11 @@ impl DeviceBridge {
         request: SdkApiRequest<'_>,
     ) -> Result<HandledCall, HandleError> {
         require_no_params(&request)?;
-        let bytes_written = modem.send_tracked_command(
-            &mut self.pending,
-            ModemCommand::TemperatureRead(TemperatureReadRequest),
-        )?;
-        Ok(HandledCall::for_request(
+        self.send_tracked_sdk(
+            modem,
             request,
-            SdkCommand::TemperatureRead,
-            bytes_written,
-        ))
+            ModemCommand::TemperatureRead(TemperatureReadRequest),
+        )
     }
 
     fn dispatch_iccid_read<T: Write>(
@@ -1880,13 +1807,7 @@ impl DeviceBridge {
         request: SdkApiRequest<'_>,
     ) -> Result<HandledCall, HandleError> {
         require_no_params(&request)?;
-        let bytes_written = modem
-            .send_tracked_command(&mut self.pending, ModemCommand::IccidRead(IccidReadRequest))?;
-        Ok(HandledCall::for_request(
-            request,
-            SdkCommand::IccidRead,
-            bytes_written,
-        ))
+        self.send_tracked_sdk(modem, request, ModemCommand::IccidRead(IccidReadRequest))
     }
 
     fn dispatch_msisdn_read<T: Write>(
@@ -1895,15 +1816,7 @@ impl DeviceBridge {
         request: SdkApiRequest<'_>,
     ) -> Result<HandledCall, HandleError> {
         require_no_params(&request)?;
-        let bytes_written = modem.send_tracked_command(
-            &mut self.pending,
-            ModemCommand::MsisdnRead(MsisdnReadRequest),
-        )?;
-        Ok(HandledCall::for_request(
-            request,
-            SdkCommand::MsisdnRead,
-            bytes_written,
-        ))
+        self.send_tracked_sdk(modem, request, ModemCommand::MsisdnRead(MsisdnReadRequest))
     }
 
     fn dispatch_mobile_id_read<T: Write>(
@@ -1912,15 +1825,11 @@ impl DeviceBridge {
         request: SdkApiRequest<'_>,
     ) -> Result<HandledCall, HandleError> {
         let &[mobile_id_type] = exact_params::<1>(&request)?;
-        let bytes_written = modem.send_tracked_command(
-            &mut self.pending,
-            ModemCommand::MobileIdRead(MobileIdReadRequest { mobile_id_type }),
-        )?;
-        Ok(HandledCall::for_request(
+        self.send_tracked_sdk(
+            modem,
             request,
-            SdkCommand::MobileIdRead,
-            bytes_written,
-        ))
+            ModemCommand::MobileIdRead(MobileIdReadRequest { mobile_id_type }),
+        )
     }
 
     fn dispatch_zero_parameter<T: Write>(

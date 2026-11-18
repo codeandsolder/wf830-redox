@@ -58,84 +58,55 @@ pub enum SdkCallbackKind {
 }
 
 impl SdkCallbackKind {
-    #[must_use]
-    pub const fn callback_id(self) -> u16 {
+    // Keep each proven live-P4 callback ID paired with its cb_rsp[] slot.
+    // These are independent OEM values, not an arithmetic offset or sequence.
+    const fn mapping(self) -> (u16, usize) {
         match self {
-            Self::Attach => 26,
-            Self::AttachExt => 28,
-            Self::Detach => 30,
-            Self::DetachRequired => 31,
-            Self::PdnConnect => 33,
-            Self::PdnConnectExt => 35,
-            Self::PdnDisconnect => 37,
-            Self::PlmnSearch => 41,
-            Self::PlmnSearchStop => 64,
-            Self::ContentsResetAndDelete => 66,
-            Self::PlmnList => 45,
-            Self::QuerySelectedPlmn => 54,
-            Self::Online => 59,
-            Self::Offline => 62,
-            Self::PsInit => 68,
-            Self::MobileIdRead => 77,
-            Self::IccidRead => 79,
-            Self::MsisdnRead => 81,
-            Self::TemperatureRead => 83,
-            Self::AtCommandFromDevice => 126,
-            Self::AtCommandFromDeviceExt => 128,
-            Self::UiccFromDevice => 148,
-            Self::UeModeChange => 162,
-            Self::RfStatusReportControl => 188,
-            Self::RfMeasureReport => 203,
-            Self::RfMeasureReportIndication => 204,
-            Self::EmmNiReattachControl => 308,
-            Self::EmmReattachControlReport => 309,
-            Self::RrcCapabilityControl => 221,
-            Self::RrcCapabilityControlGet => 223,
-            Self::RrcFunctionControl => 225,
-            Self::RrcFunctionControlGet => 227,
-            Self::SetProtocolInfo => 178,
-            Self::GetNasConfig => 305,
+            Self::Attach => (26, 2),
+            Self::AttachExt => (28, 3),
+            Self::Detach => (30, 4),
+            Self::DetachRequired => (31, 5),
+            Self::PdnConnect => (33, 6),
+            Self::PdnConnectExt => (35, 7),
+            Self::PdnDisconnect => (37, 8),
+            Self::PlmnSearch => (41, 9),
+            Self::PlmnSearchStop => (64, 20),
+            Self::ContentsResetAndDelete => (66, 21),
+            Self::PlmnList => (45, 11),
+            Self::QuerySelectedPlmn => (54, 16),
+            Self::Online => (59, 18),
+            Self::Offline => (62, 19),
+            Self::PsInit => (68, 22),
+            Self::MobileIdRead => (77, 26),
+            Self::IccidRead => (79, 27),
+            Self::MsisdnRead => (81, 28),
+            Self::TemperatureRead => (83, 29),
+            Self::AtCommandFromDevice => (126, 60),
+            Self::AtCommandFromDeviceExt => (128, 61),
+            Self::UiccFromDevice => (148, 71),
+            Self::UeModeChange => (162, 82),
+            Self::RfStatusReportControl => (188, 95),
+            Self::RfMeasureReport => (203, 106),
+            Self::RfMeasureReportIndication => (204, 107),
+            Self::EmmNiReattachControl => (308, 159),
+            Self::EmmReattachControlReport => (309, 160),
+            Self::RrcCapabilityControl => (221, 115),
+            Self::RrcCapabilityControlGet => (223, 116),
+            Self::RrcFunctionControl => (225, 117),
+            Self::RrcFunctionControlGet => (227, 118),
+            Self::SetProtocolInfo => (178, 90),
+            Self::GetNasConfig => (305, 157),
         }
     }
 
     #[must_use]
+    pub const fn callback_id(self) -> u16 {
+        self.mapping().0
+    }
+
+    #[must_use]
     pub const fn registration_index(self) -> usize {
-        match self {
-            Self::Attach => 2,
-            Self::AttachExt => 3,
-            Self::Detach => 4,
-            Self::DetachRequired => 5,
-            Self::PdnConnect => 6,
-            Self::PdnConnectExt => 7,
-            Self::PdnDisconnect => 8,
-            Self::PlmnSearch => 9,
-            Self::PlmnSearchStop => 20,
-            Self::ContentsResetAndDelete => 21,
-            Self::PlmnList => 11,
-            Self::QuerySelectedPlmn => 16,
-            Self::Online => 18,
-            Self::Offline => 19,
-            Self::PsInit => 22,
-            Self::MobileIdRead => 26,
-            Self::IccidRead => 27,
-            Self::MsisdnRead => 28,
-            Self::TemperatureRead => 29,
-            Self::AtCommandFromDevice => 60,
-            Self::AtCommandFromDeviceExt => 61,
-            Self::UiccFromDevice => 71,
-            Self::UeModeChange => 82,
-            Self::RfStatusReportControl => 95,
-            Self::RfMeasureReport => 106,
-            Self::RfMeasureReportIndication => 107,
-            Self::EmmNiReattachControl => 159,
-            Self::EmmReattachControlReport => 160,
-            Self::RrcCapabilityControl => 115,
-            Self::RrcCapabilityControlGet => 116,
-            Self::RrcFunctionControl => 117,
-            Self::RrcFunctionControlGet => 118,
-            Self::SetProtocolInfo => 90,
-            Self::GetNasConfig => 157,
-        }
+        self.mapping().1
     }
 
     #[must_use]
@@ -647,6 +618,8 @@ impl<'a> SdkCallback<'a> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::{
         ApiOpenRequest, ApiOpenResponse, Event, Header, MessageDecodeError, Packet,
         PacketDecodeError, SdkApiRequest, SdkCallback, SdkCallbackKind, SdkCommand,
@@ -763,13 +736,13 @@ mod tests {
         assert_eq!(request.encode(&mut frame), Ok(8));
         assert_eq!(frame, [0x01, 0x00, 0x00, 0x04, 0, 0, 0x12, 0x34]);
         let Ok(packet) = Packet::parse(&frame) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(ApiOpenRequest::parse(packet), Ok(request));
 
         let noncanonical = [0x01, 0x00, 0x00, 0x04, 0xde, 0xad, 0xbe, 0xef];
         let Ok(packet) = Packet::parse(&noncanonical) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(
             ApiOpenRequest::parse(packet),
@@ -779,7 +752,7 @@ mod tests {
         );
         let empty = [0x01, 0x00, 0x00, 0x00];
         let Ok(packet) = Packet::parse(&empty) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(
             ApiOpenRequest::parse(packet),
@@ -796,18 +769,18 @@ mod tests {
         assert_eq!(response.encode(&mut frame), Ok(5));
         assert_eq!(frame, [0x81, 0x01, 0x00, 0x01, 7]);
         let Ok(packet) = Packet::parse(&frame) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(ApiOpenResponse::parse(packet), Ok(response));
 
         let close_frame = [0x01, 0x02, 0x00, 0x00];
         let Ok(close) = Packet::parse(&close_frame) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(parse_api_close(close), Ok(()));
         let bad_frame = [0x01, 0x02, 0x00, 0x01, 9];
         let Ok(bad) = Packet::parse(&bad_frame) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(
             parse_api_close(bad),
@@ -836,10 +809,10 @@ mod tests {
             ]
         );
         let Ok(packet) = Packet::parse(&frame) else {
-            return;
+            std::process::abort();
         };
         let Ok(parsed) = SdkApiRequest::parse(packet) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(parsed, request);
         assert_eq!(parsed.known_command(), Ok(SdkCommand::PsInit));
@@ -861,10 +834,10 @@ mod tests {
             ]
         );
         let Ok(packet) = Packet::parse(&frame) else {
-            return;
+            std::process::abort();
         };
         let Ok(parsed) = SdkApiRequest::parse(packet) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(parsed.known_command(), Ok(SdkCommand::GetPsInitComplete));
     }
@@ -884,7 +857,7 @@ mod tests {
             &[0x01, 0x06, 0x01, 0x68, 0x00, 0x19, 0x01, 0x64, 0, 0, 0, 1]
         );
         let Ok(packet) = Packet::parse(&frame) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(SdkApiRequest::parse(packet), Ok(request));
     }
@@ -1031,7 +1004,7 @@ mod tests {
             ]
         );
         let Ok(packet) = Packet::parse(&frame) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(SdkCallback::parse(packet), Ok(callback));
     }
@@ -1040,7 +1013,7 @@ mod tests {
     fn sdk_api_rejects_inner_length_mismatch_and_preserves_unknown_commands() {
         let bad = [0x01, 0x06, 0x00, 0x08, 0x12, 0x34, 0x00, 0x05, 0, 0, 0, 1];
         let Ok(packet) = Packet::parse(&bad) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(
             SdkApiRequest::parse(packet),
@@ -1052,10 +1025,10 @@ mod tests {
 
         let unknown = [0x01, 0x06, 0x00, 0x08, 0x12, 0x34, 0x00, 0x04, 0, 0, 0, 1];
         let Ok(packet) = Packet::parse(&unknown) else {
-            return;
+            std::process::abort();
         };
         let Ok(parsed) = SdkApiRequest::parse(packet) else {
-            return;
+            std::process::abort();
         };
         assert_eq!(parsed.command, 0x1234);
         assert!(parsed.known_command().is_err());

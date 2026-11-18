@@ -8,7 +8,8 @@ use gct_hci::{
 use crate::common::{
     ApnType, OrderedPdnTlv, PcoInfo, PdnConnectionControl, PdnInfoContainers,
     PdnResponseDecodeError, PdnResponseField, ResponseDecodeError, be_u16, be_u32,
-    bounded_pdn_field, exact_pdn_field, prefix_payload, required_pdn_tlv, split_initial_pdn_info,
+    bounded_pdn_field, exact_pdn_field, parse_extended_pdn_fields, prefix_payload,
+    required_pdn_tlv, split_initial_pdn_info,
 };
 
 /// Proven ten-byte fixed prefix of normal PDN-connect response `0xb106`.
@@ -351,26 +352,8 @@ impl<'a> PdnConnectExtResponse<'a> {
     /// container framing.
     pub fn parse(packet: Packet<'a>) -> Result<Self, PdnResponseDecodeError> {
         let prefix = PdnConnectExtResponsePrefix::parse(packet)?;
-        let mut cursor = TlvCursor::new(prefix.optional_fields);
+        let fields = parse_extended_pdn_fields(prefix.optional_fields)?;
 
-        let apn_class = required_pdn_tlv(&mut cursor, PdnResponseField::ApnClass)?;
-        exact_pdn_field(PdnResponseField::ApnClass, apn_class.payload, 1)?;
-        let requested =
-            required_pdn_tlv(&mut cursor, PdnResponseField::RequestedApnNetworkIdentifier)?;
-        bounded_pdn_field(
-            PdnResponseField::RequestedApnNetworkIdentifier,
-            requested.payload,
-            64,
-        )?;
-        let received =
-            required_pdn_tlv(&mut cursor, PdnResponseField::ReceivedApnNetworkIdentifier)?;
-        bounded_pdn_field(
-            PdnResponseField::ReceivedApnNetworkIdentifier,
-            received.payload,
-            64,
-        )?;
-
-        let (initial_pdn_info, unparsed_suffix) = split_initial_pdn_info(cursor.remaining())?;
         Ok(Self {
             result: prefix.result,
             reject_cause1: prefix.reject_cause1,
@@ -379,18 +362,12 @@ impl<'a> PdnConnectExtResponse<'a> {
             data_path: prefix.data_path,
             ip_alloc: prefix.ip_alloc,
             throttle_time: prefix.throttle_time,
-            apn_class_kind: apn_class.kind,
-            apn_class: apn_class.payload[0],
-            requested_apn_ni: OrderedPdnTlv {
-                kind: requested.kind,
-                payload: requested.payload,
-            },
-            received_apn_ni: OrderedPdnTlv {
-                kind: received.kind,
-                payload: received.payload,
-            },
-            initial_pdn_info,
-            unparsed_suffix,
+            apn_class_kind: fields.apn_class_kind,
+            apn_class: fields.apn_class,
+            requested_apn_ni: fields.requested_apn_ni,
+            received_apn_ni: fields.received_apn_ni,
+            initial_pdn_info: fields.initial_pdn_info,
+            unparsed_suffix: fields.unparsed_suffix,
         })
     }
 

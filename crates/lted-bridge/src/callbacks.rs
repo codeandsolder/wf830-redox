@@ -13,7 +13,8 @@ use gct_lapi::{
     misc::{IccidReadResponse, MobileIdReadResponse, MsisdnReadResponse, TemperatureReadResponse},
     pdn::{PdnConnectExtResponse, PdnConnectResponse, PdnDisconnectResponse},
     plmn::{
-        PlmnListResponse, PlmnSearchResponse, PlmnSearchStopResponse, QuerySelectedPlmnResponse,
+        PlmnInfoCursor, PlmnInfoDecodeError, PlmnListResponse, PlmnSearchResponse,
+        PlmnSearchStopResponse, QuerySelectedPlmnResponse,
     },
     rf::{RfMeasureReportIndication, RfMeasureReportResponse, RfStatusReportControlResponse},
     rrc::{
@@ -40,6 +41,45 @@ use crate::{
     },
 };
 
+// Keep the stock callback envelope and subscription gate in one place.
+// Fixed-size callbacks retain stack allocation; variable callbacks supply their
+// own bounded/heap buffer. The message identifies the violated ABI contract.
+fn broadcast_encoded_callback(
+    server: &mut Server,
+    device_id: u32,
+    callback_kind: SdkCallbackKind,
+    data: &[u8],
+    frame: &mut [u8],
+    encode_error: &'static str,
+) -> Result<BroadcastReport, HandleError> {
+    let frame_len = SdkCallback {
+        callback_id: callback_kind.callback_id(),
+        device_id,
+        data,
+    }
+    .encode(frame)
+    .map_err(|_| HandleError::Ipc(io::Error::new(io::ErrorKind::InvalidData, encode_error)))?;
+    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
+}
+
+fn broadcast_fixed_callback<const FRAME_LEN: usize>(
+    server: &mut Server,
+    device_id: u32,
+    callback_kind: SdkCallbackKind,
+    data: &[u8],
+    encode_error: &'static str,
+) -> Result<BroadcastReport, HandleError> {
+    let mut frame = [0_u8; FRAME_LEN];
+    broadcast_encoded_callback(
+        server,
+        device_id,
+        callback_kind,
+        data,
+        &mut frame,
+        encode_error,
+    )
+}
+
 /// Materialize and broadcast stock callback 26 (`Attach`).
 ///
 /// The live daemon sends the complete 2,187-byte `_ATTACH_RSP_INFO` memory
@@ -57,22 +97,13 @@ pub(crate) fn broadcast_attach_callback(
 ) -> Result<BroadcastReport, HandleError> {
     let mut data = [0_u8; STOCK_ATTACH_CALLBACK_DATA_LEN];
     materialize_attach_callback(response, &mut data).map_err(HandleError::AttachCallback)?;
-    let callback_kind = SdkCallbackKind::Attach;
-    let mut frame = [0_u8; STOCK_ATTACH_CALLBACK_FRAME_LEN];
-    let frame_len = SdkCallback {
-        callback_id: callback_kind.callback_id(),
+    broadcast_fixed_callback::<STOCK_ATTACH_CALLBACK_FRAME_LEN>(
+        server,
         device_id,
-        data: &data,
-    }
-    .encode(&mut frame)
-    .map_err(|_| {
-        HandleError::Ipc(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "fixed-size Attach callback failed to encode",
-        ))
-    })?;
-
-    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
+        SdkCallbackKind::Attach,
+        &data,
+        "fixed-size Attach callback failed to encode",
+    )
 }
 
 /// Materialize and broadcast live-P4 stock callback 28 (`Attach EXT`).
@@ -90,22 +121,13 @@ pub(crate) fn broadcast_attach_ext_callback(
 ) -> Result<BroadcastReport, HandleError> {
     let mut data = [0_u8; STOCK_ATTACH_EXT_CALLBACK_DATA_LEN];
     materialize_attach_ext_callback(response, &mut data).map_err(HandleError::AttachExtCallback)?;
-    let callback_kind = SdkCallbackKind::AttachExt;
-    let mut frame = [0_u8; STOCK_ATTACH_EXT_CALLBACK_FRAME_LEN];
-    let frame_len = SdkCallback {
-        callback_id: callback_kind.callback_id(),
+    broadcast_fixed_callback::<STOCK_ATTACH_EXT_CALLBACK_FRAME_LEN>(
+        server,
         device_id,
-        data: &data,
-    }
-    .encode(&mut frame)
-    .map_err(|_| {
-        HandleError::Ipc(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "fixed-size extended-Attach callback failed to encode",
-        ))
-    })?;
-
-    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
+        SdkCallbackKind::AttachExt,
+        &data,
+        "fixed-size extended-Attach callback failed to encode",
+    )
 }
 
 const STOCK_DETACH_CALLBACK_DATA_LEN: usize = 8;
@@ -129,22 +151,13 @@ pub(crate) fn broadcast_detach_callback(
     data[4..6].copy_from_slice(&response.deregister_cause1.to_be_bytes());
     data[6..8].copy_from_slice(&response.deregister_cause2.to_be_bytes());
 
-    let callback_kind = SdkCallbackKind::Detach;
-    let mut frame = [0_u8; STOCK_DETACH_CALLBACK_FRAME_LEN];
-    let frame_len = SdkCallback {
-        callback_id: callback_kind.callback_id(),
+    broadcast_fixed_callback::<STOCK_DETACH_CALLBACK_FRAME_LEN>(
+        server,
         device_id,
-        data: &data,
-    }
-    .encode(&mut frame)
-    .map_err(|_| {
-        HandleError::Ipc(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "fixed-size Detach callback failed to encode",
-        ))
-    })?;
-
-    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
+        SdkCallbackKind::Detach,
+        &data,
+        "fixed-size Detach callback failed to encode",
+    )
 }
 
 const STOCK_DETACH_REQUIRED_CALLBACK_DATA_LEN: usize = 4;
@@ -167,22 +180,13 @@ pub(crate) fn broadcast_detach_required_callback(
     indication: DetachRequiredIndication,
 ) -> Result<BroadcastReport, HandleError> {
     let data = indication.detach_type.to_be_bytes();
-    let callback_kind = SdkCallbackKind::DetachRequired;
-    let mut frame = [0_u8; STOCK_DETACH_REQUIRED_CALLBACK_FRAME_LEN];
-    let frame_len = SdkCallback {
-        callback_id: callback_kind.callback_id(),
+    broadcast_fixed_callback::<STOCK_DETACH_REQUIRED_CALLBACK_FRAME_LEN>(
+        server,
         device_id,
-        data: &data,
-    }
-    .encode(&mut frame)
-    .map_err(|_| {
-        HandleError::Ipc(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "fixed-size Detach Required callback failed to encode",
-        ))
-    })?;
-
-    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
+        SdkCallbackKind::DetachRequired,
+        &data,
+        "fixed-size Detach Required callback failed to encode",
+    )
 }
 
 /// Materialize and broadcast stock callback 33 (`PDNConn`).
@@ -203,22 +207,13 @@ pub(crate) fn broadcast_pdn_connect_callback(
     let mut data = [0_u8; STOCK_PDN_CONNECT_CALLBACK_DATA_LEN];
     materialize_pdn_connect_callback(response, &mut data)
         .map_err(HandleError::PdnConnectCallback)?;
-    let callback_kind = SdkCallbackKind::PdnConnect;
-    let mut frame = [0_u8; STOCK_PDN_CONNECT_CALLBACK_FRAME_LEN];
-    let frame_len = SdkCallback {
-        callback_id: callback_kind.callback_id(),
+    broadcast_fixed_callback::<STOCK_PDN_CONNECT_CALLBACK_FRAME_LEN>(
+        server,
         device_id,
-        data: &data,
-    }
-    .encode(&mut frame)
-    .map_err(|_| {
-        HandleError::Ipc(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "fixed-size PDN-connect callback failed to encode",
-        ))
-    })?;
-
-    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
+        SdkCallbackKind::PdnConnect,
+        &data,
+        "fixed-size PDN-connect callback failed to encode",
+    )
 }
 
 /// Materialize and broadcast live-P4 stock callback 35 (`PDNConn EXT`).
@@ -239,22 +234,13 @@ pub(crate) fn broadcast_pdn_connect_ext_callback(
     let mut data = [0_u8; STOCK_PDN_CONNECT_EXT_CALLBACK_DATA_LEN];
     materialize_pdn_connect_ext_callback(response, &mut data)
         .map_err(HandleError::PdnConnectExtCallback)?;
-    let callback_kind = SdkCallbackKind::PdnConnectExt;
-    let mut frame = [0_u8; STOCK_PDN_CONNECT_EXT_CALLBACK_FRAME_LEN];
-    let frame_len = SdkCallback {
-        callback_id: callback_kind.callback_id(),
+    broadcast_fixed_callback::<STOCK_PDN_CONNECT_EXT_CALLBACK_FRAME_LEN>(
+        server,
         device_id,
-        data: &data,
-    }
-    .encode(&mut frame)
-    .map_err(|_| {
-        HandleError::Ipc(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "fixed-size extended PDN-connect callback failed to encode",
-        ))
-    })?;
-
-    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
+        SdkCallbackKind::PdnConnectExt,
+        &data,
+        "fixed-size extended PDN-connect callback failed to encode",
+    )
 }
 
 /// Materialize and broadcast live-P4 stock callback 37 (`PDNDisconn`).
@@ -277,22 +263,13 @@ pub(crate) fn broadcast_pdn_disconnect_callback(
     let mut data = [0_u8; STOCK_PDN_DISCONNECT_CALLBACK_DATA_LEN];
     materialize_pdn_disconnect_callback(response, &mut data)
         .map_err(HandleError::PdnDisconnectCallback)?;
-    let callback_kind = SdkCallbackKind::PdnDisconnect;
-    let mut frame = [0_u8; STOCK_PDN_DISCONNECT_CALLBACK_FRAME_LEN];
-    let frame_len = SdkCallback {
-        callback_id: callback_kind.callback_id(),
+    broadcast_fixed_callback::<STOCK_PDN_DISCONNECT_CALLBACK_FRAME_LEN>(
+        server,
         device_id,
-        data: &data,
-    }
-    .encode(&mut frame)
-    .map_err(|_| {
-        HandleError::Ipc(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "fixed-size PDN-disconnect callback failed to encode",
-        ))
-    })?;
-
-    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
+        SdkCallbackKind::PdnDisconnect,
+        &data,
+        "fixed-size PDN-disconnect callback failed to encode",
+    )
 }
 
 const MAX_PLMN_RECORDS: usize = 32;
@@ -315,20 +292,14 @@ pub(crate) fn broadcast_variable_callback(
         ))
     })?;
     let mut frame = vec![0_u8; total];
-    let frame_len = SdkCallback {
-        callback_id: callback_kind.callback_id(),
+    broadcast_encoded_callback(
+        server,
         device_id,
+        callback_kind,
         data,
-    }
-    .encode(&mut frame)
-    .map_err(|_| {
-        HandleError::Ipc(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "stock callback exceeds recovered 16-bit local envelope",
-        ))
-    })?;
-
-    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
+        &mut frame,
+        "stock callback exceeds recovered 16-bit local envelope",
+    )
 }
 
 /// Broadcast stock callback 54 through `cb_rsp[16]` (`0x84`).
@@ -879,22 +850,13 @@ pub(crate) fn broadcast_result_callback(
         ResultResponseKind::Offline => SdkCallbackKind::Offline,
         ResultResponseKind::PsInit => SdkCallbackKind::PsInit,
     };
-    let mut frame = [0_u8; 16];
-    let data = response.result.to_be_bytes();
-    let frame_len = SdkCallback {
-        callback_id: callback_kind.callback_id(),
+    broadcast_fixed_callback::<16>(
+        server,
         device_id,
-        data: &data,
-    }
-    .encode(&mut frame)
-    .map_err(|_| {
-        HandleError::Ipc(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "fixed-size result callback failed to encode",
-        ))
-    })?;
-
-    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
+        callback_kind,
+        &response.result.to_be_bytes(),
+        "fixed-size result callback failed to encode",
+    )
 }
 
 /// Broadcast live-P4 callback 308 (`EMM_NI_REATTACH_CTRL_RSP`) through
@@ -1060,21 +1022,13 @@ pub(crate) fn broadcast_plmn_search_stop_callback(
     let mut data = [0_u8; STOCK_PLMN_SEARCH_STOP_CALLBACK_DATA_LEN];
     data[0] = response.search_type;
     data[1..5].copy_from_slice(&response.result.to_be_bytes());
-    let callback_kind = SdkCallbackKind::PlmnSearchStop;
-    let mut frame = [0_u8; STOCK_PLMN_SEARCH_STOP_CALLBACK_FRAME_LEN];
-    let frame_len = SdkCallback {
-        callback_id: callback_kind.callback_id(),
+    broadcast_fixed_callback::<STOCK_PLMN_SEARCH_STOP_CALLBACK_FRAME_LEN>(
+        server,
         device_id,
-        data: &data,
-    }
-    .encode(&mut frame)
-    .map_err(|_| {
-        HandleError::Ipc(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "fixed-size PLMN-search-stop callback failed to encode",
-        ))
-    })?;
-    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
+        SdkCallbackKind::PlmnSearchStop,
+        &data,
+        "fixed-size PLMN-search-stop callback failed to encode",
+    )
 }
 
 const STOCK_PLMN_SEARCH_CALLBACK_DATA_LEN: usize = 436;
@@ -1082,6 +1036,26 @@ const STOCK_PLMN_SEARCH_CALLBACK_FRAME_LEN: usize = 12 + STOCK_PLMN_SEARCH_CALLB
 const STOCK_PLMN_SEARCH_RECORDS_OFFSET: usize = 31;
 const STOCK_PLMN_SEARCH_PRIORITY_OFFSET: usize = 383;
 const STOCK_PLMN_SEARCH_SIB1_OFFSET: usize = 387;
+
+// Both the fixed-size search callback and the variable-length list callback
+// materialize the same recovered PLMN_INFO[32] record memory layout. Keep the
+// shared 3+4+4-byte packing and record count in one place.
+fn materialize_stock_plmn_records(
+    mut records: PlmnInfoCursor<'_>,
+    destination: &mut [u8],
+) -> Result<(u32, usize), PlmnInfoDecodeError> {
+    debug_assert_eq!(destination.len(), MAX_PLMN_RECORDS * STOCK_PLMN_RECORD_LEN);
+    let mut count = 0_u32;
+    let mut written = 0;
+    while let Some(record) = records.next_record()? {
+        destination[written..written + 3].copy_from_slice(&record.plmn_id);
+        destination[written + 3..written + 7].copy_from_slice(&record.priority.to_be_bytes());
+        destination[written + 7..written + 11].copy_from_slice(&record.status.to_be_bytes());
+        written += STOCK_PLMN_RECORD_LEN;
+        count += 1;
+    }
+    Ok((count, written))
+}
 
 /// Materialize and broadcast live-P4 stock callback 41 (`PLMNSearch`).
 ///
@@ -1110,16 +1084,11 @@ pub(crate) fn broadcast_plmn_search_callback(
     data[21..23].copy_from_slice(&response.tac);
     data[23..27].copy_from_slice(&response.bit28_cell_id.to_be_bytes());
 
-    let mut count = 0_u32;
-    let mut offset = STOCK_PLMN_SEARCH_RECORDS_OFFSET;
-    let mut records = response.records();
-    while let Some(record) = records.next_record().map_err(HandleError::PlmnSearch)? {
-        data[offset..offset + 3].copy_from_slice(&record.plmn_id);
-        data[offset + 3..offset + 7].copy_from_slice(&record.priority.to_be_bytes());
-        data[offset + 7..offset + 11].copy_from_slice(&record.status.to_be_bytes());
-        offset += STOCK_PLMN_RECORD_LEN;
-        count += 1;
-    }
+    let (count, _) = materialize_stock_plmn_records(
+        response.records(),
+        &mut data[STOCK_PLMN_SEARCH_RECORDS_OFFSET..STOCK_PLMN_SEARCH_PRIORITY_OFFSET],
+    )
+    .map_err(HandleError::PlmnSearch)?;
     data[27..31].copy_from_slice(&count.to_be_bytes());
     if let Some(priority) = response.plmn_priority {
         data[STOCK_PLMN_SEARCH_PRIORITY_OFFSET..STOCK_PLMN_SEARCH_PRIORITY_OFFSET + 4]
@@ -1131,22 +1100,13 @@ pub(crate) fn broadcast_plmn_search_callback(
         data[start..start + sib1.packed_plmn.len()].copy_from_slice(sib1.packed_plmn);
     }
 
-    let callback_kind = SdkCallbackKind::PlmnSearch;
-    let mut frame = [0_u8; STOCK_PLMN_SEARCH_CALLBACK_FRAME_LEN];
-    let frame_len = SdkCallback {
-        callback_id: callback_kind.callback_id(),
+    broadcast_fixed_callback::<STOCK_PLMN_SEARCH_CALLBACK_FRAME_LEN>(
+        server,
         device_id,
-        data: &data,
-    }
-    .encode(&mut frame)
-    .map_err(|_| {
-        HandleError::Ipc(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "fixed-size PLMN-search callback failed to encode",
-        ))
-    })?;
-
-    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
+        SdkCallbackKind::PlmnSearch,
+        &data,
+        "fixed-size PLMN-search callback failed to encode",
+    )
 }
 
 /// Materialize and broadcast stock callback 45 (`PLMN List`).
@@ -1165,32 +1125,67 @@ pub(crate) fn broadcast_plmn_list_callback(
 ) -> Result<BroadcastReport, HandleError> {
     let mut data = [0_u8; MAX_PLMN_CALLBACK_DATA_LEN];
     data[0] = response.search_complete;
-    let mut count = 0_u32;
-    let mut offset = STOCK_PLMN_PREFIX_LEN;
-    let mut records = response.records();
-    while let Some(record) = records.next_record().map_err(HandleError::PlmnList)? {
-        data[offset..offset + 3].copy_from_slice(&record.plmn_id);
-        data[offset + 3..offset + 7].copy_from_slice(&record.priority.to_be_bytes());
-        data[offset + 7..offset + 11].copy_from_slice(&record.status.to_be_bytes());
-        offset += STOCK_PLMN_RECORD_LEN;
-        count += 1;
-    }
+    let (count, records_len) =
+        materialize_stock_plmn_records(response.records(), &mut data[STOCK_PLMN_PREFIX_LEN..])
+            .map_err(HandleError::PlmnList)?;
     data[1..5].copy_from_slice(&count.to_be_bytes());
 
-    let callback_kind = SdkCallbackKind::PlmnList;
-    let mut frame = [0_u8; MAX_PLMN_CALLBACK_FRAME_LEN];
-    let frame_len = SdkCallback {
-        callback_id: callback_kind.callback_id(),
+    broadcast_fixed_callback::<MAX_PLMN_CALLBACK_FRAME_LEN>(
+        server,
         device_id,
-        data: &data[..offset],
-    }
-    .encode(&mut frame)
-    .map_err(|_| {
-        HandleError::Ipc(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "bounded PLMN-list callback failed to encode",
-        ))
-    })?;
+        SdkCallbackKind::PlmnList,
+        &data[..STOCK_PLMN_PREFIX_LEN + records_len],
+        "bounded PLMN-list callback failed to encode",
+    )
+}
 
-    broadcast_registered(server, callback_kind, &frame[..frame_len]).map_err(HandleError::from)
+#[cfg(test)]
+mod tests {
+    use std::vec::Vec;
+
+    use gct_lapi::plmn::{PlmnInfoCursor, PlmnInfoDecodeError};
+
+    use super::{MAX_PLMN_RECORDS, STOCK_PLMN_RECORD_LEN, materialize_stock_plmn_records};
+
+    fn records(count: usize) -> Vec<u8> {
+        let mut wire = Vec::new();
+        for index in 0..count {
+            let Ok(i) = u8::try_from(index) else {
+                std::process::abort();
+            };
+            wire.extend_from_slice(&[0x12, 3, i, 0xf0, 0x10]);
+            wire.extend_from_slice(&[0x13, 4, 0x11, 0x22, 0x33, i]);
+            wire.extend_from_slice(&[0x14, 4, 0xaa, 0xbb, 0xcc, i]);
+        }
+        wire
+    }
+
+    #[test]
+    fn plmn_stock_records_have_exact_layout_and_shared_capacity() {
+        let wire = records(MAX_PLMN_RECORDS);
+        let mut dst = [0xa5_u8; MAX_PLMN_RECORDS * STOCK_PLMN_RECORD_LEN];
+        let result = materialize_stock_plmn_records(PlmnInfoCursor::new(&wire), &mut dst);
+        assert_eq!(result, Ok((32, 352)));
+        assert_eq!(
+            &dst[..11],
+            &[0, 0xf0, 0x10, 0x11, 0x22, 0x33, 0, 0xaa, 0xbb, 0xcc, 0],
+        );
+        assert_eq!(
+            &dst[31 * 11..],
+            &[31, 0xf0, 0x10, 0x11, 0x22, 0x33, 31, 0xaa, 0xbb, 0xcc, 31],
+        );
+
+        let mut empty_dst = [0xa5_u8; MAX_PLMN_RECORDS * STOCK_PLMN_RECORD_LEN];
+        assert_eq!(
+            materialize_stock_plmn_records(PlmnInfoCursor::new(&[]), &mut empty_dst),
+            Ok((0, 0)),
+        );
+        assert!(empty_dst.iter().all(|&byte| byte == 0xa5));
+
+        let oversized = records(MAX_PLMN_RECORDS + 1);
+        assert_eq!(
+            materialize_stock_plmn_records(PlmnInfoCursor::new(&oversized), &mut dst),
+            Err(PlmnInfoDecodeError::TooManyRecords),
+        );
+    }
 }

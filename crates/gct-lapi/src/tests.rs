@@ -1,3 +1,7 @@
+extern crate std;
+
+use std::vec;
+
 use super::{
     at::AtCommand,
     attach::{
@@ -34,7 +38,7 @@ fn query_selected_plmn_matches_live_p4_wire() {
 
     let response = [0xb1, 0x10, 0, 4, 0, 0x21, 0xf3, 0x54];
     let Ok(packet) = Packet::parse(&response) else {
-        return;
+        std::process::abort();
     };
     assert_eq!(
         QuerySelectedPlmnResponse::parse(packet),
@@ -67,7 +71,7 @@ fn rrc_function_frames_match_live_p4_common_grammar() {
 
     let set_response = [0xb9, 0x09, 0, 7, 0, 0, 0, 1, 0, 7, 0xaa];
     let Ok(packet) = Packet::parse(&set_response) else {
-        return;
+        std::process::abort();
     };
     assert_eq!(
         RrcFunctionResponse::parse_set(packet),
@@ -80,7 +84,7 @@ fn rrc_function_frames_match_live_p4_common_grammar() {
 
     let get_response = [0xb9, 0x10, 0, 7, 0, 0, 0, 1, 0, 7, 0xbb];
     let Ok(packet) = Packet::parse(&get_response) else {
-        return;
+        std::process::abort();
     };
     assert_eq!(
         RrcFunctionResponse::parse_get(packet),
@@ -424,7 +428,7 @@ fn normal_attach_response_splits_ordered_apn_and_typed_tail() {
     ];
     let response = AttachResponse::parse(packet(0xb102, &payload));
     let Ok(response) = response else {
-        return;
+        std::process::abort();
     };
     assert_eq!(response.transaction_id, 0x7f);
     assert_eq!(response.register_result1, 1);
@@ -452,20 +456,20 @@ fn normal_attach_emergency_list_preserves_packed_record_grammar() {
         0x02, 0x02, b'9', // len=2: category + one number byte
     ];
     let Ok(response) = AttachResponse::parse(packet(0xb102, &payload)) else {
-        return;
+        std::process::abort();
     };
     let mut tail = response.trailing_fields();
     let Ok(Some(AttachTailField::EmergencyNumbers(list))) = tail.next_field() else {
-        return;
+        std::process::abort();
     };
     let mut records = list.records();
     let Ok(Some(first)) = records.next_record() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(first.category, 1);
     assert_eq!(first.number, b"11");
     let Ok(Some(second)) = records.next_record() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(second.category, 2);
     assert_eq!(second.number, b"9");
@@ -529,19 +533,19 @@ fn nested_pdn_containers_stop_before_enclosing_suffix() {
     ];
     let mut containers = PdnInfoContainers::new(&bytes);
     let Ok(Some(first)) = containers.next_container() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(first.kind, PdnInfoContainerKind::F0);
     let mut fields = first.fields();
     let Ok(Some(first_tlv)) = fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(
         PdnInfoField::parse(first_tlv),
         Ok(PdnInfoField::Ipv4Address([10, 20, 30, 40]))
     );
     let Ok(Some(second_tlv)) = fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(
         PdnInfoField::parse(second_tlv),
@@ -550,12 +554,12 @@ fn nested_pdn_containers_stop_before_enclosing_suffix() {
     assert!(matches!(fields.next_tlv(), Ok(None)));
 
     let Ok(Some(second)) = containers.next_container() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(second.kind, PdnInfoContainerKind::F2);
     let mut qos_fields = second.fields();
     let Ok(Some(qos_tlv)) = qos_fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(
         PdnInfoField::parse(qos_tlv),
@@ -716,7 +720,7 @@ fn extended_attach_response_splits_ordered_apns_nested_pdn_and_ignored_suffix() 
         0xaa, 0x00,
     ];
     let Ok(response) = AttachExtResponse::parse(packet(0xb166, &payload)) else {
-        return;
+        std::process::abort();
     };
     assert_eq!(response.register_result1, 1);
     assert_eq!(response.register_result2, 2);
@@ -734,21 +738,21 @@ fn extended_attach_response_splits_ordered_apns_nested_pdn_and_ignored_suffix() 
 
     let mut containers = response.pdn_info_containers();
     let Ok(Some(container)) = containers.next_container() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(container.kind, PdnInfoContainerKind::F0);
     let mut fields = container.fields();
     let Ok(Some(apn)) = fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     let Ok(Some(pdn_type)) = fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     let Ok(Some(ipv4)) = fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     let Ok(Some(qos)) = fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(
         PdnInfoField::parse(apn),
@@ -1190,7 +1194,7 @@ fn full_normal_pdn_response_follows_recovered_parser_pipeline() {
         0x06, 0x08, 0x04, 1, 1, 1, 1, 0xf3, 0x08, 0, 0, 0, 100, 0, 0, 0, 200, 0xee, 0x01, 0xff,
     ];
     let Ok(response) = super::pdn::PdnConnectResponse::parse(packet(0xb106, &payload)) else {
-        return;
+        std::process::abort();
     };
     assert_eq!(response.result, 1);
     assert_eq!(response.default_eps_id, 0x1234);
@@ -1200,24 +1204,24 @@ fn full_normal_pdn_response_follows_recovered_parser_pipeline() {
 
     let mut containers = response.pdn_info_containers();
     let Ok(Some(first)) = containers.next_container() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(first.kind, PdnInfoContainerKind::F0);
     let mut first_fields = first.fields();
     let Ok(Some(first_tlv)) = first_fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(
         PdnInfoField::parse(first_tlv),
         Ok(PdnInfoField::Ipv4Address([10, 20, 30, 40]))
     );
     let Ok(Some(second)) = containers.next_container() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(second.kind, PdnInfoContainerKind::F2);
     let mut second_fields = second.fields();
     let Ok(Some(qos_tlv)) = second_fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(
         PdnInfoField::parse(qos_tlv),
@@ -1270,7 +1274,7 @@ fn extended_pdn_response_preserves_unchecked_tags_and_ignored_suffix() {
         0xaa, 0x00,
     ];
     let Ok(response) = super::pdn::PdnConnectExtResponse::parse(packet(0xb168, &payload)) else {
-        return;
+        std::process::abort();
     };
     assert_eq!(response.throttle_time, 0x0708);
     assert_eq!(response.apn_class_kind, 0x20);
@@ -1283,13 +1287,94 @@ fn extended_pdn_response_preserves_unchecked_tags_and_ignored_suffix() {
 
     let mut containers = response.pdn_info_containers();
     let Ok(Some(container)) = containers.next_container() else {
-        return;
+        std::process::abort();
     };
     let mut fields = container.fields();
     let Ok(Some(tlv)) = fields.next_tlv() else {
-        return;
+        std::process::abort();
     };
     assert_eq!(PdnInfoField::parse(tlv), Ok(PdnInfoField::PdnType(3)));
+}
+
+#[test]
+fn extended_attach_and_pdn_share_ordered_suffix_contract() {
+    use super::common::PdnResponseDecodeError;
+    use super::pdn::PdnConnectExtResponse;
+
+    let mut oversized_requested = vec![0x20, 1, 1, 0x57, 65];
+    oversized_requested.extend_from_slice(&[0x42; 65]);
+    oversized_requested.extend_from_slice(&[0x58, 0]);
+
+    let mut oversized_received = vec![0x20, 1, 1, 0x57, 0, 0x58, 65];
+    oversized_received.extend_from_slice(&[0x42; 65]);
+
+    // Position, length, and nested-container framing are shared; prefix
+    // layouts and their semantic result fields remain family-specific.
+    let cases: &[(&str, &[u8], bool)] = &[
+        ("empty", &[], false),
+        ("short-class-header", &[0x20], false),
+        ("class-length-zero", &[0x20, 0], false),
+        ("missing-requested", &[0x20, 1, 1], false),
+        ("missing-received", &[0x20, 1, 1, 0x57, 0], false),
+        (
+            "truncated-nested",
+            &[0x20, 1, 1, 0x57, 0, 0x58, 0, 0xf0, 4, 0x05],
+            false,
+        ),
+        (
+            "unchecked-tags",
+            &[0x99, 1, 7, 0x88, 1, b'a', 0x77, 1, b'b'],
+            true,
+        ),
+        (
+            "ignored-non-tlv-suffix",
+            &[0x20, 1, 1, 0x57, 0, 0x58, 0, 0xff],
+            true,
+        ),
+        (
+            "two-pdn-containers",
+            &[0x20, 1, 1, 0x57, 0, 0x58, 0, 0xf0, 0, 0xf2, 0, 0xa5],
+            true,
+        ),
+    ];
+
+    let check = |name: &str, suffix: &[u8], expected_success: bool| {
+        let mut attach = vec![0_u8; 15];
+        attach.extend_from_slice(suffix);
+        let mut pdn = vec![0_u8; 12];
+        pdn.extend_from_slice(suffix);
+
+        let attach_result: Result<_, PdnResponseDecodeError> =
+            AttachExtResponse::parse(packet(0xb166, &attach)).map(|response| {
+                (
+                    response.apn_class_kind,
+                    response.apn_class,
+                    response.requested_apn_ni,
+                    response.received_apn_ni,
+                    response.pdn_info_containers().remaining(),
+                    response.unparsed_suffix,
+                )
+            });
+        let pdn_result: Result<_, PdnResponseDecodeError> =
+            PdnConnectExtResponse::parse(packet(0xb168, &pdn)).map(|response| {
+                (
+                    response.apn_class_kind,
+                    response.apn_class,
+                    response.requested_apn_ni,
+                    response.received_apn_ni,
+                    response.pdn_info_containers().remaining(),
+                    response.unparsed_suffix,
+                )
+            });
+
+        assert_eq!(attach_result, pdn_result, "{name}");
+        assert_eq!(attach_result.is_ok(), expected_success, "{name}");
+    };
+    for (name, suffix, expected_success) in cases {
+        check(name, suffix, *expected_success);
+    }
+    check("oversized-requested", &oversized_requested, false);
+    check("oversized-received", &oversized_received, false);
 }
 
 #[test]
@@ -1299,7 +1384,7 @@ fn disconnect_response_decodes_descriptor_suffix_and_unknowns() {
         b't', b'e', b'r', b'n', b'e', b't', 0x5d, 0x02, 0xaa, 0xbb, 0xee, 0x00,
     ];
     let Ok(response) = super::pdn::PdnDisconnectResponse::parse(packet(0xb108, &payload)) else {
-        return;
+        std::process::abort();
     };
     assert_eq!(response.transaction_id, 9);
     let mut fields = response.trailing_fields();
@@ -1755,7 +1840,7 @@ fn plmn_list_response_assembles_three_tlvs_per_record() {
         0x04, 0, 0, 0, 3, 0x12, 0x03, 0x21, 0x43, 0x65, 0x13, 0x04, 0, 0, 0, 2,
     ];
     let Ok(response) = super::plmn::PlmnListResponse::parse(packet(0xb10c, &payload)) else {
-        return;
+        std::process::abort();
     };
     assert_eq!(response.search_complete, 1);
     let mut records = response.records();
@@ -1787,7 +1872,7 @@ fn plmn_search_response_splits_fixed_metadata_and_records() {
         0x04, 0x00, 0x00, 0x00, 0x01, 0x14, 0x04, 0x00, 0x00, 0x00, 0x02,
     ];
     let Ok(response) = super::plmn::PlmnSearchResponse::parse(packet(0xb10a, &payload)) else {
-        return;
+        std::process::abort();
     };
     assert_eq!(response.result, 0);
     assert_eq!(response.selection_mode, 2);
@@ -1827,7 +1912,7 @@ fn plmn_parsers_reject_ambiguous_or_unsafe_vendor_shapes() {
         1, 0x12, 0x03, 1, 2, 3, 0x12, 0x03, 4, 5, 6, 0x14, 0x04, 0, 0, 0, 1,
     ];
     let Ok(response) = super::plmn::PlmnListResponse::parse(packet(0xb10c, &duplicate)) else {
-        return;
+        std::process::abort();
     };
     let mut records = response.records();
     assert_eq!(
@@ -2493,6 +2578,63 @@ fn extended_at_to_device_matches_live_channel_command_lf_layout() {
         super::at::AtCommandExt::new(1, &OVERSIZED).encode(&mut []),
         Err(gct_hci::EncodeError::PayloadTooLong)
     );
+}
+
+#[test]
+fn at_request_boundaries_preserve_wire_and_avoid_partial_writes() {
+    use gct_hci::EncodeError;
+
+    // A normal AT request has one LF of overhead; an extended request also
+    // includes one channel byte. Both must permit the maximum u16 payload.
+    let normal_command = std::vec![b'X'; 65_534];
+    let extended_command = std::vec![b'Y'; 65_533];
+    let mut normal_wire = std::vec![0x5a; 65_539];
+    let mut extended_wire = std::vec![0x5a; 65_539];
+
+    assert_eq!(
+        AtCommand::new(&normal_command).encode(&mut normal_wire),
+        Ok(65_539)
+    );
+    assert_eq!(&normal_wire[..4], &[0x33, 0x07, 0xff, 0xff]);
+    assert!(normal_wire[4..65_538].iter().all(|&b| b == b'X'));
+    assert_eq!(normal_wire[65_538], b'\n');
+
+    assert_eq!(
+        super::at::AtCommandExt::new(0xab, &extended_command).encode(&mut extended_wire),
+        Ok(65_539)
+    );
+    assert_eq!(&extended_wire[..5], &[0x33, 0x23, 0xff, 0xff, 0xab]);
+    assert!(extended_wire[5..65_538].iter().all(|&b| b == b'Y'));
+    assert_eq!(extended_wire[65_538], b'\n');
+
+    // No output bytes change if the frame would not fit, including when
+    // length validation rejects it before considering the output buffer.
+    let mut short = [0xa5; 6];
+    assert_eq!(
+        AtCommand::new(b"AT").encode(&mut short),
+        Err(EncodeError::NoSpace)
+    );
+    assert_eq!(short, [0xa5; 6]);
+    let mut short_ext = [0xa5; 7];
+    assert_eq!(
+        super::at::AtCommandExt::new(7, b"AT").encode(&mut short_ext),
+        Err(EncodeError::NoSpace)
+    );
+    assert_eq!(short_ext, [0xa5; 7]);
+
+    let oversized_normal = std::vec![0; 65_535];
+    assert_eq!(
+        AtCommand::new(&oversized_normal).encode(&mut short),
+        Err(EncodeError::PayloadTooLong)
+    );
+    assert_eq!(short, [0xa5; 6]);
+
+    let oversized_ext = std::vec![0; 65_534];
+    assert_eq!(
+        super::at::AtCommandExt::new(1, &oversized_ext).encode(&mut short_ext),
+        Err(EncodeError::PayloadTooLong)
+    );
+    assert_eq!(short_ext, [0xa5; 7]);
 }
 
 #[test]

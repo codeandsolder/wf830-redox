@@ -157,86 +157,129 @@ fn encode_set_mtu_request(interface_index: u32, mtu: u32) -> io::Result<[u8; SET
     Ok(bytes)
 }
 
-fn decode_netlink_ack(bytes: &[u8], expected_sequence: u32) -> io::Result<()> {
-    let mut offset = 0_usize;
-    while offset < bytes.len() {
-        let remaining = &bytes[offset..];
+/// Framing is common to ACK and notification datagrams, while diagnostics
+/// retain the original context-specific error strings.
+#[derive(Clone, Copy)]
+struct NetlinkFrameErrors {
+    truncated_header: &'static str,
+    length_overflow: &'static str,
+    invalid_length: &'static str,
+    alignment_overflow: &'static str,
+    truncated_padding: &'static str,
+}
+
+const ACK_FRAME_ERRORS: NetlinkFrameErrors = NetlinkFrameErrors {
+    truncated_header: "truncated rtnetlink ACK header",
+    length_overflow: "rtnetlink ACK length does not fit usize",
+    invalid_length: "invalid rtnetlink ACK length",
+    alignment_overflow: "rtnetlink ACK alignment overflow",
+    truncated_padding: "truncated rtnetlink ACK padding",
+};
+
+const NOTIFICATION_FRAME_ERRORS: NetlinkFrameErrors = NetlinkFrameErrors {
+    truncated_header: "truncated rtnetlink message header",
+    length_overflow: "rtnetlink message length does not fit usize",
+    invalid_length: "invalid rtnetlink message length",
+    alignment_overflow: "rtnetlink message alignment overflow",
+    truncated_padding: "truncated rtnetlink message padding",
+};
+
+struct NetlinkMessage<'a> {
+    message_type: u16,
+    sequence: u32,
+    payload: &'a [u8],
+}
+
+struct NetlinkFrames<'a> {
+    remaining: &'a [u8],
+    errors: NetlinkFrameErrors,
+    previous_len: Option<usize>,
+}
+
+impl<'a> NetlinkFrames<'a> {
+    const fn new(bytes: &'a [u8], errors: NetlinkFrameErrors) -> Self {
+        Self {
+            remaining: bytes,
+            errors,
+            previous_len: None,
+        }
+    }
+
+    fn next_message(&mut self) -> io::Result<Option<NetlinkMessage<'a>>> {
+        // Advance *after* the caller handles a message: the ACK path can
+        // return on a matching response before examining trailing padding.
+        // Prefix notifications instead consume and validate the whole stream.
+        if let Some(previous_len) = self.previous_len.take() {
+            let aligned =
+                align4(previous_len).ok_or_else(|| invalid_data(self.errors.alignment_overflow))?;
+            let consumed = if aligned <= self.remaining.len() {
+                aligned
+            } else if previous_len == self.remaining.len() {
+                // The final message may omit alignment padding.
+                previous_len
+            } else {
+                return Err(invalid_data(self.errors.truncated_padding));
+            };
+            self.remaining = &self.remaining[consumed..];
+        }
+        let remaining = self.remaining;
+        if remaining.is_empty() {
+            return Ok(None);
+        }
         if remaining.len() < NLMSG_HEADER_LEN {
-            return Err(invalid_data("truncated rtnetlink ACK header"));
+            return Err(invalid_data(self.errors.truncated_header));
         }
         let message_len = usize::try_from(native_u32(&remaining[0..4]))
-            .map_err(|_| invalid_data("rtnetlink ACK length does not fit usize"))?;
+            .map_err(|_| invalid_data(self.errors.length_overflow))?;
         if message_len < NLMSG_HEADER_LEN || message_len > remaining.len() {
-            return Err(invalid_data("invalid rtnetlink ACK length"));
+            return Err(invalid_data(self.errors.invalid_length));
         }
 
-        let message_type = native_u16(&remaining[4..6]);
-        let sequence = native_u32(&remaining[8..12]);
-        if message_type == NLMSG_ERROR && sequence == expected_sequence {
-            if message_len < NLMSG_HEADER_LEN + 4 {
-                return Err(invalid_data("truncated rtnetlink NLMSG_ERROR payload"));
-            }
-            let status = i32::from_ne_bytes(
-                remaining[NLMSG_HEADER_LEN..NLMSG_HEADER_LEN + 4]
-                    .try_into()
-                    .map_err(|_| invalid_data("invalid rtnetlink ACK status"))?,
-            );
-            if status == 0 {
-                return Ok(());
-            }
-            let errno = status
-                .checked_neg()
-                .filter(|errno| *errno > 0)
-                .ok_or_else(|| invalid_data("invalid positive rtnetlink error status"))?;
-            return Err(io::Error::from_raw_os_error(errno));
-        }
+        self.previous_len = Some(message_len);
+        Ok(Some(NetlinkMessage {
+            message_type: native_u16(&remaining[4..6]),
+            sequence: native_u32(&remaining[8..12]),
+            payload: &remaining[NLMSG_HEADER_LEN..message_len],
+        }))
+    }
+}
 
-        let aligned_len =
-            align4(message_len).ok_or_else(|| invalid_data("rtnetlink ACK alignment overflow"))?;
-        if aligned_len > remaining.len() {
-            if message_len == remaining.len() {
-                break;
-            }
-            return Err(invalid_data("truncated rtnetlink ACK padding"));
+fn decode_netlink_ack(bytes: &[u8], expected_sequence: u32) -> io::Result<()> {
+    let mut frames = NetlinkFrames::new(bytes, ACK_FRAME_ERRORS);
+    while let Some(frame) = frames.next_message()? {
+        if frame.message_type != NLMSG_ERROR || frame.sequence != expected_sequence {
+            continue;
         }
-        offset += aligned_len;
+        if frame.payload.len() < 4 {
+            return Err(invalid_data("truncated rtnetlink NLMSG_ERROR payload"));
+        }
+        let status = i32::from_ne_bytes(
+            frame.payload[..4]
+                .try_into()
+                .map_err(|_| invalid_data("invalid rtnetlink ACK status"))?,
+        );
+        if status == 0 {
+            return Ok(());
+        }
+        let errno = status
+            .checked_neg()
+            .filter(|errno| *errno > 0)
+            .ok_or_else(|| invalid_data("invalid positive rtnetlink error status"))?;
+        return Err(io::Error::from_raw_os_error(errno));
     }
     Err(invalid_data("matching rtnetlink ACK not received"))
 }
 
 fn decode_ipv6_prefix_events(bytes: &[u8]) -> io::Result<Vec<Ipv6PrefixEvent>> {
     let mut events = Vec::new();
-    let mut offset = 0_usize;
-
-    while offset < bytes.len() {
-        let remaining = &bytes[offset..];
-        if remaining.len() < NLMSG_HEADER_LEN {
-            return Err(invalid_data("truncated rtnetlink message header"));
-        }
-
-        let message_len = usize::try_from(native_u32(&remaining[0..4]))
-            .map_err(|_| invalid_data("rtnetlink message length does not fit usize"))?;
-        if message_len < NLMSG_HEADER_LEN || message_len > remaining.len() {
-            return Err(invalid_data("invalid rtnetlink message length"));
-        }
-
-        if native_u16(&remaining[4..6]) == RTM_NEWPREFIX
-            && let Some(event) = decode_new_prefix(&remaining[NLMSG_HEADER_LEN..message_len])?
+    let mut frames = NetlinkFrames::new(bytes, NOTIFICATION_FRAME_ERRORS);
+    while let Some(frame) = frames.next_message()? {
+        if frame.message_type == RTM_NEWPREFIX
+            && let Some(event) = decode_new_prefix(frame.payload)?
         {
             events.push(event);
         }
-
-        let aligned_len = align4(message_len)
-            .ok_or_else(|| invalid_data("rtnetlink message alignment overflow"))?;
-        if aligned_len > remaining.len() {
-            if message_len == remaining.len() {
-                break;
-            }
-            return Err(invalid_data("truncated rtnetlink message padding"));
-        }
-        offset += aligned_len;
     }
-
     Ok(events)
 }
 
@@ -366,6 +409,112 @@ mod tests {
         bytes[8..12].copy_from_slice(&sequence.to_ne_bytes());
         bytes[NLMSG_HEADER_LEN..NLMSG_HEADER_LEN + 4].copy_from_slice(&status.to_ne_bytes());
         bytes
+    }
+
+    fn frame(message_type: u16, sequence: u32, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0; NLMSG_HEADER_LEN + payload.len()];
+        let Ok(message_len) = u32::try_from(bytes.len()) else {
+            std::process::abort();
+        };
+        bytes[0..4].copy_from_slice(&message_len.to_ne_bytes());
+        bytes[4..6].copy_from_slice(&message_type.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&sequence.to_ne_bytes());
+        bytes[NLMSG_HEADER_LEN..].copy_from_slice(payload);
+        bytes
+    }
+
+    fn assert_invalid<T>(result: std::io::Result<T>, message: &str) {
+        let Err(error) = result else {
+            std::process::abort();
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), message);
+    }
+
+    #[test]
+    fn netlink_frame_walker_handles_mixed_messages_and_alignment() {
+        let mut acks = frame(RTM_NEWLINK, SET_MTU_SEQUENCE, &[0xca]);
+        acks.extend_from_slice(&[0, 0, 0]); // 17-byte frame aligned to 20
+        acks.extend_from_slice(&ack(-2, SET_MTU_SEQUENCE + 1));
+        acks.extend_from_slice(&ack(-1, SET_MTU_SEQUENCE));
+        let Err(error) = decode_netlink_ack(&acks, SET_MTU_SEQUENCE) else {
+            std::process::abort();
+        };
+        assert_eq!(error.raw_os_error(), Some(1));
+
+        let mut prefix_datagram = frame(RTM_NEWLINK, 0, &[0x55]);
+        prefix_datagram.extend_from_slice(&[0, 0, 0]);
+        prefix_datagram.extend_from_slice(&message(AF_INET6, ND_OPT_PREFIX_INFORMATION, 16));
+        let events =
+            decode_ipv6_prefix_events(&prefix_datagram).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].interface_index, 7);
+
+        // No end-padding is needed for the final message in a datagram.
+        assert_eq!(
+            decode_ipv6_prefix_events(&frame(RTM_NEWLINK, 1, &[0xcc]))
+                .unwrap_or_else(|_| std::process::abort()),
+            Vec::new(),
+        );
+
+        // A matched ACK terminates immediately, prior to inspecting any
+        // trailing padding. That ordering is the original decoder behavior.
+        let mut matched_ack = ack(0, SET_MTU_SEQUENCE);
+        matched_ack[0..4].copy_from_slice(&21_u32.to_ne_bytes());
+        matched_ack.extend_from_slice(&[0xff, 0x42]);
+        assert!(decode_netlink_ack(&matched_ack, SET_MTU_SEQUENCE).is_ok());
+    }
+
+    #[test]
+    fn netlink_frame_walker_preserves_diagnostic_errors() {
+        for truncated in [vec![0_u8; 15], vec![0_u8; 1]] {
+            assert_invalid(
+                decode_netlink_ack(&truncated, SET_MTU_SEQUENCE),
+                "truncated rtnetlink ACK header",
+            );
+            assert_invalid(
+                decode_ipv6_prefix_events(&truncated),
+                "truncated rtnetlink message header",
+            );
+        }
+
+        for declared in [0_u32, 15, 25] {
+            let mut header = [0_u8; NLMSG_HEADER_LEN];
+            header[..4].copy_from_slice(&declared.to_ne_bytes());
+            assert_invalid(
+                decode_netlink_ack(&header, SET_MTU_SEQUENCE),
+                "invalid rtnetlink ACK length",
+            );
+            assert_invalid(
+                decode_ipv6_prefix_events(&header),
+                "invalid rtnetlink message length",
+            );
+        }
+
+        // When at least one pad byte is present but not enough for the
+        // advertised alignment, the stream must reject the partial tail.
+        let mut truncated_padding = frame(RTM_NEWLINK, 1, &[0x12]);
+        truncated_padding.push(0);
+        assert_invalid(
+            decode_netlink_ack(&truncated_padding, SET_MTU_SEQUENCE),
+            "truncated rtnetlink ACK padding",
+        );
+        assert_invalid(
+            decode_ipv6_prefix_events(&truncated_padding),
+            "truncated rtnetlink message padding",
+        );
+
+        assert_invalid(
+            decode_netlink_ack(&frame(NLMSG_ERROR, SET_MTU_SEQUENCE, &[]), SET_MTU_SEQUENCE),
+            "truncated rtnetlink NLMSG_ERROR payload",
+        );
+
+        // A negative errno is forwarded to the caller; positive kernel
+        // statuses are not accepted as error codes.
+        assert_invalid(
+            decode_netlink_ack(&ack(1, SET_MTU_SEQUENCE), SET_MTU_SEQUENCE),
+            "invalid positive rtnetlink error status",
+        );
     }
 
     #[test]

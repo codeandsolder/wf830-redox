@@ -1322,15 +1322,28 @@ fn map_pdn_connect_materialize_error(error: PdnInfoMaterializeError) -> PdnConne
     }
 }
 
+// All three stock PDN callback objects begin with the same proven 8-byte
+// result/reject-cause/default-EPS prefix. Their remaining memory layouts differ.
+fn materialize_pdn_status_prefix(data: &mut [u8], fields: [u16; 4]) {
+    for (slot, value) in data[..8].as_chunks_mut::<2>().0.iter_mut().zip(fields) {
+        slot.copy_from_slice(&value.to_be_bytes());
+    }
+}
+
 pub(crate) fn materialize_pdn_connect_callback(
     response: PdnConnectResponse<'_>,
     data: &mut [u8; STOCK_PDN_CONNECT_CALLBACK_DATA_LEN],
 ) -> Result<(), PdnConnectCallbackError> {
     data.fill(0);
-    data[0x000..0x002].copy_from_slice(&response.result.to_be_bytes());
-    data[0x002..0x004].copy_from_slice(&response.reject_cause1.to_be_bytes());
-    data[0x004..0x006].copy_from_slice(&response.reject_cause2.to_be_bytes());
-    data[0x006..0x008].copy_from_slice(&response.default_eps_id.to_be_bytes());
+    materialize_pdn_status_prefix(
+        data,
+        [
+            response.result,
+            response.reject_cause1,
+            response.reject_cause2,
+            response.default_eps_id,
+        ],
+    );
     data[0x008] = response.data_path;
     data[0x009] = response.ip_alloc;
     data[0x00a] = response.transaction_id;
@@ -1395,10 +1408,15 @@ pub(crate) fn materialize_pdn_connect_ext_callback(
     data: &mut [u8; STOCK_PDN_CONNECT_EXT_CALLBACK_DATA_LEN],
 ) -> Result<(), PdnConnectExtCallbackError> {
     data.fill(0);
-    data[0x000..0x002].copy_from_slice(&response.result.to_be_bytes());
-    data[0x002..0x004].copy_from_slice(&response.reject_cause1.to_be_bytes());
-    data[0x004..0x006].copy_from_slice(&response.reject_cause2.to_be_bytes());
-    data[0x006..0x008].copy_from_slice(&response.default_eps_id.to_be_bytes());
+    materialize_pdn_status_prefix(
+        data,
+        [
+            response.result,
+            response.reject_cause1,
+            response.reject_cause2,
+            response.default_eps_id,
+        ],
+    );
     data[0x008] = response.data_path;
     data[0x009] = response.ip_alloc;
     data[0x00a..0x00c].copy_from_slice(&response.throttle_time.to_be_bytes());
@@ -1437,10 +1455,15 @@ pub(crate) fn materialize_pdn_disconnect_callback(
     data: &mut [u8; STOCK_PDN_DISCONNECT_CALLBACK_DATA_LEN],
 ) -> Result<(), PdnDisconnectCallbackError> {
     data.fill(0);
-    data[0x000..0x002].copy_from_slice(&response.result.to_be_bytes());
-    data[0x002..0x004].copy_from_slice(&response.reject_cause1.to_be_bytes());
-    data[0x004..0x006].copy_from_slice(&response.reject_cause2.to_be_bytes());
-    data[0x006..0x008].copy_from_slice(&response.default_eps_id.to_be_bytes());
+    materialize_pdn_status_prefix(
+        data,
+        [
+            response.result,
+            response.reject_cause1,
+            response.reject_cause2,
+            response.default_eps_id,
+        ],
+    );
     data[0x008] = response.transaction_id;
 
     let mut tail = response.trailing_fields();
