@@ -2581,6 +2581,63 @@ fn extended_at_to_device_matches_live_channel_command_lf_layout() {
 }
 
 #[test]
+fn at_request_boundaries_preserve_wire_and_avoid_partial_writes() {
+    use gct_hci::EncodeError;
+
+    // A normal AT request has one LF of overhead; an extended request also
+    // includes one channel byte. Both must permit the maximum u16 payload.
+    let normal_command = std::vec![b'X'; 65_534];
+    let extended_command = std::vec![b'Y'; 65_533];
+    let mut normal_wire = std::vec![0x5a; 65_539];
+    let mut extended_wire = std::vec![0x5a; 65_539];
+
+    assert_eq!(
+        AtCommand::new(&normal_command).encode(&mut normal_wire),
+        Ok(65_539)
+    );
+    assert_eq!(&normal_wire[..4], &[0x33, 0x07, 0xff, 0xff]);
+    assert!(normal_wire[4..65_538].iter().all(|&b| b == b'X'));
+    assert_eq!(normal_wire[65_538], b'\n');
+
+    assert_eq!(
+        super::at::AtCommandExt::new(0xab, &extended_command).encode(&mut extended_wire),
+        Ok(65_539)
+    );
+    assert_eq!(&extended_wire[..5], &[0x33, 0x23, 0xff, 0xff, 0xab]);
+    assert!(extended_wire[5..65_538].iter().all(|&b| b == b'Y'));
+    assert_eq!(extended_wire[65_538], b'\n');
+
+    // No output bytes change if the frame would not fit, including when
+    // length validation rejects it before considering the output buffer.
+    let mut short = [0xa5; 6];
+    assert_eq!(
+        AtCommand::new(b"AT").encode(&mut short),
+        Err(EncodeError::NoSpace)
+    );
+    assert_eq!(short, [0xa5; 6]);
+    let mut short_ext = [0xa5; 7];
+    assert_eq!(
+        super::at::AtCommandExt::new(7, b"AT").encode(&mut short_ext),
+        Err(EncodeError::NoSpace)
+    );
+    assert_eq!(short_ext, [0xa5; 7]);
+
+    let oversized_normal = std::vec![0; 65_535];
+    assert_eq!(
+        AtCommand::new(&oversized_normal).encode(&mut short),
+        Err(EncodeError::PayloadTooLong)
+    );
+    assert_eq!(short, [0xa5; 6]);
+
+    let oversized_ext = std::vec![0; 65_534];
+    assert_eq!(
+        super::at::AtCommandExt::new(1, &oversized_ext).encode(&mut short_ext),
+        Err(EncodeError::PayloadTooLong)
+    );
+    assert_eq!(short_ext, [0xa5; 7]);
+}
+
+#[test]
 fn extended_at_from_device_splits_channel_from_raw_command() {
     assert_eq!(
         super::at::AtCommandFromDeviceExt::parse(packet(0xb324, &[7, b'O', b'K'])),

@@ -4,6 +4,42 @@ use gct_hci::{EncodeError, HEADER_LEN, Header, Packet, public_opcode};
 
 use crate::common::{ResponseDecodeError, prefix_payload, response_payload};
 
+// Both OEM AT request families prepend an optional channel and append LF.
+// Validate the complete frame before touching the output buffer.
+fn encode_at_line(
+    opcode: u16,
+    prefix: &[u8],
+    command: &[u8],
+    output: &mut [u8],
+) -> Result<usize, EncodeError> {
+    let payload_len = prefix
+        .len()
+        .checked_add(command.len())
+        .and_then(|len| len.checked_add(1))
+        .ok_or(EncodeError::PayloadTooLong)?;
+    let payload_len_u16 = u16::try_from(payload_len).map_err(|_| EncodeError::PayloadTooLong)?;
+    let total = HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or(EncodeError::PayloadTooLong)?;
+    let Some(dst) = output.get_mut(..total) else {
+        return Err(EncodeError::NoSpace);
+    };
+
+    dst[..HEADER_LEN].copy_from_slice(
+        &Header {
+            command: opcode,
+            payload_len: payload_len_u16,
+        }
+        .encode(),
+    );
+    let prefix_end = HEADER_LEN + prefix.len();
+    dst[HEADER_LEN..prefix_end].copy_from_slice(prefix);
+    let command_end = prefix_end + command.len();
+    dst[prefix_end..command_end].copy_from_slice(command);
+    dst[command_end] = b'\n';
+    Ok(total)
+}
+
 /// Raw AT command sent to the modem through HCI `0x3307`.
 ///
 /// The OEM SDK accepts a pointer/length pair, copies exactly that byte range,
@@ -29,31 +65,12 @@ impl<'a> AtCommand<'a> {
     /// exceeds the 16-bit HCI payload length, or [`EncodeError::NoSpace`] when
     /// `output` is too small.
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
-        let payload_len = self
-            .command
-            .len()
-            .checked_add(1)
-            .ok_or(EncodeError::PayloadTooLong)?;
-        let payload_len_u16 =
-            u16::try_from(payload_len).map_err(|_| EncodeError::PayloadTooLong)?;
-        let total = HEADER_LEN
-            .checked_add(payload_len)
-            .ok_or(EncodeError::PayloadTooLong)?;
-        let Some(dst) = output.get_mut(..total) else {
-            return Err(EncodeError::NoSpace);
-        };
-
-        dst[..HEADER_LEN].copy_from_slice(
-            &Header {
-                command: public_opcode::LTE_AT_CMD_TO_DEVICE,
-                payload_len: payload_len_u16,
-            }
-            .encode(),
-        );
-        let command_end = HEADER_LEN + self.command.len();
-        dst[HEADER_LEN..command_end].copy_from_slice(self.command);
-        dst[command_end] = b'\n';
-        Ok(total)
+        encode_at_line(
+            public_opcode::LTE_AT_CMD_TO_DEVICE,
+            &[],
+            self.command,
+            output,
+        )
     }
 }
 
@@ -82,33 +99,12 @@ impl<'a> AtCommandExt<'a> {
     /// exceeds the 16-bit HCI payload length, or [`EncodeError::NoSpace`] when
     /// `output` is too small.
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
-        let payload_len = self
-            .command
-            .len()
-            .checked_add(2)
-            .ok_or(EncodeError::PayloadTooLong)?;
-        let payload_len_u16 =
-            u16::try_from(payload_len).map_err(|_| EncodeError::PayloadTooLong)?;
-        let total = HEADER_LEN
-            .checked_add(payload_len)
-            .ok_or(EncodeError::PayloadTooLong)?;
-        let Some(dst) = output.get_mut(..total) else {
-            return Err(EncodeError::NoSpace);
-        };
-
-        dst[..HEADER_LEN].copy_from_slice(
-            &Header {
-                command: public_opcode::LTE_AT_CMD_TO_DEVICE_EXT,
-                payload_len: payload_len_u16,
-            }
-            .encode(),
-        );
-        dst[HEADER_LEN] = self.channel;
-        let command_start = HEADER_LEN + 1;
-        let command_end = command_start + self.command.len();
-        dst[command_start..command_end].copy_from_slice(self.command);
-        dst[command_end] = b'\n';
-        Ok(total)
+        encode_at_line(
+            public_opcode::LTE_AT_CMD_TO_DEVICE_EXT,
+            &[self.channel],
+            self.command,
+            output,
+        )
     }
 }
 

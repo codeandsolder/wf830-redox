@@ -13,7 +13,8 @@ use gct_lapi::{
     misc::{IccidReadResponse, MobileIdReadResponse, MsisdnReadResponse, TemperatureReadResponse},
     pdn::{PdnConnectExtResponse, PdnConnectResponse, PdnDisconnectResponse},
     plmn::{
-        PlmnListResponse, PlmnSearchResponse, PlmnSearchStopResponse, QuerySelectedPlmnResponse,
+        PlmnInfoCursor, PlmnInfoDecodeError, PlmnListResponse, PlmnSearchResponse,
+        PlmnSearchStopResponse, QuerySelectedPlmnResponse,
     },
     rf::{RfMeasureReportIndication, RfMeasureReportResponse, RfStatusReportControlResponse},
     rrc::{
@@ -1036,6 +1037,26 @@ const STOCK_PLMN_SEARCH_RECORDS_OFFSET: usize = 31;
 const STOCK_PLMN_SEARCH_PRIORITY_OFFSET: usize = 383;
 const STOCK_PLMN_SEARCH_SIB1_OFFSET: usize = 387;
 
+// Both the fixed-size search callback and the variable-length list callback
+// materialize the same recovered PLMN_INFO[32] record memory layout. Keep the
+// shared 3+4+4-byte packing and record count in one place.
+fn materialize_stock_plmn_records(
+    mut records: PlmnInfoCursor<'_>,
+    destination: &mut [u8],
+) -> Result<(u32, usize), PlmnInfoDecodeError> {
+    debug_assert_eq!(destination.len(), MAX_PLMN_RECORDS * STOCK_PLMN_RECORD_LEN);
+    let mut count = 0_u32;
+    let mut written = 0;
+    while let Some(record) = records.next_record()? {
+        destination[written..written + 3].copy_from_slice(&record.plmn_id);
+        destination[written + 3..written + 7].copy_from_slice(&record.priority.to_be_bytes());
+        destination[written + 7..written + 11].copy_from_slice(&record.status.to_be_bytes());
+        written += STOCK_PLMN_RECORD_LEN;
+        count += 1;
+    }
+    Ok((count, written))
+}
+
 /// Materialize and broadcast live-P4 stock callback 41 (`PLMNSearch`).
 ///
 /// B014 DWARF fixes `_PLMN_SEARCH_RSP_INFO` at 436 bytes. Live P4
@@ -1063,16 +1084,11 @@ pub(crate) fn broadcast_plmn_search_callback(
     data[21..23].copy_from_slice(&response.tac);
     data[23..27].copy_from_slice(&response.bit28_cell_id.to_be_bytes());
 
-    let mut count = 0_u32;
-    let mut offset = STOCK_PLMN_SEARCH_RECORDS_OFFSET;
-    let mut records = response.records();
-    while let Some(record) = records.next_record().map_err(HandleError::PlmnSearch)? {
-        data[offset..offset + 3].copy_from_slice(&record.plmn_id);
-        data[offset + 3..offset + 7].copy_from_slice(&record.priority.to_be_bytes());
-        data[offset + 7..offset + 11].copy_from_slice(&record.status.to_be_bytes());
-        offset += STOCK_PLMN_RECORD_LEN;
-        count += 1;
-    }
+    let (count, _) = materialize_stock_plmn_records(
+        response.records(),
+        &mut data[STOCK_PLMN_SEARCH_RECORDS_OFFSET..STOCK_PLMN_SEARCH_PRIORITY_OFFSET],
+    )
+    .map_err(HandleError::PlmnSearch)?;
     data[27..31].copy_from_slice(&count.to_be_bytes());
     if let Some(priority) = response.plmn_priority {
         data[STOCK_PLMN_SEARCH_PRIORITY_OFFSET..STOCK_PLMN_SEARCH_PRIORITY_OFFSET + 4]
@@ -1109,23 +1125,67 @@ pub(crate) fn broadcast_plmn_list_callback(
 ) -> Result<BroadcastReport, HandleError> {
     let mut data = [0_u8; MAX_PLMN_CALLBACK_DATA_LEN];
     data[0] = response.search_complete;
-    let mut count = 0_u32;
-    let mut offset = STOCK_PLMN_PREFIX_LEN;
-    let mut records = response.records();
-    while let Some(record) = records.next_record().map_err(HandleError::PlmnList)? {
-        data[offset..offset + 3].copy_from_slice(&record.plmn_id);
-        data[offset + 3..offset + 7].copy_from_slice(&record.priority.to_be_bytes());
-        data[offset + 7..offset + 11].copy_from_slice(&record.status.to_be_bytes());
-        offset += STOCK_PLMN_RECORD_LEN;
-        count += 1;
-    }
+    let (count, records_len) =
+        materialize_stock_plmn_records(response.records(), &mut data[STOCK_PLMN_PREFIX_LEN..])
+            .map_err(HandleError::PlmnList)?;
     data[1..5].copy_from_slice(&count.to_be_bytes());
 
     broadcast_fixed_callback::<MAX_PLMN_CALLBACK_FRAME_LEN>(
         server,
         device_id,
         SdkCallbackKind::PlmnList,
-        &data[..offset],
+        &data[..STOCK_PLMN_PREFIX_LEN + records_len],
         "bounded PLMN-list callback failed to encode",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::vec::Vec;
+
+    use gct_lapi::plmn::{PlmnInfoCursor, PlmnInfoDecodeError};
+
+    use super::{MAX_PLMN_RECORDS, STOCK_PLMN_RECORD_LEN, materialize_stock_plmn_records};
+
+    fn records(count: usize) -> Vec<u8> {
+        let mut wire = Vec::new();
+        for index in 0..count {
+            let Ok(i) = u8::try_from(index) else {
+                std::process::abort();
+            };
+            wire.extend_from_slice(&[0x12, 3, i, 0xf0, 0x10]);
+            wire.extend_from_slice(&[0x13, 4, 0x11, 0x22, 0x33, i]);
+            wire.extend_from_slice(&[0x14, 4, 0xaa, 0xbb, 0xcc, i]);
+        }
+        wire
+    }
+
+    #[test]
+    fn plmn_stock_records_have_exact_layout_and_shared_capacity() {
+        let wire = records(MAX_PLMN_RECORDS);
+        let mut dst = [0xa5_u8; MAX_PLMN_RECORDS * STOCK_PLMN_RECORD_LEN];
+        let result = materialize_stock_plmn_records(PlmnInfoCursor::new(&wire), &mut dst);
+        assert_eq!(result, Ok((32, 352)));
+        assert_eq!(
+            &dst[..11],
+            &[0, 0xf0, 0x10, 0x11, 0x22, 0x33, 0, 0xaa, 0xbb, 0xcc, 0],
+        );
+        assert_eq!(
+            &dst[31 * 11..],
+            &[31, 0xf0, 0x10, 0x11, 0x22, 0x33, 31, 0xaa, 0xbb, 0xcc, 31],
+        );
+
+        let mut empty_dst = [0xa5_u8; MAX_PLMN_RECORDS * STOCK_PLMN_RECORD_LEN];
+        assert_eq!(
+            materialize_stock_plmn_records(PlmnInfoCursor::new(&[]), &mut empty_dst),
+            Ok((0, 0)),
+        );
+        assert!(empty_dst.iter().all(|&byte| byte == 0xa5));
+
+        let oversized = records(MAX_PLMN_RECORDS + 1);
+        assert_eq!(
+            materialize_stock_plmn_records(PlmnInfoCursor::new(&oversized), &mut dst),
+            Err(PlmnInfoDecodeError::TooManyRecords),
+        );
+    }
 }
