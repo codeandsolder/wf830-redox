@@ -78,6 +78,22 @@ impl PsmControlRequest {
     }
 }
 
+// The three recovered EMM u32 controls share the same tagged payload:
+// discriminator:u16be | length=4:u16be | value:u32be. Their discriminators
+// are distinct and the surrounding request types remain separate.
+fn encode_shared_u32_control(
+    discriminator: u8,
+    value: u32,
+    output: &mut [u8],
+) -> Result<usize, EncodeError> {
+    let [a, b, c, d] = value.to_be_bytes();
+    encode_packet(
+        recovered_opcode::SHARED_CONTROL_REQUEST,
+        &[0, discriminator, 0, 4, a, b, c, d],
+        output,
+    )
+}
+
 /// LCS control request carried by shared command `0x3155` discriminator 9.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LcsControlRequest {
@@ -90,12 +106,7 @@ impl LcsControlRequest {
     /// # Errors
     /// Returns [`EncodeError::NoSpace`] when `output` is shorter than 12 bytes.
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
-        let mode = self.mode.to_be_bytes();
-        encode_packet(
-            recovered_opcode::SHARED_CONTROL_REQUEST,
-            &[0x00, 0x09, 0x00, 0x04, mode[0], mode[1], mode[2], mode[3]],
-            output,
-        )
+        encode_shared_u32_control(9, self.mode, output)
     }
 }
 
@@ -111,12 +122,7 @@ impl LppControlRequest {
     /// # Errors
     /// Returns [`EncodeError::NoSpace`] when `output` is shorter than 12 bytes.
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
-        let mode = self.mode.to_be_bytes();
-        encode_packet(
-            recovered_opcode::SHARED_CONTROL_REQUEST,
-            &[0x00, 0x0a, 0x00, 0x04, mode[0], mode[1], mode[2], mode[3]],
-            output,
-        )
+        encode_shared_u32_control(10, self.mode, output)
     }
 }
 
@@ -167,14 +173,7 @@ impl EmmNiReattachControlRequest {
     /// # Errors
     /// Returns [`EncodeError::NoSpace`] when `output` is shorter than 12 bytes.
     pub fn encode(self, output: &mut [u8]) -> Result<usize, EncodeError> {
-        let control = self.control.to_be_bytes();
-        encode_packet(
-            recovered_opcode::SHARED_CONTROL_REQUEST,
-            &[
-                0x00, 0x0b, 0x00, 0x04, control[0], control[1], control[2], control[3],
-            ],
-            output,
-        )
+        encode_shared_u32_control(11, self.control, output)
     }
 }
 
