@@ -1759,7 +1759,7 @@ pub enum CompletionMode {
 }
 
 impl HandledCall {
-    #[must_use]
+    #[must_use = "the returned mode determines the call completion path"]
     pub const fn completion_mode(self) -> CompletionMode {
         match self.command {
             SdkCommand::GetDeviceInformation => {
@@ -2745,7 +2745,7 @@ pub struct DeviceBridge {
 }
 
 impl DeviceBridge {
-    #[must_use]
+    #[must_use = "the returned bridge owns the device call and initialization state"]
     pub const fn new(device_id: u32) -> Self {
         Self {
             device_id,
@@ -2756,27 +2756,27 @@ impl DeviceBridge {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned ID identifies the bridged device"]
     pub const fn device_id(&self) -> u32 {
         self.device_id
     }
 
-    #[must_use]
+    #[must_use = "the returned count describes outstanding bridge calls"]
     pub const fn pending_count(&self) -> usize {
         self.pending.len()
     }
 
-    #[must_use]
+    #[must_use = "the returned count describes deferred bridge calls"]
     pub const fn deferred_count(&self) -> usize {
         self.deferred_calls.len()
     }
 
-    #[must_use]
+    #[must_use = "the returned state indicates whether initialization completed"]
     pub const fn init_complete(&self) -> bool {
         matches!(self.startup_phase, StartupPhase::Complete)
     }
 
-    #[must_use]
+    #[must_use = "the returned phase determines the next startup step"]
     pub const fn startup_phase(&self) -> StartupPhase {
         self.startup_phase
     }

@@ -75,12 +75,12 @@ impl ClientContext {
         Ok(context)
     }
 
-    #[must_use]
+    #[must_use = "the returned ID identifies the shared memory segment"]
     pub const fn shmid(&self) -> libc::c_int {
         self.shmid
     }
 
-    #[must_use]
+    #[must_use = "the returned ID identifies the semaphore set"]
     pub const fn semid(&self) -> libc::c_int {
         self.semid
     }

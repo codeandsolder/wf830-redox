@@ -51,7 +51,7 @@ pub enum SdkCallbackKind {
 }
 
 impl SdkCallbackKind {
-    #[must_use]
+    #[must_use = "the returned identifier selects the SDK callback"]
     pub const fn callback_id(self) -> u16 {
         match self {
             Self::Attach => 26,
@@ -84,7 +84,7 @@ impl SdkCallbackKind {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned index selects the callback registration slot"]
     pub const fn registration_index(self) -> usize {
         match self {
             Self::Attach => 2,
@@ -117,7 +117,7 @@ impl SdkCallbackKind {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned offset locates the callback registration in shared memory"]
     pub const fn registration_offset(self) -> usize {
         CALLBACK_REGISTRATION_BASE + self.registration_index() * CALLBACK_REGISTRATION_STRIDE
     }
@@ -264,14 +264,14 @@ pub struct Header {
 }
 
 impl Header {
-    #[must_use]
+    #[must_use = "the returned bytes contain the serialized wire header"]
     pub const fn encode(self) -> [u8; HEADER_LEN] {
         let event = self.event.to_be_bytes();
         let len = self.payload_len.to_be_bytes();
         [event[0], event[1], len[0], len[1]]
     }
 
-    #[must_use]
+    #[must_use = "the returned header contains the interpreted wire fields"]
     pub const fn decode(bytes: [u8; HEADER_LEN]) -> Self {
         Self {
             event: u16::from_be_bytes([bytes[0], bytes[1]]),

@@ -15,13 +15,10 @@ permissions:
 
 jobs:
   rust:
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@097cc824fc551bce6708700117f796c746689faa # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
     with:
-      rust-toolchain: "1.99.1"
       rust-components: "rustfmt clippy"
       command: |
-        cargo +1.99.1 fmt --all -- --check
         git diff --check
-        cargo +1.99.1 clippy --locked --workspace --all-targets --all-features -- -D warnings
-        cargo +1.99.1 test --locked --workspace --all-features
-        RUSTDOCFLAGS="-D warnings" cargo +1.99.1 doc --locked --workspace --all-features --no-deps
+        cargo test --locked --workspace --all-features
+        RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps

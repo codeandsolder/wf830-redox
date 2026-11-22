@@ -42,7 +42,7 @@ pub struct PdnInfoContainer<'a> {
 
 impl<'a> PdnInfoContainer<'a> {
     /// Cursor over the inner `[type,len,payload]` fields.
-    #[must_use]
+    #[must_use = "the returned cursor traverses the encoded PDN fields"]
     pub const fn fields(self) -> TlvCursor<'a> {
         self.fields
     }
@@ -56,7 +56,7 @@ pub struct PdnInfoContainers<'a> {
 }
 
 impl<'a> PdnInfoContainers<'a> {
-    #[must_use]
+    #[must_use = "the returned cursor traverses the supplied PDN containers"]
     pub const fn new(bytes: &'a [u8]) -> Self {
         Self {
             cursor: TlvCursor::new(bytes),
@@ -64,7 +64,7 @@ impl<'a> PdnInfoContainers<'a> {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned slice contains the unconsumed wire payload"]
     pub const fn remaining(&self) -> &'a [u8] {
         self.cursor.remaining()
     }
@@ -307,7 +307,7 @@ pub enum ResultResponseKind {
 }
 
 impl ResultResponseKind {
-    #[must_use]
+    #[must_use = "the returned opcode identifies the protocol operation"]
     pub const fn opcode(self) -> u16 {
         match self {
             Self::Online => recovered_opcode::ONLINE_RESPONSE,
@@ -418,7 +418,7 @@ pub enum AttachResponseKind {
 }
 
 impl AttachResponseKind {
-    #[must_use]
+    #[must_use = "the returned opcode identifies the protocol operation"]
     pub const fn opcode(self) -> u16 {
         match self {
             Self::Normal => recovered_opcode::ATTACH_RESPONSE,
@@ -475,7 +475,7 @@ pub struct EmergencyNumberList<'a> {
 }
 
 impl<'a> EmergencyNumberList<'a> {
-    #[must_use]
+    #[must_use = "the returned cursor traverses records in the response"]
     pub const fn records(self) -> EmergencyNumberCursor<'a> {
         EmergencyNumberCursor {
             remaining: self.payload,
@@ -590,7 +590,7 @@ pub struct AttachTailCursor<'a> {
 }
 
 impl<'a> AttachTailCursor<'a> {
-    #[must_use]
+    #[must_use = "the returned cursor traverses the attach response tail"]
     pub const fn new(bytes: &'a [u8]) -> Self {
         Self {
             cursor: TlvCursor::new(bytes),
@@ -749,12 +749,12 @@ impl<'a> AttachResponse<'a> {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned cursor traverses encoded PDN containers"]
     pub const fn pdn_info_containers(&self) -> PdnInfoContainers<'a> {
         PdnInfoContainers::new(self.initial_pdn_info)
     }
 
-    #[must_use]
+    #[must_use = "the returned cursor traverses the remaining response fields"]
     pub const fn trailing_fields(&self) -> AttachTailCursor<'a> {
         AttachTailCursor::new(self.trailing_fields)
     }
@@ -794,7 +794,7 @@ impl<'a> AttachResponsePrefix<'a> {
     /// Cursor over the still-unclassified optional suffix. This is useful for
     /// the portions already known to use the common GCT TLV grammar while the
     /// nested vendor parser is being reconstructed.
-    #[must_use]
+    #[must_use = "the returned cursor traverses the optional TLV payload"]
     pub const fn optional_tlvs(&self) -> TlvCursor<'a> {
         TlvCursor::new(self.optional_fields)
     }
@@ -875,7 +875,7 @@ impl<'a> AttachExtResponse<'a> {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned cursor traverses encoded PDN containers"]
     pub const fn pdn_info_containers(&self) -> PdnInfoContainers<'a> {
         PdnInfoContainers::new(self.initial_pdn_info)
     }
@@ -913,7 +913,7 @@ impl<'a> PdnConnectResponsePrefix<'a> {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned cursor traverses the optional TLV payload"]
     pub const fn optional_tlvs(&self) -> TlvCursor<'a> {
         TlvCursor::new(self.optional_fields)
     }
@@ -953,7 +953,7 @@ impl<'a> PdnConnectExtResponsePrefix<'a> {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned cursor traverses the optional TLV payload"]
     pub const fn optional_tlvs(&self) -> TlvCursor<'a> {
         TlvCursor::new(self.optional_fields)
     }
@@ -987,7 +987,7 @@ impl<'a> PdnDisconnectResponsePrefix<'a> {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned cursor traverses the optional TLV payload"]
     pub const fn optional_tlvs(&self) -> TlvCursor<'a> {
         TlvCursor::new(self.optional_fields)
     }
@@ -1154,12 +1154,12 @@ impl<'a> PdnConnectResponse<'a> {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned cursor traverses encoded PDN containers"]
     pub const fn pdn_info_containers(&self) -> PdnInfoContainers<'a> {
         PdnInfoContainers::new(self.initial_pdn_info)
     }
 
-    #[must_use]
+    #[must_use = "the returned cursor traverses the remaining response fields"]
     pub const fn trailing_fields(&self) -> PdnConnectTailCursor<'a> {
         PdnConnectTailCursor::new(self.trailing_fields)
     }
@@ -1182,7 +1182,7 @@ pub enum PdnConnectTailField<'a> {
 impl<'a> PdnConnectTailField<'a> {
     /// Return the inner TLV cursor for the descriptor-managed extra PDN-info
     /// field. Other tail variants have no nested PDN payload.
-    #[must_use]
+    #[must_use = "the returned cursor identifies the PDN fields when present"]
     pub const fn pdn_info_fields(self) -> Option<TlvCursor<'a>> {
         match self {
             Self::PdnInfo(bytes) => Some(TlvCursor::new(bytes)),
@@ -1222,14 +1222,14 @@ pub struct PdnConnectTailCursor<'a> {
 }
 
 impl<'a> PdnConnectTailCursor<'a> {
-    #[must_use]
+    #[must_use = "the returned cursor traverses the PDN connection response tail"]
     pub const fn new(bytes: &'a [u8]) -> Self {
         Self {
             cursor: TlvCursor::new(bytes),
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned slice contains the unconsumed wire payload"]
     pub const fn remaining(&self) -> &'a [u8] {
         self.cursor.remaining()
     }
@@ -1365,7 +1365,7 @@ impl<'a> PdnConnectExtResponse<'a> {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned cursor traverses encoded PDN containers"]
     pub const fn pdn_info_containers(&self) -> PdnInfoContainers<'a> {
         PdnInfoContainers::new(self.initial_pdn_info)
     }
@@ -1410,7 +1410,7 @@ impl<'a> PdnDisconnectResponse<'a> {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned cursor traverses the remaining response fields"]
     pub const fn trailing_fields(&self) -> PdnDisconnectFieldCursor<'a> {
         PdnDisconnectFieldCursor::new(self.trailing_fields)
     }
@@ -1446,14 +1446,14 @@ pub struct PdnDisconnectFieldCursor<'a> {
 }
 
 impl<'a> PdnDisconnectFieldCursor<'a> {
-    #[must_use]
+    #[must_use = "the returned cursor traverses the PDN disconnect response fields"]
     pub const fn new(bytes: &'a [u8]) -> Self {
         Self {
             cursor: TlvCursor::new(bytes),
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned slice contains the unconsumed wire payload"]
     pub const fn remaining(&self) -> &'a [u8] {
         self.cursor.remaining()
     }
@@ -1547,7 +1547,7 @@ pub struct PlmnInfoCursor<'a> {
 }
 
 impl<'a> PlmnInfoCursor<'a> {
-    #[must_use]
+    #[must_use = "the returned cursor traverses the encoded network records"]
     pub const fn new(bytes: &'a [u8]) -> Self {
         Self {
             cursor: TlvCursor::new(bytes),
@@ -1555,7 +1555,7 @@ impl<'a> PlmnInfoCursor<'a> {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned slice contains the unconsumed wire payload"]
     pub const fn remaining(&self) -> &'a [u8] {
         self.cursor.remaining()
     }
@@ -1759,7 +1759,7 @@ impl<'a> PlmnSearchResponse<'a> {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned cursor traverses records in the response"]
     pub const fn records(&self) -> PlmnInfoCursor<'a> {
         PlmnInfoCursor::new(self.records)
     }
@@ -1787,7 +1787,7 @@ impl<'a> PlmnListResponse<'a> {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned cursor traverses records in the response"]
     pub const fn records(&self) -> PlmnInfoCursor<'a> {
         PlmnInfoCursor::new(self.records)
     }
@@ -2124,7 +2124,7 @@ pub struct MsisdnReadResponse<'a> {
 }
 
 impl MsisdnReadResponse<'_> {
-    #[must_use]
+    #[must_use = "the returned count describes the encoded subscriber numbers"]
     pub const fn num_msisdn(self) -> usize {
         self.records.len() / MSISDN_RECORD_LEN
     }
@@ -2939,7 +2939,7 @@ impl<'a> UiccFixedRequest<'a> {
         Ok(Self { kind, data })
     }
 
-    #[must_use]
+    #[must_use = "the returned type identifies the fixed UICC request"]
     pub const fn kind(self) -> u16 {
         self.kind
     }
@@ -3707,7 +3707,7 @@ pub enum EmptyRequest {
 
 impl EmptyRequest {
     /// Exact recovered modem-wire opcode.
-    #[must_use]
+    #[must_use = "the returned opcode identifies the protocol operation"]
     pub const fn opcode(self) -> u16 {
         match self {
             Self::Online => recovered_opcode::ONLINE_REQUEST,
@@ -3749,7 +3749,7 @@ impl ApnType {
     /// B014 accepted three additional mappings which the live P4 SDK removed.
     /// This deliberately follows the live target: Emergency/Reserved2/
     /// Reserved3/NotSet map to zero rather than B014's historical values.
-    #[must_use]
+    #[must_use = "the returned value is the protocol encoding of the APN type"]
     pub const fn p4_wire_value(self) -> u8 {
         match self {
             Self::Internet => 3,
@@ -4080,7 +4080,7 @@ pub struct PcoInfo {
 }
 
 impl PcoInfo {
-    #[must_use]
+    #[must_use = "the returned bytes contain the serialized protocol configuration"]
     const fn wire_bytes(self) -> [u8; 9] {
         let first = self.first_os.to_be_bytes();
         let second = self.second_os.to_be_bytes();
@@ -4383,13 +4383,13 @@ pub struct DetachRequest {
 
 impl DetachRequest {
     /// Construct from the exact host-side 32-bit value consumed by the OEM SDK.
-    #[must_use]
+    #[must_use = "the returned request interprets the supplied wire value"]
     pub const fn from_raw(raw: u32) -> Self {
         Self { raw }
     }
 
     /// Return the preserved host-side value.
-    #[must_use]
+    #[must_use = "the returned value is the encoded detach request"]
     pub const fn raw(self) -> u32 {
         self.raw
     }
@@ -4421,7 +4421,7 @@ pub struct AtCommand<'a> {
 
 impl<'a> AtCommand<'a> {
     /// Construct an AT command from the exact bytes to precede the SDK-added LF.
-    #[must_use]
+    #[must_use = "the returned command represents the supplied AT payload"]
     pub const fn new(command: &'a [u8]) -> Self {
         Self { command }
     }
@@ -4475,7 +4475,7 @@ pub struct AtCommandExt<'a> {
 
 impl<'a> AtCommandExt<'a> {
     /// Construct an extended AT command for one recovered channel byte.
-    #[must_use]
+    #[must_use = "the returned command contains the channel and AT payload"]
     pub const fn new(channel: u8, command: &'a [u8]) -> Self {
         Self { channel, command }
     }

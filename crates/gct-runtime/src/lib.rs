@@ -90,7 +90,7 @@ impl std::str::FromStr for StartupInterface {
 
 /// Find the first OEM primary LTE interface in already-read `/proc/net/dev`
 /// text, preserving kernel listing order.
-#[must_use]
+#[must_use = "the returned interface determines the modem startup transport"]
 pub fn find_startup_interface(net_dev: &str) -> Option<StartupInterface> {
     net_dev.lines().find_map(|line| {
         let (name, _) = line.split_once(':')?;
@@ -293,7 +293,7 @@ impl ModemCommand<'_> {
     /// AT commands intentionally return `None`: their response stream has no
     /// recovered request identifier and may produce multiple asynchronous AT
     /// chunks.
-    #[must_use]
+    #[must_use = "the returned key correlates the command or event with its response"]
     pub const fn response_key(self) -> Option<ResponseKey> {
         match self {
             Self::Attach(request) => Some(ResponseKey::Attach(request.transaction_id)),
@@ -351,7 +351,7 @@ impl ModemEvent<'_> {
     ///
     /// Matching does not imply completion: PLMN search/list responses can be
     /// multipart, so pending lifetime remains an explicit higher-layer choice.
-    #[must_use]
+    #[must_use = "the returned key correlates the command or event with its response"]
     pub const fn response_key(&self) -> Option<ResponseKey> {
         match self {
             Self::Attach(response) => Some(ResponseKey::Attach(response.transaction_id)),
@@ -409,22 +409,22 @@ pub struct PendingRequests {
 }
 
 impl PendingRequests {
-    #[must_use]
+    #[must_use = "the returned queue owns the pending request state"]
     pub const fn new() -> Self {
         Self { keys: Vec::new() }
     }
 
-    #[must_use]
+    #[must_use = "the returned length bounds the valid encoded or pending data"]
     pub const fn len(&self) -> usize {
         self.keys.len()
     }
 
-    #[must_use]
+    #[must_use = "the returned status indicates whether the buffer or queue is empty"]
     pub const fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
 
-    #[must_use]
+    #[must_use = "the returned decision indicates whether the request is pending"]
     pub fn contains(&self, key: ResponseKey) -> bool {
         self.keys.contains(&key)
     }
@@ -448,7 +448,7 @@ impl PendingRequests {
         true
     }
 
-    #[must_use]
+    #[must_use = "the returned key identifies the pending request matched by the event"]
     pub fn matching_event(&self, event: &ModemEvent<'_>) -> Option<ResponseKey> {
         let key = event.response_key()?;
         self.contains(key).then_some(key)
@@ -764,7 +764,7 @@ pub struct Modem<T> {
 
 impl<T> Modem<T> {
     /// Construct a runtime using the live SDK's observed 32 KiB read size.
-    #[must_use]
+    #[must_use = "the returned modem owns the supplied HCI transport"]
     pub fn new(transport: HciIo<T>) -> Self {
         Self {
             transport,
@@ -775,13 +775,13 @@ impl<T> Modem<T> {
     }
 
     /// Recover the underlying transport.
-    #[must_use]
+    #[must_use = "the returned transport owns the underlying modem IO"]
     pub fn into_transport(self) -> HciIo<T> {
         self.transport
     }
 
     /// Borrow the underlying transport.
-    #[must_use]
+    #[must_use = "the returned reference exposes the underlying transport"]
     pub const fn transport(&self) -> &HciIo<T> {
         &self.transport
     }
@@ -792,7 +792,7 @@ impl<T> Modem<T> {
     }
 
     /// Number of bytes retained because the final HCI frame is incomplete.
-    #[must_use]
+    #[must_use = "the returned count indicates buffered receive data"]
     pub const fn pending_rx_bytes(&self) -> usize {
         self.decoder.pending_len()
     }
