@@ -41,13 +41,13 @@ impl<T> HciIo<T> {
     }
 
     /// Recover the wrapped transport.
-    #[must_use]
+    #[must_use = "the returned value owns the underlying transport"]
     pub fn into_inner(self) -> T {
         self.inner
     }
 
     /// Borrow the wrapped transport.
-    #[must_use]
+    #[must_use = "the returned reference provides access to the underlying transport"]
     pub const fn inner(&self) -> &T {
         &self.inner
     }
@@ -117,7 +117,7 @@ pub struct HciStreamDecoder {
 
 impl HciStreamDecoder {
     /// Create an empty stream decoder.
-    #[must_use]
+    #[must_use = "the returned decoder owns its incremental frame parsing state"]
     pub const fn new() -> Self {
         Self {
             pending: Vec::new(),
@@ -125,13 +125,13 @@ impl HciStreamDecoder {
     }
 
     /// Number of bytes currently retained for an incomplete next frame.
-    #[must_use]
+    #[must_use = "the returned length identifies buffered incomplete frames"]
     pub const fn pending_len(&self) -> usize {
         self.pending.len()
     }
 
     /// Whether no incomplete frame bytes are retained.
-    #[must_use]
+    #[must_use = "the returned status indicates whether the buffer or queue is empty"]
     pub const fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }

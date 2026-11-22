@@ -47,7 +47,7 @@ pub struct Header {
 
 impl Header {
     /// Decode a four-byte big-endian HCI header.
-    #[must_use]
+    #[must_use = "the returned header contains the interpreted wire fields"]
     pub const fn decode(bytes: [u8; HEADER_LEN]) -> Self {
         Self {
             command: u16::from_be_bytes([bytes[0], bytes[1]]),
@@ -56,7 +56,7 @@ impl Header {
     }
 
     /// Encode this header in the modem wire byte order.
-    #[must_use]
+    #[must_use = "the returned bytes contain the serialized wire header"]
     pub const fn encode(self) -> [u8; HEADER_LEN] {
         let command = self.command.to_be_bytes();
         let len = self.payload_len.to_be_bytes();
@@ -170,13 +170,13 @@ pub struct TlvCursor<'a> {
 
 impl<'a> TlvCursor<'a> {
     /// Create a cursor at the first TLV in `bytes`.
-    #[must_use]
+    #[must_use = "the returned cursor traverses the supplied TLV bytes"]
     pub const fn new(bytes: &'a [u8]) -> Self {
         Self { remaining: bytes }
     }
 
     /// Bytes not yet consumed by successful [`Self::next_tlv`] calls.
-    #[must_use]
+    #[must_use = "the returned slice contains the unconsumed wire payload"]
     pub const fn remaining(&self) -> &'a [u8] {
         self.remaining
     }
@@ -242,19 +242,19 @@ impl<'a> TlvWriter<'a> {
     }
 
     /// Number of bytes written so far.
-    #[must_use]
+    #[must_use = "the returned length bounds the valid encoded or pending data"]
     pub const fn len(&self) -> usize {
         self.len
     }
 
     /// Whether no TLVs have been written yet.
-    #[must_use]
+    #[must_use = "the returned status indicates whether the buffer or queue is empty"]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Return the encoded prefix of the backing buffer.
-    #[must_use]
+    #[must_use = "the returned slice contains the encoded TLV payload"]
     pub fn as_bytes(&self) -> &[u8] {
         &self.buffer[..self.len]
     }

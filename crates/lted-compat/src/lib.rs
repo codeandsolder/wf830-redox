@@ -110,24 +110,24 @@ impl Server {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned path identifies the shared server socket"]
     pub fn common_path(&self) -> &Path {
         &self.common_path
     }
 
     /// Borrow the common UNIX datagram socket for external readiness polling.
-    #[must_use]
+    #[must_use = "the returned reference identifies the shared server socket"]
     pub const fn common_socket(&self) -> &UnixDatagram {
         &self.common
     }
 
-    #[must_use]
+    #[must_use = "the returned count describes registered clients"]
     pub fn client_count(&self) -> usize {
         self.clients.iter().flatten().count()
     }
 
     /// Snapshot the currently allocated client IDs in ascending slot order.
-    #[must_use]
+    #[must_use = "the returned IDs identify registered clients"]
     pub fn client_ids(&self) -> Vec<u8> {
         self.clients
             .iter()
@@ -147,7 +147,7 @@ impl Server {
         self.client(id).map(|client| client.identity)
     }
 
-    #[must_use]
+    #[must_use = "the returned path locates the requested client socket"]
     pub fn client_socket_path(&self, id: u8) -> Option<&Path> {
         self.clients
             .get(usize::from(id))
